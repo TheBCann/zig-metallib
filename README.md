@@ -1,0 +1,136 @@
+# zig-metallib — a Metal graphics pipeline written entirely in Zig
+
+Shaders are written in Zig. They are compiled to Apple AIR bitcode, packed into a
+`.metallib`, and loaded by a Metal app — **without Apple's Metal Shading Language
+toolchain anywhere in the build**. No `.metal` files, no `xcrun metal`, no checked-in
+`.ll`, no C or Objective-C sources: every AppKit and Metal call goes through
+`objc_msgSend` from Zig.
+
+```
+src/engine/my_shader.zig        Zig shader source + the binding manifest
+        │
+        │  zig build-obj -target nvptx64-cuda -mcpu=sm_75 -femit-llvm-ir   (Zig's LLVM)
+        ▼
+    LLVM IR text
+        │
+        │  tools/air_splice.zig          rewrite: AIR target, entry headers from the
+        │                                manifest, sret → by-value, attribute cleanup
+        │  tools/air/assembler.zig       IR text → bitcode via std.zig.llvm.Builder
+        │  tools/air/metadata.zig        manifest + Zig types → !air.* metadata
+        │  tools/air/metallib.zig        MTLB container packer
+        ▼
+   default.metallib  ──@embedFile──▶  src/main.zig  ──newLibraryWithData:──▶  Metal
+```
+
+The only Apple binaries involved are the ones that must be: the Metal *runtime*
+(`MTLCompilerService`, which turns AIR into GPU code when a pipeline is created) and,
+optionally, `xcrun metal` / `metal-objdump` used **outside** the build to cross-check
+what we produce.
+
+## Quick start
+
+```sh
+zig build                                              # shaders + library + app
+zig build run                                          # opens a window, textured triangle
+zig build test                                         # 78 tests
+zig build metallib                                     # zig-out/bin/{default.metallib,shader.air.ll}
+zig build check -- zig-out/bin/default.metallib         # load into Metal, run everything
+xcrun metal-objdump -d zig-out/bin/default.metallib     # read our container back
+```
+
+Requires a nightly Zig (developed against **0.17.0-dev.2257+3bfb29994**) and macOS.
+`std.zig.llvm.Builder` is an internal standard-library API and moves between nightlies.
+
+## What is verified, and how
+
+`zig build check` is the gate that matters. Apple's frontend accepting IR proves
+nothing — many constructs assemble happily and then crash `MTLCompilerService` at
+pipeline creation — so every feature here is checked by *executing* it: a compute
+dispatch whose results are read back and compared, or an offscreen render whose pixels
+are read back and compared.
+
+| gate | what it proves | result |
+| --- | --- | --- |
+| `zig build test` | rewriter, assembler, metadata, packer, uniformity analysis | 78 tests pass |
+| `zig build` | Zig → IR → container, end to end | builds |
+| `zig build check -- …` | Metal loads it, compiles every pipeline, and the GPU computes the right answers | **42 ok, 0 fail** |
+| `xcrun metal-objdump -d` | our container is readable by Apple's own tooling | passes |
+| `xcrun metal` on `shader.air.ll` | Apple's assembler accepts our printed IR; the library *it* builds also passes `zig build check` | **42 ok, 0 fail** |
+
+The last row is the strongest cross-check available without Apple's source: from the
+same IR text, Apple's assembler and ours produce libraries that both run correctly.
+
+The 42 checks cover 15 entry points — 2 vertex, 3 fragment, 10 kernels — including:
+
+- pixel-exact textured renders (all 64 pixels of an 8×8 target), once through a
+  `constexpr` sampler baked into the shader and once through a host-bound
+  `[[sampler(0)]]`;
+- an MRT render (two colour attachments of different formats + depth) with
+  `discard_fragment`, instancing, `base_instance`, `front_facing` and `point_coord`;
+- 10 compute dispatches: threadgroup memory, barriers, SIMD-group reductions,
+  shuffles and prefix sums, device and threadgroup atomics, a two-stage tree
+  reduction, and a texture read/write kernel.
+
+## Scope and honest limits
+
+- **One machine.** Everything above was measured on macOS 26.3 (25D125), Apple M3
+  (10-core GPU), Metal 4, `air64_v28-apple-macosx26.0.0`. It has not been run on any
+  other machine or OS version. The container header carries values copied from that
+  toolchain's output; other Metal versions may differ.
+- **The AIR format is undocumented.** The container layout, the `!air.*` metadata and
+  the sampler bit layout here were reverse-engineered from Apple's output and
+  confirmed by repacking, loading and running. A few header fields are reproduced
+  without knowing their meaning (see `docs/air-format.md`).
+- **The shader target is a detour.** Zig only permits GPU address spaces on GPU
+  targets, so shaders are compiled for `nvptx64` and the AIR-specific work happens
+  afterwards. Nothing NVPTX-specific survives the rewrite.
+- **Unsupported IR fails loudly.** Anything the assembler does not handle is
+  `error.Unsupported` with the offending line, never silently dropped.
+- **Not a general Metal binding.** `src/objc.zig` is the minimum `msgSend` surface the
+  example needs.
+
+## Prior art
+
+Writing `.metallib` files without Apple's compiler has been done before — floor/libfloor,
+LLAIR, Metal.jl and metal-ir-pipeline all emit AIR — but they go through a **patched or
+pinned LLVM** (typically a typed-pointer downgrade) and target compute, from C++ or
+Julia. What is different here:
+
+- shaders are written in **Zig**, a general-purpose language, with `struct`s and
+  `comptime` describing the binding layout;
+- the bitcode is produced by **`std.zig.llvm.Builder`** — a stock standard-library
+  bitcode writer, no LLVM fork, no C++ dependency;
+- the `!air.*` reflection metadata is **derived at comptime from the Zig types**
+  themselves, so the manifest cannot drift from the shader signatures;
+- it does **graphics** (vertex/fragment, MRT, depth, textures, samplers), not only
+  compute;
+- Metal's runtime compiler accepts **opaque-pointer, LLVM-20-era bitcode**, which
+  contradicts the typed-pointer requirement other projects work around. That was
+  measured here, not assumed.
+
+## Layout
+
+```
+build.zig                   the whole pipeline as a build graph
+src/main.zig                NSApplication + CAMetalLayer + render loop, via msgSend
+src/objc.zig                objc_msgSend, autorelease pools, dispatch_data_create
+src/engine/my_shader.zig    the shaders and the `functions` manifest
+src/engine/air.zig          manifest types (host-safe: no GPU pointers)
+src/engine/gpu.zig          shader-side helpers: barriers, SIMD, atomics, textures, samplers
+tools/air_splice.zig        IR text rewrite + the CLI that drives the whole conversion
+tools/air/assembler.zig     LLVM IR text → bitcode (std.zig.llvm.Builder)
+tools/air/divergence.zig    uniformity analysis behind the convergent-call check
+tools/air/intrinsics.zig    which llvm.* Metal accepts, renames, or cannot take at all
+tools/air/metadata.zig      manifest → !air.* metadata (text and bitcode)
+tools/air/metallib.zig      MTLB container writer
+tools/metallib_check.zig    loads a library into Metal and runs every entry point
+docs/pipeline.md            how the pipeline works, and how to add a shader
+docs/air-format.md          the container, bitcode dialect and metadata reference
+```
+
+## Documentation
+
+- **[docs/pipeline.md](docs/pipeline.md)** — each stage, the manifest reference, the
+  GPU helper surface, and what to do when something fails.
+- **[docs/air-format.md](docs/air-format.md)** — the `.metallib` container byte
+  layout, the AIR bitcode dialect, the metadata nodes and the sampler word.
