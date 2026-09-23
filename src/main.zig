@@ -7,8 +7,7 @@ extern "c" fn MTLCreateSystemDefaultDevice() ?objc.Object;
 // 2. Define the memory layout for macOS Window frames (maps perfectly to CGRect)
 const NSRect = extern struct { x: f64, y: f64, w: f64, h: f64 };
 
-pub fn main(init: std.process.Init) !void {
-    _ = init;
+pub fn main() !void {
 
     // --- BOOTSTRAP MACOS ---
     const NSApp = objc.msgSend(?objc.Object, objc.class("NSApplication"), "sharedApplication", .{});
@@ -16,7 +15,7 @@ pub fn main(init: std.process.Init) !void {
 
     const frame = NSRect{ .x = 0, .y = 0, .w = 800, .h = 600 };
     const window_alloc = objc.msgSend(?objc.Object, objc.class("NSWindow"), "alloc", .{});
-    
+
     // Titled (1) | Closable (2) | Resizable (8) = 11
     const window = objc.msgSend(?objc.Object, window_alloc.?, "initWithContentRect:styleMask:backing:defer:", .{
         frame, @as(u64, 11), @as(u64, 2), false
@@ -33,7 +32,7 @@ pub fn main(init: std.process.Init) !void {
 
     const view_alloc = objc.msgSend(?objc.Object, objc.class("MTKView"), "alloc", .{});
     const view = objc.msgSend(?objc.Object, view_alloc.?, "initWithFrame:device:", .{ frame, device });
-    
+
     // CRITICAL: We are taking over the render loop. Disable MTKView's internal timer.
     _ = objc.msgSend(void, view.?, "setPaused:", .{ true });
     _ = objc.msgSend(void, view.?, "setEnableSetNeedsDisplay:", .{ false });
@@ -44,7 +43,7 @@ pub fn main(init: std.process.Init) !void {
 
     // --- LOAD THE LLVM PAYLOAD ---
     const command_queue = objc.msgSend(?objc.Object, device, "newCommandQueue", .{});
-    
+
     // Compile the binary directly into the Zig executable to avoid file path tracking
     const metallib_payload = @embedFile("default_metallib"); 
     const lib_data = objc.dispatch_data_create(metallib_payload.ptr, metallib_payload.len, null, null) orelse
@@ -56,18 +55,15 @@ pub fn main(init: std.process.Init) !void {
         logNSError(error_out);
         return error.MetalLibraryLoadFailed;
     };
-    
+
     const vertex_fn = objc.msgSend(?objc.Object, library, "newFunctionWithName:", .{ objc.createNSString("vertexShader") });
     const frag_fn = objc.msgSend(?objc.Object, library, "newFunctionWithName:", .{ objc.createNSString("fragmentShader") });
-    
     const pipeline_desc = objc.msgSend(?objc.Object, objc.class("MTLRenderPipelineDescriptor"), "alloc", .{});
     _ = objc.msgSend(?objc.Object, pipeline_desc.?, "init", .{});
     _ = objc.msgSend(void, pipeline_desc.?, "setVertexFunction:", .{ vertex_fn.? });
     _ = objc.msgSend(void, pipeline_desc.?, "setFragmentFunction:", .{ frag_fn.? });
-    
     const color_attachments = objc.msgSend(?objc.Object, pipeline_desc.?, "colorAttachments", .{});
     const attach_0 = objc.msgSend(?objc.Object, color_attachments.?, "objectAtIndexedSubscript:", .{ @as(u64, 0) });
-    
     const pixel_format = objc.msgSend(u64, view.?, "colorPixelFormat", .{});
     _ = objc.msgSend(void, attach_0.?, "setPixelFormat:", .{ pixel_format });
 
