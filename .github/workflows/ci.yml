@@ -56,6 +56,14 @@ jobs:
       #   control ok, ours fails  -> this project's output; the Apple-assembled
       #                              IR then tells our assembler and packer
       #                              apart from the IR itself
+      # A third rung has Apple compile the same control kernel with opaque
+      # pointers, the only kind this project's assembler writes. On macOS 26
+      # runners: typed passes and opaque fails -> this GPU's compiler rejects
+      # opaque pointers (on a real M3 both pass for a macOS 26 target). On
+      # macOS 15 the rung compiles for AIR 2.7, which a real M3 on macOS 26
+      # also fails ("Failed to upgrade function bitcode"), so only a pass
+      # there says something: opaque pointers accepted under AIR 2.7. The
+      # rung is informational and does not affect the step's result.
       # Apple's compile, a missing toolchain and a runner without a Metal device
       # get their own "not run" rows, so none of them reads as a GPU failure.
       # Diagnostic only: it never fails the run. Results go to the job summary.
@@ -78,6 +86,7 @@ jobs:
           device=
           compile=unavailable
           control=unavailable
+          opaque=unavailable
           ours_apple=unavailable
           if [ "$toolchain" = ok ]; then
             if xcrun metal -mmacosx-version-min="$MACOS_MAJOR.0" "$RUNNER_TEMP/control.metal" -o "$RUNNER_TEMP/control.metallib"; then
@@ -89,6 +98,17 @@ jobs:
             else
               compile=fail
               control=notrun
+            fi
+            if [ "$compile" != ok ]; then
+              opaque=notrun
+            elif xcrun metal -Xclang -opaque-pointers -mmacosx-version-min="$MACOS_MAJOR.0" "$RUNNER_TEMP/control.metal" -o "$RUNNER_TEMP/control_opaque.metallib"; then
+              oout=$(zig build check -- --kernel=control "$RUNNER_TEMP/control_opaque.metallib" 2>&1); rc=$?
+              echo "$oout"
+              opaque=$(state "$oout" "$rc")
+              # Below macOS 26 a failure has no real-GPU baseline (see above).
+              if [ "$opaque" = fail ] && [ "$MACOS_MAJOR" -lt 26 ]; then opaque=fail-nobaseline; fi
+            else
+              opaque=compile-fail
             fi
             ours_apple=skipped
             if [ "$MACOS_MAJOR" -ge 26 ]; then
@@ -107,6 +127,8 @@ jobs:
               ok) echo ok ;;
               fail) echo FAIL ;;
               assemble-fail) echo "FAIL (Apple's assembler rejected the IR)" ;;
+              compile-fail) echo "FAIL (Apple's opaque-pointer compile failed)" ;;
+              fail-nobaseline) echo "FAIL (inconclusive: a real M3 fails this AIR 2.7 target too)" ;;
               nodevice) echo "not run (no Metal device)" ;;
               notrun) echo "not run (Apple's compile failed)" ;;
               skipped) echo "skipped (needs macOS 26)" ;;
@@ -122,6 +144,7 @@ jobs:
             echo "| GPU | ${device:-unknown} |"
             echo "| Apple's compiler builds the MSL kernel | $(result $compile) |"
             echo "| pipeline from Apple's kernel (the control) | $(result $control) |"
+            echo "| same kernel, compiled by Apple with opaque pointers | $(result $opaque) |"
             echo "| this project's IR, assembled by Apple | $(result $ours_apple) |"
           } >> "$GITHUB_STEP_SUMMARY"
           if [ "$control" = nodevice ] || [ "$ours_apple" = nodevice ]; then
@@ -137,6 +160,15 @@ jobs:
       # With no device at all, metallib-check prints SKIP: the step then still
       # passes (green), with a ::warning:: annotation and a line in the job
       # summary saying nothing was checked.
+      # On a real Apple GPU any failure here fails the run. On GitHub's virtual
+      # GPU ("Apple Paravirtual device") exactly one failure is reported
+      # instead of fatal: the one measured in CI run 36263730445, where that
+      # device's compiler could not build a compute pipeline from this
+      # project's IR (CompilerError Code=2), even when Apple assembled it,
+      # while the same library passes every check on a real M3. Any other
+      # failure there (library load, function lookup, a wrong dispatch
+      # result, a crash) still fails the run. The warning and the job summary
+      # keep the downgraded result visible, so a green run never hides it.
       - name: Runtime checks, default library
         if: env.MACOS_MAJOR >= 26
         run: |
@@ -147,6 +179,13 @@ jobs:
           if grep -q '^SKIP no Metal device' <<<"$out"; then
             echo "::warning::no Metal device on this runner; runtime checks skipped"
             echo "Runtime checks skipped: no Metal device on ${{ matrix.os }}." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          first=$(grep -m1 '^FAIL' <<<"$out" | cut -c1-200)
+          if [ "$rc" -ne 0 ] && grep -q '^info device .*Paravirtual' <<<"$out" \
+            && grep -q '^FAIL newComputePipelineState .*Domain=CompilerError Code=2' <<<"$first"; then
+            echo "::warning::GitHub's virtual GPU (Apple Paravirtual device) could not build a compute pipeline from this project's IR, the known failure from CI run 36263730445; informational only, real Apple GPUs stay strict. First failure: $first"
+            echo "Runtime checks on ${{ matrix.os }}: FAILED on the virtual GPU (Apple Paravirtual device), reported as informational. First failure: \`$first\`" >> "$GITHUB_STEP_SUMMARY"
             exit 0
           fi
           exit $rc

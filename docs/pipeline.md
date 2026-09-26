@@ -305,14 +305,26 @@ kernel fails too, the runner's GPU is the cause; if it passes and ours fails, th
 is this project's output, and the Apple-assembled IR tells our assembler and packer
 apart from the IR itself. A missing Metal toolchain, a failed Apple compile and a runner
 without a Metal device each get their own "not run" row, so none of them reads as a GPU
-failure. The runtime checks run where the runner is macOS 26 or newer, and on macOS 15
-the experiment above runs without failing the build. GitHub's arm64 runners are virtual
-machines and may expose an "Apple Paravirtual device", so the checks can run on a
-virtual GPU; confirm a failure there on a real Mac before blaming the library. With no
-Metal device at all, `metallib-check` prints `SKIP no Metal device` and exits 77. The
-step still passes (green), but it adds a `::warning::` annotation and a job-summary line
-saying nothing was checked. ziglang.org deletes old nightlies, so the setup step fails
-when no mirror still serves the pinned version.
+failure. A further rung has Apple compile the same control kernel with opaque pointers,
+the only kind this project's assembler writes. On macOS 26 runners, if the typed
+original passes and the opaque one fails, opaque pointers are what that GPU's compiler
+rejects; on a real M3 both pass for a macOS 26 target. On macOS 15 the rung compiles for
+AIR 2.7, which a real M3 fails too, so only a pass there says something (opaque pointers
+accepted under AIR 2.7); a failure is labelled inconclusive. The runtime checks run
+where the runner is macOS 26 or newer, and on macOS 15 the experiment above runs without
+failing the build. GitHub's runners expose only a virtual GPU ("Apple Paravirtual
+device"). In CI run 36263730445, on the 26.6.2 runner, it could not build the first
+compute pipeline from this project's IR (`CompilerError Code=2`), even when Apple
+assembled it, while it built one from Apple's MSL-compiled control kernel; on the 15.7.9
+runner the macOS 15 experiment failed the same way, so the experiment cannot answer its
+question on GitHub's virtual GPU. That one failure, a `newComputePipelineState`
+rejection with `CompilerError Code=2` on the virtual GPU, is reported as informational:
+it adds a `::warning::` and a job-summary line naming it, and does not fail the run. Any
+other failure on the virtual GPU, and any failure on a real Apple GPU, fails the run.
+With no Metal device at all, `metallib-check` prints `SKIP no Metal device` and exits
+77. The step still passes (green), but it adds a `::warning::` annotation and a
+job-summary line saying nothing was checked. ziglang.org deletes old nightlies, so the
+setup step fails when no mirror still serves the pinned version.
 
 ---
 

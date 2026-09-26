@@ -76,10 +76,18 @@ The 42 checks cover 15 entry points — 2 vertex, 3 fragment, 10 kernels — inc
 
 ## Scope and honest limits
 
-- **One machine.** Everything above was measured on macOS 26.3 (25D125), Apple M3
-  (10-core GPU), Metal 4, `air64_v28-apple-macosx26.0.0`. It has not been run on any
-  other machine or OS version. The container header carries values copied from that
-  toolchain's output; other Metal versions may differ.
+- **One real GPU.** The GPU checks above were measured on macOS 26.3 (25D125), Apple
+  M3 (10-core GPU), Metal 4, `air64_v28-apple-macosx26.0.0`. CI builds the project and
+  passes the unit tests on GitHub's macOS 15.7.9 and 26.6.2 runners. Those runners have
+  only a virtual GPU ("Apple Paravirtual device"), though. On the 26.6.2 runner it
+  could not build the first compute pipeline (`scaleKernel`) from this project's IR,
+  even when Apple assembled it, while it built one from Apple's MSL-compiled control
+  kernel; the checker stops at the first failure, so nothing after it was tried. On
+  15.7.9 only the unverified macOS 15 library could run, and it failed the same way,
+  which settles nothing. That one known failure is reported as informational on the
+  virtual GPU; any other failure there, and any failure on a real GPU, fails the run
+  ([docs/pipeline.md](docs/pipeline.md#continuous-integration)). The container header
+  carries values copied from one toolchain's output; other Metal versions may differ.
 - **macOS 26 and newer only.** Libraries are stamped for macOS 26 (`-Dmetal-target`).
   Profiles for macOS 13–15 exist, reproducing Apple's container layout and stamps,
   but they are refused by default. macOS 26 rejects this project's opaque-pointer
@@ -113,8 +121,10 @@ Julia. What is different here:
   themselves, so the manifest cannot drift from the shader signatures;
 - it does **graphics** (vertex/fragment, MRT, depth, textures, samplers), not only
   compute;
-- Metal's runtime compiler accepts **opaque-pointer, LLVM-20-era bitcode for macOS 26
-  (AIR 2.8)**, even though Apple's own compiler still emits typed pointers. For older
+- Metal's runtime compiler on Apple silicon (measured on an M3, macOS 26.3) accepts
+  **opaque-pointer, LLVM-20-era bitcode for macOS 26 (AIR 2.8)**, even though Apple's
+  own compiler still emits typed pointers. GitHub's virtual GPU does not build
+  pipelines from it (see *One real GPU* above). For older
   targets the typed-pointer requirement other projects work around is real: macOS 26
   refuses opaque pointers under an AIR 2.7-or-older stamp, and Apple's assembler
   reproduces the refusal. Both findings were measured here, not assumed.
