@@ -8,6 +8,7 @@
 
 const std = @import("std");
 const shader = @import("shader");
+const target = @import("target.zig");
 pub const air = shader.air;
 const Builder = std.zig.llvm.Builder;
 const comptimePrint = std.fmt.comptimePrint;
@@ -69,30 +70,40 @@ pub fn paramUniformity(comptime f: air.Function) []const air.Uniformity {
 
 pub const NamedList = struct { name: []const u8, nodes: []const Node };
 
-pub const module_lists = [_]NamedList{
-    .{
-        .name = "llvm.module.flags",
-        .nodes = &.{
-            // Metal-specific limits, copied from metalfe-32023.883 output.
-            t(&.{ .{ .int = 1 }, .{ .str = "wchar_size" }, .{ .int = 4 } }),
-            t(&.{ .{ .int = 7 }, .{ .str = "frame-pointer" }, .{ .int = 2 } }),
-            t(&.{ .{ .int = 7 }, .{ .str = "air.max_device_buffers" }, .{ .int = 31 } }),
-            t(&.{ .{ .int = 7 }, .{ .str = "air.max_constant_buffers" }, .{ .int = 31 } }),
-            t(&.{ .{ .int = 7 }, .{ .str = "air.max_threadgroup_buffers" }, .{ .int = 31 } }),
-            t(&.{ .{ .int = 7 }, .{ .str = "air.max_textures" }, .{ .int = 128 } }),
-            t(&.{ .{ .int = 7 }, .{ .str = "air.max_read_write_textures" }, .{ .int = 8 } }),
-            t(&.{ .{ .int = 7 }, .{ .str = "air.max_samplers" }, .{ .int = 16 } }),
+/// The module-level named lists for the deployment target `p`, in the order
+/// Apple emits them. `air.version`, `air.language_version` and the presence of
+/// the frame-pointer flag depend on the target; the limits and compile options
+/// are the same for every profile (target.zig). The order is part of the
+/// output: it decides the metadata numbering, so moving a list changes the
+/// bitcode. Callers pick the profile by name from target.profiles (every
+/// Profile in this project comes from that table).
+pub fn moduleLists(comptime p: target.Profile) [5]NamedList {
+    return .{
+        .{
+            .name = "llvm.module.flags",
+            // Metal-specific limits, copied from metalfe-32023.883 output. Apple
+            // leaves out the frame-pointer flag for macOS 13 (target.zig).
+            .nodes = &([_]Node{t(&.{ .{ .int = 1 }, .{ .str = "wchar_size" }, .{ .int = 4 } })} ++
+                (if (p.frame_pointer_flag) [_]Node{t(&.{ .{ .int = 7 }, .{ .str = "frame-pointer" }, .{ .int = 2 } })} else [_]Node{}) ++
+                [_]Node{
+                    t(&.{ .{ .int = 7 }, .{ .str = "air.max_device_buffers" }, .{ .int = 31 } }),
+                    t(&.{ .{ .int = 7 }, .{ .str = "air.max_constant_buffers" }, .{ .int = 31 } }),
+                    t(&.{ .{ .int = 7 }, .{ .str = "air.max_threadgroup_buffers" }, .{ .int = 31 } }),
+                    t(&.{ .{ .int = 7 }, .{ .str = "air.max_textures" }, .{ .int = 128 } }),
+                    t(&.{ .{ .int = 7 }, .{ .str = "air.max_read_write_textures" }, .{ .int = 8 } }),
+                    t(&.{ .{ .int = 7 }, .{ .str = "air.max_samplers" }, .{ .int = 16 } }),
+                }),
         },
-    },
-    .{ .name = "llvm.ident", .nodes = &.{t(&.{.{ .str = "zig air-splice" }})} },
-    .{ .name = "air.version", .nodes = &.{t(&.{ .{ .int = 2 }, .{ .int = 8 }, .{ .int = 0 } })} },
-    .{ .name = "air.language_version", .nodes = &.{t(&.{ .{ .str = "Metal" }, .{ .int = 4 }, .{ .int = 0 }, .{ .int = 0 } })} },
-    .{ .name = "air.compile_options", .nodes = &.{
-        t(&.{.{ .str = "air.compile.denorms_disable" }}),
-        t(&.{.{ .str = "air.compile.fast_math_enable" }}),
-        t(&.{.{ .str = "air.compile.framebuffer_fetch_enable" }}),
-    } },
-};
+        .{ .name = "llvm.ident", .nodes = &.{t(&.{.{ .str = "zig air-splice" }})} },
+        .{ .name = "air.version", .nodes = &.{t(&.{ .{ .int = 2 }, .{ .int = p.air_minor }, .{ .int = 0 } })} },
+        .{ .name = "air.language_version", .nodes = &.{t(&.{ .{ .str = "Metal" }, .{ .int = p.lang_major }, .{ .int = p.lang_minor }, .{ .int = 0 } })} },
+        .{ .name = "air.compile_options", .nodes = &.{
+            t(&.{.{ .str = "air.compile.denorms_disable" }}),
+            t(&.{.{ .str = "air.compile.fast_math_enable" }}),
+            t(&.{.{ .str = "air.compile.framebuffer_fetch_enable" }}),
+        } },
+    };
+}
 
 pub fn stageListName(stage: air.Stage) []const u8 {
     return switch (stage) {
@@ -420,13 +431,14 @@ fn mangle(comptime T: type) []const u8 {
 /// Append the metadata block for a whole module (all entry points) as text.
 /// `samplers` names the constexpr sampler globals (`@name`, already in
 /// address space 2 in the text) to list under `!air.sampler_states`.
-pub fn printModule(gpa: std.mem.Allocator, out: *std.ArrayList(u8), samplers: []const []const u8) !void {
-    return printManifestWith(gpa, out, &function_metadata, samplers);
+pub fn printModule(gpa: std.mem.Allocator, out: *std.ArrayList(u8), samplers: []const []const u8, profile: target.Profile) !void {
+    return printManifestWith(gpa, out, &function_metadata, samplers, profile);
 }
 
-/// `printModule` for an explicit list of entry points (tests use their own).
+/// `printModule` for an explicit list of entry points (tests use their own),
+/// for the default deployment target.
 pub fn printManifest(gpa: std.mem.Allocator, out: *std.ArrayList(u8), comptime fms: []const FunctionMetadata) !void {
-    return printManifestWith(gpa, out, fms, &.{});
+    return printManifestWith(gpa, out, fms, &.{}, target.default);
 }
 
 /// `!air.sampler_states = !{!N, ...}` with `!N = !{!"air.sampler_state",
@@ -437,19 +449,29 @@ pub fn printManifest(gpa: std.mem.Allocator, out: *std.ArrayList(u8), comptime f
 pub const sampler_states_list = "air.sampler_states";
 pub const sampler_state_tag = "air.sampler_state";
 
-pub fn printManifestWith(gpa: std.mem.Allocator, out: *std.ArrayList(u8), comptime fms: []const FunctionMetadata, samplers: []const []const u8) !void {
+/// The module-level lists of `profile` as text. `moduleLists` needs the
+/// profile at comptime, so this picks the matching one of the known profiles.
+fn printModuleLists(gpa: std.mem.Allocator, nodes: *std.ArrayList(u8), named: *std.ArrayList(u8), next: *u32, profile: target.Profile) !void {
+    inline for (target.profiles) |p| {
+        if (p.name == profile.name) {
+            inline for (comptime moduleLists(p)) |list| {
+                var refs: std.ArrayList(u8) = .empty;
+                inline for (list.nodes) |node| {
+                    const id = try printNode(gpa, nodes, next, node, "");
+                    try appendRef(gpa, &refs, id);
+                }
+                try named.print(gpa, "!{s} = !{{{s}}}\n", .{ list.name, refs.items });
+            }
+        }
+    }
+}
+
+pub fn printManifestWith(gpa: std.mem.Allocator, out: *std.ArrayList(u8), comptime fms: []const FunctionMetadata, samplers: []const []const u8, profile: target.Profile) !void {
     var next: u32 = 0;
     var nodes: std.ArrayList(u8) = .empty;
     var named: std.ArrayList(u8) = .empty;
 
-    inline for (module_lists) |list| {
-        var refs: std.ArrayList(u8) = .empty;
-        inline for (list.nodes) |node| {
-            const id = try printNode(gpa, &nodes, &next, node, "");
-            try appendRef(gpa, &refs, id);
-        }
-        try named.print(gpa, "!{s} = !{{{s}}}\n", .{ list.name, refs.items });
-    }
+    try printModuleLists(gpa, &nodes, &named, &next, profile);
     inline for (stage_order) |stage| {
         var refs: std.ArrayList(u8) = .empty;
         inline for (fms) |fm| {
@@ -514,11 +536,18 @@ fn printNode(gpa: std.mem.Allocator, nodes: *std.ArrayList(u8), next: *u32, comp
 /// and `!air.sampler_states` for the constexpr sampler globals the
 /// assembler saw as sampler operands (`samplers`; empty for a module that
 /// samples through bound samplers only).
-pub fn lowerModule(b: *Builder, comptime fm: FunctionMetadata, func: Builder.Function.Index, samplers: []const Builder.Global.Index) !void {
-    inline for (module_lists) |list| {
-        var operands: [list.nodes.len]Builder.Metadata = undefined;
-        inline for (list.nodes, 0..) |node, idx| operands[idx] = try lowerNode(b, node, func);
-        try b.addNamedMetadata(try b.string(list.name), &operands);
+pub fn lowerModule(b: *Builder, comptime fm: FunctionMetadata, func: Builder.Function.Index, samplers: []const Builder.Global.Index, profile: target.Profile) !void {
+    // `moduleLists` needs the profile at comptime: pick the matching one of
+    // the few known profiles (only these lists are instantiated per profile,
+    // not the entry-point node below).
+    inline for (target.profiles) |p| {
+        if (p.name == profile.name) {
+            inline for (comptime moduleLists(p)) |list| {
+                var operands: [list.nodes.len]Builder.Metadata = undefined;
+                inline for (list.nodes, 0..) |node, idx| operands[idx] = try lowerNode(b, node, func);
+                try b.addNamedMetadata(try b.string(list.name), &operands);
+            }
+        }
     }
     const fn_node = try lowerNode(b, fm.node, func);
     try b.addNamedMetadata(try b.string(stageListName(fm.stage)), &.{fn_node});
@@ -819,7 +848,7 @@ test "D2 textures and samplers: air.texture nodes per access, air.sampler node, 
     defer arena.deinit();
     const gpa = arena.allocator();
     var out: std.ArrayList(u8) = .empty;
-    try printManifestWith(gpa, &out, &.{ test_textured_fragment_fm, test_texture_kernel_fm }, &.{ "gpu.constexprSampler.Holder.state", "__air_sampler_state.1" });
+    try printManifestWith(gpa, &out, &.{ test_textured_fragment_fm, test_texture_kernel_fm }, &.{ "gpu.constexprSampler.Holder.state", "__air_sampler_state.1" }, target.default);
     const text = out.items;
     // Fragment: position, then texture slot 3 (sample), sampler slot 2, read_write texture slot 4.
     try std.testing.expect(has(text, "!{i32 1, !\"air.texture\", !\"air.location_index\", i32 3, i32 1, !\"air.sample\", !\"air.arg_type_name\", !\"texture2d<float, sample>\", !\"air.arg_name\", !\"tex\"}\n"));

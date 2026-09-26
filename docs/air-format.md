@@ -19,7 +19,7 @@ payload`.
 ├─────────────────────────────┤ 88
 │ function list               │   u32 count, then one entry per function
 ├─────────────────────────────┤
-│ header extension            │   HDYN, RLST, UUID, ENDT
+│ header extension            │   [HDYN,] RLST, UUID, ENDT
 ├─────────────────────────────┤
 │ public metadata             │   one stub per function
 ├─────────────────────────────┤
@@ -27,7 +27,7 @@ payload`.
 ├─────────────────────────────┤
 │ bitcode                     │   wrapped + 16-byte-padded blob per function
 ├─────────────────────────────┤
-│ dynamic header              │   NAME "<library name>\0", ENDT
+│ dynamic header (2.9 only)   │   NAME "<library name>\0", ENDT
 ├─────────────────────────────┤
 │ reflection list             │   u32 count = 0
 └─────────────────────────────┘ file size
@@ -40,9 +40,10 @@ payload`.
 | 0 | `char[4]` | `"MTLB"` | magic |
 | 4 | u16 | `0x8001` | undocumented; looks like platform + flags |
 | 6 | u16 | `2` | format version major |
-| 8 | u16 | `9` | format version minor |
+| 8 | u16 | `9` | format version minor; follows the deployment target (§1.7) |
 | 10 | u16 | `0x8100` | undocumented |
-| 12 | u32 | `26` | undocumented; matches the macOS SDK major |
+| 12 | u16 | `26` | the deployment target's macOS major — *not* the SDK's (§1.7) |
+| 14 | u16 | `0` | the deployment target's macOS minor (a 26.1 target writes `1`) |
 | 16 | u64 | | total file size |
 | 24 | u64 | `88` | function-list offset |
 | 32 | u64 | | function-list size. Apple's value **excludes the final `ENDT`**, and the reader stops at `ENDT` anyway |
@@ -64,17 +65,20 @@ followed by tags and a bare `ENDT` (no length field).
 | `TYPE` | u8 | stage: `0` vertex, `1` fragment, `2` kernel |
 | `HASH` | 32 bytes | SHA-256 of the function's **padded, wrapped** bitcode blob |
 | `OFFT` | 3 × u64 | offsets of this function's public metadata, private metadata and bitcode, each relative to its own section |
-| `VERS` | 4 × u16 | AIR version major/minor, then Metal language major/minor — here `2, 8, 4, 0` |
+| `VERS` | 4 × u16 | AIR version major/minor, then Metal language major/minor — `2, 8, 4, 0` for macOS 26 (§1.7) |
 | `MDSZ` | u64 | length of the padded, wrapped bitcode blob |
 | `RFLT` | u64 | `0`; reflection-related, unused here |
 
 ### 1.3 Header extension
 
-Three tags plus a terminator, 70 bytes total:
+Three tags plus a terminator, 70 bytes, for format 2.9 (macOS 26). The older formats
+(macOS 15, 14, 13) have no `HDYN` and no dynamic header: the extension is `RLST`,
+`UUID`, `ENDT` (48 bytes), and the reflection list starts right where the bitcode ends
+(§1.7).
 
 | tag | payload | meaning |
 | --- | --- | --- |
-| `HDYN` | 2 × u64 | offset and size of the dynamic header |
+| `HDYN` | 2 × u64 | offset and size of the dynamic header (format 2.9 only) |
 | `RLST` | 2 × u64 | offset and size of the reflection list |
 | `UUID` | 16 bytes | library identity. Ours is the first 16 bytes of a SHA-256 over all bitcode blobs, so identical shaders produce byte-identical libraries — the runtime uses it as a cache key |
 | `ENDT` | — | terminator |
@@ -106,9 +110,57 @@ wrapper's own size field stays the *unpadded* length.
 
 ### 1.6 Dynamic header and reflection list
 
-Dynamic header: a `NAME` tag holding the library name (`default.metallib\0`) plus
-`ENDT`. Reflection list: a single `u32 0`. The runtime ignores the reflection list, but
-`metal-objdump` refuses to open a library that has no count there.
+Dynamic header (format 2.9 only): a `NAME` tag holding the library name
+(`default.metallib\0`) plus `ENDT`. Reflection list: ours is a single `u32 0`. Apple
+writes real reflection data there (`RBUF`/`AIRR` records). The runtime ignores the list,
+but `metal-objdump` refuses to open a library that has no count there.
+
+### 1.7 Deployment targets
+
+A library is stamped for the oldest macOS that must load it. On macOS 26.3, libraries
+that target 26.0, 26.4 and 26.9 load, and a macOS 27.0 target is rejected with
+`Unsupported target triple`. So Metal refuses a newer macOS *major* than the running one
+and accepts newer minors of the same major. It decides from the bitcode's target triple,
+not the container header: a 26 triple loads with its header forged to 27, and a 27
+triple is rejected with its header forged to 26.
+
+Compiling one probe shader with `xcrun metal -mmacosx-version-min=<os> -std=<metal>`
+for each target (macOS 26.5 SDK, metalfe-32023.883, run on macOS 26.3) shows these
+values differing between targets. Not every value changes at every step: header @8 is
+7 for both macOS 14 and 13. The Metal column is the highest language version each
+target supports, which is what the profiles emit. That is a choice, not something the
+target dictates: a macOS 26 build with `-std=metal3.2` carries `VERS 2,8,3,2`.
+
+| target | triple | header @8 | header @12 | `VERS` | `!air.version` | `!air.language_version` |
+| --- | --- | --- | --- | --- | --- | --- |
+| macOS 26 | `air64_v28-apple-macosx26.0.0` | 9 | 26 | `2,8,4,0` | 2.8.0 | Metal 4.0.0 |
+| macOS 15 | `air64_v27-apple-macosx15.0.0` | 8 | 15 | `2,7,3,2` | 2.7.0 | Metal 3.2.0 |
+| macOS 14 | `air64_v26-apple-macosx14.0.0` | 7 | 14 | `2,6,3,1` | 2.6.0 | Metal 3.1.0 |
+| macOS 13 | `air64_v25-apple-macosx13.0.0` | 7 | 13 | `2,5,3,0` | 2.5.0 | Metal 3.0.0 |
+
+The triple's `vNN` is always `20 +` the AIR minor. The header's target (major at @12,
+minor at @14) is the *target's* version: the macOS 26.5 SDK writes 15, 0 when targeting
+macOS 15. Two structural differences come on top of the stamps:
+
+- only macOS 26 (format 2.9) has the `HDYN` tag and the dynamic header (§1.3, §1.6);
+- macOS 13 output has no `frame-pointer` module flag. It also writes `undef` where the
+  newer targets write `poison`, drops `noundef` parameter attributes, and uses an older
+  function-attribute set. The profiles reproduce the flag only. This project emits no
+  attribute groups, and its `poison` is one more reason the macOS 13 profile is
+  unverified.
+
+No profile reproduces Apple's `SDK Version` module flag or its real reflection list
+(§1.6); the macOS 26 library passes every check without either.
+
+The datalayout, the binding limits, the compile options, and the signatures of the two
+intrinsics the probe calls (`air.simd_sum.f32`, `air.sample_texture_2d.v4f32`) are
+identical across all four. After normalizing the stamps, the macOS 26 disassembly
+differs from the 15 and 14 ones only in function offsets. All four Apple-built
+libraries load and build pipelines on macOS 26.
+
+`tools/air/target.zig` holds this table, `-Dmetal-target` selects a row, and the packer
+and metadata reproduce each row's container layout and module flags. Only macOS 26 is
+usable today; see §2, *Bitcode version*.
 
 ---
 
@@ -123,9 +175,16 @@ target datalayout = "e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-f3
 do we: the module contains the entry point, every function it reaches through calls, and
 only the globals and declarations those name.
 
-**Bitcode version.** Metal's runtime accepts bitcode written by a current LLVM with
-**opaque pointers**; this was measured, and it contradicts the typed-pointer downgrade
-other AIR projects perform. Two limits apply: Apple's LLVM-15-era *reader* rejects
+**Bitcode version.** For an AIR 2.8 (macOS 26) library, Metal's runtime accepts bitcode
+written by a current LLVM with **opaque pointers**, even though Apple's own compiler
+still emits typed pointers for every target. That does **not** hold for older targets.
+macOS 26 loads an older-AIR library through an *upgrader*, and pipeline creation fails
+with `Failed to upgrade function bitcode` on opaque-pointer bitcode stamped AIR 2.7,
+2.6 or 2.5. Apple's typed-pointer libraries for those targets upgrade fine, and Apple's
+own assembler, given our opaque-pointer text with the macOS 15 stamp, fails the same
+way. So the typed-pointer requirement other AIR projects work around is real for older
+targets. Whether macOS 13–15 read opaque pointers natively, without the upgrader, has
+not been tested. Two further limits apply: Apple's LLVM-15-era *reader* rejects
 attributes and instruction flags newer than it knows (`Failed to materializeAll`), so
 LLVM ≥ 19 flags (`trunc nuw`, `zext nneg`, `or disjoint`, `icmp samesign`, gep
 `nuw`/`nusw`) must not be encoded; and `xcrun metal` needs `-Xclang -opaque-pointers` to

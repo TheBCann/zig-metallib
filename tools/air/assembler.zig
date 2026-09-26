@@ -91,6 +91,7 @@ const WipFunction = Builder.WipFunction;
 const metadata = @import("metadata.zig");
 const intrinsics = @import("intrinsics.zig");
 const divergence = @import("divergence.zig");
+const air_target = @import("target.zig");
 
 pub const Error = error{
     OutOfMemory,
@@ -109,8 +110,6 @@ pub const Options = struct {
     entry: []const u8,
     /// Metadata to attach for that entry point.
     fm: metadata.FunctionMetadata,
-    triple: []const u8,
-    datalayout: []const u8,
 };
 
 /// Prefix air-splice puts in front of LLVM's numbered temporaries (`%7` ->
@@ -122,23 +121,24 @@ pub const numbered_prefix = "__";
 /// constant globals.
 const constant_space: Builder.AddrSpace = @fromBackingInt(@intCast(2));
 
-/// Assemble one entry point into a bitcode module. Returns the raw bitcode
-/// bytes (no darwin wrapper).
-pub fn assemble(gpa: Allocator, ir: []const u8, comptime opts: Options) Error![]u8 {
+/// Assemble one entry point into a bitcode module for the deployment target
+/// `profile` (triple and `!air.version` / `!air.language_version`). Returns
+/// the raw bitcode bytes (no darwin wrapper).
+pub fn assemble(gpa: Allocator, ir: []const u8, comptime opts: Options, profile: air_target.Profile) Error![]u8 {
     var b = try Builder.init(.{ .allocator = gpa, .strip = true, .name = "air-splice" });
     defer b.deinit();
-    try build(&b, gpa, ir, opts);
+    try build(&b, gpa, ir, opts, profile);
     const words = try b.toBitcode(gpa, .{ .name = "zig air-splice", .version = .{ .major = 0, .minor = 1, .patch = 0 } });
     defer gpa.free(words);
     return gpa.dupe(u8, std.mem.sliceAsBytes(words));
 }
 
 /// Populate `b` with the module for `opts.entry`.
-fn build(b: *Builder, gpa: Allocator, ir: []const u8, comptime opts: Options) Error!void {
+fn build(b: *Builder, gpa: Allocator, ir: []const u8, comptime opts: Options, profile: air_target.Profile) Error!void {
     b.source_filename = try b.string(opts.entry);
-    b.target_triple = try b.string(opts.triple);
+    b.target_triple = try b.string(profile.triple);
     b.data_layout.deinit(gpa);
-    b.data_layout = try Builder.DataLayout.parseString(try b.string(opts.datalayout), b);
+    b.data_layout = try Builder.DataLayout.parseString(try b.string(air_target.datalayout), b);
 
     var mod = ModuleState{ .gpa = gpa, .b = b };
     defer mod.deinit();
@@ -193,7 +193,7 @@ fn build(b: *Builder, gpa: Allocator, ir: []const u8, comptime opts: Options) Er
     try mod.queue(entry);
     var i: usize = 0;
     while (i < mod.worklist.items.len) : (i += 1) try mod.lowerDefine(mod.worklist.items[i]);
-    try metadata.lowerModule(b, opts.fm, mod.defines.items[entry].func.?, mod.samplers.items);
+    try metadata.lowerModule(b, opts.fm, mod.defines.items[entry].func.?, mod.samplers.items, profile);
 }
 
 fn fail(line_no: usize, line: []const u8, msg: []const u8, err: Error) Error {
@@ -2120,8 +2120,6 @@ const Cursor = struct {
 
 // ── Tests ───────────────────────────────────────────────────────────────────
 
-const test_datalayout = "e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-f32:32:32-f64:64:64-v16:16:16-v24:32:32-v32:32:32-v48:64:64-v64:64:64-v96:128:128-v128:128:128-v192:256:256-v256:256:256-v512:512:512-v1024:1024:1024-n8:16:32";
-const test_triple = "air64_v28-apple-macosx26.0.0";
 const test_header =
     \\target datalayout = "e-p:64:64:64"
     \\target triple = "air64_v28-apple-macosx26.0.0"
@@ -2206,7 +2204,7 @@ fn testRoundTrip(gpa: Allocator, module: []const u8) ![]u8 {
 fn testRoundTripAs(gpa: Allocator, module: []const u8, comptime entry: []const u8, comptime fm: metadata.FunctionMetadata) ![]u8 {
     var b = try Builder.init(.{ .allocator = gpa, .strip = true, .name = "air-splice" });
     defer b.deinit();
-    try build(&b, gpa, module, .{ .entry = entry, .fm = fm, .triple = test_triple, .datalayout = test_datalayout });
+    try build(&b, gpa, module, .{ .entry = entry, .fm = fm }, air_target.default);
     const words = try b.toBitcode(gpa, .{ .name = "zig air-splice", .version = .{ .major = 0, .minor = 1, .patch = 0 } });
     defer gpa.free(words);
     const bytes = std.mem.sliceAsBytes(words);
@@ -2225,7 +2223,7 @@ fn testFails(gpa: Allocator, module: []const u8) !void {
 fn testFailsAs(gpa: Allocator, module: []const u8, comptime entry: []const u8, comptime fm: metadata.FunctionMetadata) !void {
     var b = try Builder.init(.{ .allocator = gpa, .strip = true, .name = "air-splice" });
     defer b.deinit();
-    try std.testing.expectError(error.Unsupported, build(&b, gpa, module, .{ .entry = entry, .fm = fm, .triple = test_triple, .datalayout = test_datalayout }));
+    try std.testing.expectError(error.Unsupported, build(&b, gpa, module, .{ .entry = entry, .fm = fm }, air_target.default));
 }
 
 test "assembles the converted vertex/fragment pair into bitcode" {
@@ -2276,9 +2274,7 @@ test "assembles the converted vertex/fragment pair into bitcode" {
         const bc = try assemble(gpa, ir, .{
             .entry = fm.name,
             .fm = fm,
-            .triple = test_triple,
-            .datalayout = test_datalayout,
-        });
+        }, air_target.default);
         try std.testing.expect(bc.len > 64);
         try std.testing.expectEqualStrings("BC\xC0\xDE", bc[0..4]);
     }
@@ -2603,7 +2599,7 @@ test "D5.8 quoted named types: `%\"q.Pair(f32)\"` definitions and references res
         \\  ret <4 x float> %__0
         \\}
         \\
-    , .{ .entry = "fragmentShader", .fm = fragment_fm, .triple = test_triple, .datalayout = test_datalayout }));
+    , .{ .entry = "fragmentShader", .fm = fragment_fm }, air_target.default));
 }
 
 test "D5.9 LLVM 19 flags on casts and binary ops are dropped" {
@@ -3815,4 +3811,43 @@ test "D1 phi over getelementptr constant expressions into relocated tables" {
     );
     try std.testing.expect(has(text2, "phi ptr addrspace(2) [ null, %"));
     try std.testing.expect(has(text2, "icmp eq ptr addrspace(2) %"));
+}
+
+test "the bitcode's triple and module metadata follow the deployment target (literal values from Apple's output)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const gpa = arena.allocator();
+    const module = test_header ++
+        \\define <4 x float> @fragmentShader(<4 x float> %__0, <3 x float> %__1, <2 x float> %__2, ptr addrspace(1) %__3) {
+        \\  ret <4 x float> %__0
+        \\}
+        \\
+    ;
+    // `xcrun metal -mmacosx-version-min=<os> -std=<metal>` disassemblies
+    // (macOS 26.5 SDK): triple, !air.version, !air.language_version, and the
+    // frame-pointer module flag that macOS 13 output does not carry.
+    const Expect = struct { name: air_target.Name, triple: []const u8, air: []const u8, metal: []const u8, frame_pointer: bool };
+    const apple = [_]Expect{
+        .{ .name = .macos26, .triple = "target triple = \"air64_v28-apple-macosx26.0.0\"", .air = "i32 2, i32 8, i32 0", .metal = "!\"Metal\", i32 4, i32 0, i32 0", .frame_pointer = true },
+        .{ .name = .macos15, .triple = "target triple = \"air64_v27-apple-macosx15.0.0\"", .air = "i32 2, i32 7, i32 0", .metal = "!\"Metal\", i32 3, i32 2, i32 0", .frame_pointer = true },
+        .{ .name = .macos13, .triple = "target triple = \"air64_v25-apple-macosx13.0.0\"", .air = "i32 2, i32 5, i32 0", .metal = "!\"Metal\", i32 3, i32 0, i32 0", .frame_pointer = false },
+    };
+    for (apple) |e| {
+        var b = try Builder.init(.{ .allocator = gpa, .strip = true, .name = "air-splice" });
+        defer b.deinit();
+        try build(&b, gpa, module, .{ .entry = "fragmentShader", .fm = fragment_fm }, air_target.get(e.name));
+        var aw: std.Io.Writer.Allocating = .init(gpa);
+        try b.print(&aw.writer);
+        const text = aw.written();
+        try std.testing.expect(has(text, e.triple));
+        try std.testing.expect(has(text, e.air));
+        try std.testing.expect(has(text, e.metal));
+        try std.testing.expectEqual(e.frame_pointer, has(text, "!\"frame-pointer\""));
+        try std.testing.expect(has(text, "!\"air.compile.fast_math_enable\""));
+        try std.testing.expect(has(text, "!\"air.max_samplers\", i32 16"));
+        // No other profile's versions leak in.
+        for (apple) |other| {
+            if (other.name != e.name) try std.testing.expect(!has(text, other.metal));
+        }
+    }
 }

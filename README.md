@@ -32,14 +32,17 @@ what we produce.
 ```sh
 zig build                                              # shaders + library + app
 zig build run                                          # opens a window, textured triangle
-zig build test                                         # 78 tests
+zig build test                                         # 90 tests
 zig build metallib                                     # zig-out/bin/{default.metallib,shader.air.ll}
 zig build check -- zig-out/bin/default.metallib         # load into Metal, run everything
 xcrun metal-objdump -d zig-out/bin/default.metallib     # read our container back
 ```
 
-Requires a nightly Zig (developed against **0.17.0-dev.2257+3bfb29994**) and macOS.
-`std.zig.llvm.Builder` is an internal standard-library API and moves between nightlies.
+Requires a nightly Zig (pinned to **0.17.0-dev.2257+3bfb29994** in `build.zig.zon`) and
+macOS 26 or newer to run the result. `std.zig.llvm.Builder` is an internal
+standard-library API and moves between nightlies, so `zig build` warns when a different
+Zig runs it. ziglang.org deletes old nightlies, so an exact pin may need a community
+mirror to fetch.
 
 ## What is verified, and how
 
@@ -51,7 +54,7 @@ are read back and compared.
 
 | gate | what it proves | result |
 | --- | --- | --- |
-| `zig build test` | rewriter, assembler, metadata, packer, uniformity analysis | 78 tests pass |
+| `zig build test` | rewriter, assembler, metadata, packer, uniformity analysis, target profiles | 90 tests pass |
 | `zig build` | Zig → IR → container, end to end | builds |
 | `zig build check -- …` | Metal loads it, compiles every pipeline, and the GPU computes the right answers | **42 ok, 0 fail** |
 | `xcrun metal-objdump -d` | our container is readable by Apple's own tooling | passes |
@@ -77,6 +80,12 @@ The 42 checks cover 15 entry points — 2 vertex, 3 fragment, 10 kernels — inc
   (10-core GPU), Metal 4, `air64_v28-apple-macosx26.0.0`. It has not been run on any
   other machine or OS version. The container header carries values copied from that
   toolchain's output; other Metal versions may differ.
+- **macOS 26 and newer only.** Libraries are stamped for macOS 26 (`-Dmetal-target`).
+  Profiles for macOS 13–15 exist, reproducing Apple's container layout and stamps,
+  but they are refused by default. macOS 26 rejects this project's opaque-pointer
+  bitcode under an older AIR version (`Failed to upgrade function bitcode`). Apple uses
+  typed pointers for those targets, and `std.zig.llvm.Builder` can only write opaque
+  ones. See [docs/pipeline.md](docs/pipeline.md#deployment-targets).
 - **The AIR format is undocumented.** The container layout, the `!air.*` metadata and
   the sampler bit layout here were reverse-engineered from Apple's output and
   confirmed by repacking, loading and running. A few header fields are reproduced
@@ -104,9 +113,11 @@ Julia. What is different here:
   themselves, so the manifest cannot drift from the shader signatures;
 - it does **graphics** (vertex/fragment, MRT, depth, textures, samplers), not only
   compute;
-- Metal's runtime compiler accepts **opaque-pointer, LLVM-20-era bitcode**, which
-  contradicts the typed-pointer requirement other projects work around. That was
-  measured here, not assumed.
+- Metal's runtime compiler accepts **opaque-pointer, LLVM-20-era bitcode for macOS 26
+  (AIR 2.8)**, even though Apple's own compiler still emits typed pointers. For older
+  targets the typed-pointer requirement other projects work around is real: macOS 26
+  refuses opaque pointers under an AIR 2.7-or-older stamp, and Apple's assembler
+  reproduces the refusal. Both findings were measured here, not assumed.
 
 ## Layout
 
@@ -123,9 +134,11 @@ tools/air/divergence.zig    uniformity analysis behind the convergent-call check
 tools/air/intrinsics.zig    which llvm.* Metal accepts, renames, or cannot take at all
 tools/air/metadata.zig      manifest → !air.* metadata (text and bitcode)
 tools/air/metallib.zig      MTLB container writer
+tools/air/target.zig        deployment-target profiles: triple, versions, header stamps
 tools/metallib_check.zig    loads a library into Metal and runs every entry point
 docs/pipeline.md            how the pipeline works, and how to add a shader
 docs/air-format.md          the container, bitcode dialect and metadata reference
+.github/workflows/ci.yml    build, test and runtime checks on GitHub's macOS runners
 ```
 
 ## Documentation

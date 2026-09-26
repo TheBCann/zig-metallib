@@ -1,11 +1,18 @@
 //! Shaders written in Zig.
 //!
 //! Build pipeline (see build.zig):
-//!   this file --zig (nvptx64 target)--> LLVM IR --air-splice--> AIR IR --xcrun metal--> default.metallib
+//!   this file --zig (nvptx64 target)--> LLVM IR --air-splice (rewrite + assemble + pack)--> default.metallib
 //!
 //! Rules for shader code here:
-//!   * No `std` in shader bodies. The file is compiled for a GPU target with
-//!     no runtime. The one exception is the `panic` declaration below.
+//!   * Keep `std` facilities out of shader bodies. Importing `std` is fine —
+//!     this file does, for the `std.debug.no_panic` below — but *referencing*
+//!     its runtime side (`std.log`, the default panic, anything reaching
+//!     `std.Io`) instantiates `std.Io.Threaded`, which wants thread-local
+//!     storage and host syscalls that mean nothing on a GPU. Zig compiles
+//!     only what is referenced, so as long as shader code names none of that,
+//!     no runtime machinery reaches the AIR. If on-device logging is ever
+//!     wanted, the way in is a custom `std_options` with a `logFn` (and a
+//!     minimal `Io`) that talks to the host, not the default threaded IO.
 //!   * Buffer pointers use `addrspace(.global)`, which lowers to LLVM
 //!     addrspace(1) == Metal's `device` address space. Constant buffers are
 //!     `*addrspace(.param) const T` (nvptx 4, renumbered to Metal's 2), and

@@ -1,8 +1,28 @@
 const std = @import("std");
+const builtin = @import("builtin");
+const zon = @import("build.zig.zon");
+const air_target = @import("tools/air/target.zig");
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+
+    // The project pins one Zig nightly in build.zig.zon. The assembler is
+    // built on std.zig.llvm.Builder, which changes between nightlies, so say
+    // up front when the running compiler differs rather than leaving the
+    // mismatch to surface as an unrelated-looking compile error.
+    if (!std.mem.eql(u8, builtin.zig_version_string, zon.minimum_zig_version)) {
+        std.log.warn("this project is pinned to Zig {s} (build.zig.zon) but this is Zig {s}; " ++
+            "std.zig.llvm.Builder changes between nightlies, so build errors may come from the version mismatch", .{ zon.minimum_zig_version, builtin.zig_version_string });
+    }
+
+    // The oldest macOS the generated library must load on (tools/air/target.zig).
+    // Metal refuses a library that targets a newer macOS major than the one running.
+    const metal_target = b.option(air_target.Name, "metal-target", "macOS version the .metallib targets (default macos26)") orelse air_target.default.name;
+    // Only macos26 is verified; the older targets need typed-pointer bitcode
+    // (tools/air/target.zig). This builds one anyway, e.g. to run
+    // `zig build check` on that macOS and learn whether it accepts it.
+    const allow_unverified = b.option(bool, "allow-unverified-target", "Build a -Dmetal-target that is not verified to work") orelse false;
 
     // ── 1. Shaders: Zig source -> LLVM IR ──────────────────────────────────
     // Zig only allows GPU address spaces on GPU targets, so the shader module
@@ -48,6 +68,8 @@ pub fn build(b: *std.Build) void {
     });
     const splice = b.addExecutable(.{ .name = "air-splice", .root_module = splice_mod });
     const run_splice = b.addRunArtifact(splice);
+    run_splice.addArg(b.fmt("--target={t}", .{metal_target}));
+    if (allow_unverified) run_splice.addArg("--allow-unverified");
     run_splice.addFileArg(shader_ir);
     const metallib = run_splice.addOutputFileArg("default.metallib");
     // Debug text output: the rewritten IR plus metadata, also accepted by
@@ -120,4 +142,7 @@ pub fn build(b: *std.Build) void {
     const splice_tests = b.addTest(.{ .root_module = splice_mod });
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&b.addRunArtifact(splice_tests).step);
+    // Compile (not run) metallib-check too: nothing else builds it without a
+    // GPU, so a compile error in it would otherwise pass `zig build test`.
+    test_step.dependOn(&check.step);
 }

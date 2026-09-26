@@ -1,5 +1,9 @@
 //! metallib-check: load a .metallib into Metal and validate it the way the
 //! app would, from the shader manifest (DESIGN.md D7):
+//!   * the deployment target the header is stamped for (tools/air/target.zig)
+//!     and the library's own VERS, printed as an `info` line, with a `note`
+//!     when the target is a newer macOS major than the running one (Metal
+//!     then rejects it with "Unsupported target triple"),
 //!   * `newLibraryWithData:` and `newFunctionWithName:` for every entry,
 //!   * a render pipeline for every (vertex, fragment) pair whose `stage_in`
 //!     type is the vertex output type, with the colour / depth attachment
@@ -15,6 +19,7 @@
 //!     pixel per attachment back through a blit and compares it with what
 //!     the shaders must produce (the discarded pixel included).
 //! Prints one `ok  ...` line per check, `FAIL ...` and exit code 1 otherwise.
+//! Without a Metal device (a CI runner, say) it prints `SKIP ...` and exits 77.
 //! All Metal calls go through objc.msgSend; no C or Objective-C sources.
 //!
 //! Usage: metallib-check <file.metallib>
@@ -22,6 +27,8 @@
 const std = @import("std");
 const objc = @import("objc");
 const shader = @import("shader");
+const air_target = @import("air/target.zig");
+const container = @import("air/metallib.zig");
 
 extern "c" fn MTLCreateSystemDefaultDevice() ?objc.Object;
 
@@ -74,10 +81,45 @@ pub fn main(init: std.process.Init) !void {
     }
     const bytes = try std.Io.Dir.cwd().readFileAlloc(io, args[1], arena, .unlimited);
 
+    // Which deployment target the library is stamped for (tools/air/target.zig).
+    const stamp = container.readStamp(bytes) orelse {
+        if (std.mem.startsWith(u8, bytes, "MTLB")) {
+            std.debug.print("FAIL {s} is truncated: {d} bytes, shorter than the 88-byte MTLB header\n", .{ args[1], bytes.len });
+        } else {
+            std.debug.print("FAIL {s} is not a .metallib (no MTLB header)\n", .{args[1]});
+        }
+        std.process.exit(1);
+    };
+    const lib_target = stamp.macos;
+    if (stamp.vers) |v| {
+        std.debug.print("info library targets macOS {d}.{d}, compiled as AIR {d}.{d} / Metal {d}.{d}", .{ lib_target.major, lib_target.minor, v[0], v[1], v[2], v[3] });
+    } else {
+        std.debug.print("info library targets macOS {d}.{d} (no VERS tag found)", .{ lib_target.major, lib_target.minor });
+    }
+    if (air_target.fromHeader(stamp.container_minor, lib_target.major)) |p| {
+        std.debug.print(" (profile {t}{s})\n", .{ p.name, if (p.verified) "" else ", unverified" });
+    } else {
+        std.debug.print(" (format 2.{d}: no known profile)\n", .{stamp.container_minor});
+    }
+    // Metal refuses a newer macOS major than the running one and accepts newer
+    // minors. It decides from the bitcode triple, which this header mirrors,
+    // so this is a note that explains the failure to come, not a verdict.
+    if (hostMacos()) |host| {
+        if (!lib_target.acceptedOn(host)) {
+            std.debug.print("note library targets macOS {d}.{d} but this is macOS {d}.{d}: Metal rejects a newer macOS major (\"Unsupported target triple\"); rebuild for this macOS with -Dmetal-target\n", .{ lib_target.major, lib_target.minor, host.major, host.minor });
+        }
+    }
+
     const pool = objc.objc_autoreleasePoolPush();
     defer objc.objc_autoreleasePoolPop(pool);
 
-    const device = MTLCreateSystemDefaultDevice() orelse return error.NoMetalDevice;
+    const device = MTLCreateSystemDefaultDevice() orelse {
+        // A machine without a usable GPU (a CI runner, say) lands here. Exit 77,
+        // the conventional "skipped" code, so a workflow can tell "not run"
+        // from "failed".
+        std.debug.print("SKIP no Metal device available; nothing was checked\n", .{});
+        std.process.exit(77);
+    };
 
     const data = objc.dispatch_data_create(bytes.ptr, bytes.len, null, null) orelse return error.DispatchDataFailed;
     defer objc.dispatch_release(data);
@@ -154,6 +196,15 @@ pub fn main(init: std.process.Init) !void {
     if (comptime findFunction("copyTextureKernel")) |i| try testCopyTextureKernel(device, pipelines[i].?);
 
     if (failed) std.process.exit(1);
+}
+
+/// The running macOS version, from `kern.osproductversion` ("26.3"); null
+/// when it cannot be read.
+fn hostMacos() ?air_target.Version {
+    var buf: [32]u8 = undefined;
+    var len: usize = buf.len;
+    if (std.c.sysctlbyname("kern.osproductversion", &buf, &len, null, 0) != 0) return null;
+    return air_target.Version.parse(std.mem.sliceTo(buf[0..len], 0));
 }
 
 fn stageInType(comptime f: shader.air.Function) ?type {

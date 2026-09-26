@@ -270,9 +270,39 @@ host build.
 | `zig build metallib` | installs `zig-out/bin/default.metallib` and `shader.air.ll` |
 | `zig build check -- <lib>` | loads any `.metallib` into Metal, builds every pipeline, runs the dispatch and render self-tests |
 | `-Dshader-optimize=<mode>` | optimize mode of the GPU module (`fast` default; `safe` keeps Zig's safety checks) |
+| `-Dmetal-target=<profile>` | the macOS the library targets: `macos26` (default), `macos15`, `macos14`, `macos13` ([air-format.md §1.7](air-format.md#17-deployment-targets)) |
+| `-Dallow-unverified-target=true` | build a profile other than `macos26` anyway (they are refused by default; see below) |
 
 `air-splice` can also be run by hand:
-`air-splice <in.ll> <out.metallib> [out.ll]`.
+`air-splice [--target=<profile>] [--allow-unverified] <in.ll> <out.metallib> [out.ll]`.
+
+`zig build` prints a warning when the running Zig differs from the version pinned in
+`build.zig.zon`, because `std.zig.llvm.Builder` changes between nightlies.
+
+### Deployment targets
+
+The library is stamped for macOS 26 by default. `tools/air/target.zig` also carries the
+macOS 15, 14 and 13 profiles, whose stamps match Apple's output byte for byte. They are
+refused unless you pass `-Dallow-unverified-target=true`. macOS 26 rejects this
+project's opaque-pointer bitcode under an older AIR version, and `std.zig.llvm.Builder`
+cannot write the typed pointers Apple uses there. The opt-in exists for one experiment:
+build `-Dmetal-target=macos15 -Dallow-unverified-target=true` **on macOS 15** and run
+`zig build check`. If macOS 15 reads opaque pointers natively (it skips the upgrader
+that fails on 26), that profile becomes verifiable.
+
+### Continuous integration
+
+`.github/workflows/ci.yml` runs on GitHub's `macos-15` and `macos-latest` runners. It
+reads the Zig version from `build.zig.zon` and runs `zig build test`, which also
+compiles `metallib-check`. It then runs `zig build install metallib`, which compiles the
+app and installs the library. The runtime checks run where the runner is macOS 26 or
+newer, and on macOS 15 the experiment above runs without failing the build. GitHub's
+arm64 runners are virtual machines and may expose an "Apple Paravirtual device", so the
+checks can run on a virtual GPU; confirm a failure there on a real Mac before blaming
+the library. With no Metal device at all, `metallib-check` prints `SKIP no Metal device`
+and exits 77. The step still passes (green), but it adds a `::warning::` annotation and
+a job-summary line saying nothing was checked. ziglang.org deletes old nightlies, so the
+setup step fails when no mirror still serves the pinned version.
 
 ---
 
@@ -289,6 +319,10 @@ host build.
 | `Compilation failed due to an interrupted connection: XPC_ERROR_CONNECTION_INTERRUPTED` | `MTLCompilerService` **crashed**. Something in the IR is unsupported in a way Apple does not diagnose; check `~/Library/Logs/DiagnosticReports/MTLCompilerService*.ips` for the failing instruction, and compare against the intrinsic table |
 | `FAIL dispatch …: N mismatches` | it compiled and ran, and computed the wrong thing — the most interesting failure; suspect the convergent-call rules or an intrinsic mapping |
 | `metal-objdump: unknown magic` | a bitcode blob is not padded to 16 bytes |
+| `air-splice: refusing --target=…` | that deployment target is not verified; the message says why (see *Deployment targets*) |
+| `note library targets macOS N.n but this is macOS M.m` (then `Unsupported target triple`) | the library targets a newer macOS *major* than the one running, which Metal refuses. A newer minor of the same major loads fine. Rebuild for this macOS with `-Dmetal-target` |
+| `Failed to upgrade function bitcode` | an older-AIR library with opaque pointers on macOS 26 — the reason the older profiles are unverified |
+| `SKIP no Metal device available` | no usable GPU (typically a CI runner); nothing was checked, exit code 77 |
 
 A useful bisection tool: `zig build metallib`, then
 `xcrun metal -Xclang -opaque-pointers zig-out/bin/shader.air.ll -o /tmp/apple.metallib`

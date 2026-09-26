@@ -38,7 +38,7 @@
 //!   metadata derived from the shader manifest (air/metadata.zig).
 //! Packer (air/metallib.zig): bitcode modules -> MTLB container.
 //!
-//! Usage: air-splice <in.ll> <out.metallib> [out.ll]
+//! Usage: air-splice [--target=<profile>] [--allow-unverified] <in.ll> <out.metallib> [out.ll]
 //! The optional third output is the rewritten IR plus metadata as text, which
 //! `xcrun metal -Xclang -opaque-pointers` also accepts; handy for diffing.
 
@@ -49,44 +49,107 @@ const assembler = @import("air/assembler.zig");
 const metadata = @import("air/metadata.zig");
 const metallib = @import("air/metallib.zig");
 const intrinsics = @import("air/intrinsics.zig");
+const target = @import("air/target.zig");
 
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
 const List = std.ArrayList(u8);
 const comptimePrint = std.fmt.comptimePrint;
 
-pub const air_datalayout =
-    "e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-f32:32:32-f64:64:64" ++
-    "-v16:16:16-v24:32:32-v32:32:32-v48:64:64-v64:64:64-v96:128:128-v128:128:128" ++
-    "-v192:256:256-v256:256:256-v512:512:512-v1024:1024:1024-n8:16:32";
-pub const air_triple = "air64_v28-apple-macosx26.0.0";
-
 /// Prefix used when renaming LLVM's numbered temporaries (`%7` -> `%__7`).
 /// Numbered values must stay sequential, which our edits would break.
 const rename_prefix = "__";
+
+/// `air-splice [--target=<profile>] [--allow-unverified] <in.ll> <out.metallib> [out.ll]`
+const Cli = struct {
+    profile: target.Profile = target.default,
+    allow_unverified: bool = false,
+    input: []const u8 = "",
+    output: []const u8 = "",
+    text_output: ?[]const u8 = null,
+};
+
+const CliError = error{ UnknownOption, UnknownTarget, OptionAfterFile, WrongArgCount, UnverifiedTarget };
+
+/// Parse the arguments after the program name. Options come before the
+/// files, and an argument starting with `-` among the files is an error
+/// rather than a file name, so a misplaced flag (`--target=...`, or a
+/// single-dash `-target=...`) cannot become an output path and overwrite a
+/// file. A profile whose libraries fail `zig build check` is
+/// refused unless `--allow-unverified`, rather than producing a library that
+/// only fails at pipeline creation. On error, `bad` names the offending
+/// argument (the profile name for UnknownTarget / UnverifiedTarget).
+fn parseCli(args: []const [:0]const u8, bad: *[]const u8) CliError!Cli {
+    var cli = Cli{};
+    var rest = args;
+    while (rest.len > 0 and std.mem.startsWith(u8, rest[0], "--")) : (rest = rest[1..]) {
+        if (std.mem.startsWith(u8, rest[0], "--target=")) {
+            const name = rest[0]["--target=".len..];
+            cli.profile = target.fromName(name) orelse {
+                bad.* = name;
+                return error.UnknownTarget;
+            };
+        } else if (std.mem.eql(u8, rest[0], "--allow-unverified")) {
+            cli.allow_unverified = true;
+        } else {
+            bad.* = rest[0];
+            return error.UnknownOption;
+        }
+    }
+    for (rest) |arg| {
+        if (std.mem.startsWith(u8, arg, "-")) {
+            bad.* = arg;
+            return error.OptionAfterFile;
+        }
+    }
+    if (rest.len != 2 and rest.len != 3) return error.WrongArgCount;
+    if (!cli.profile.verified and !cli.allow_unverified) {
+        bad.* = @tagName(cli.profile.name);
+        return error.UnverifiedTarget;
+    }
+    cli.input = rest[0];
+    cli.output = rest[1];
+    if (rest.len == 3) cli.text_output = rest[2];
+    return cli;
+}
 
 pub fn main(init: std.process.Init) !void {
     const arena = init.arena.allocator();
     const io = init.io;
 
     const args = try init.minimal.args.toSlice(arena);
-    if (args.len != 3 and args.len != 4) {
-        std.debug.print("usage: air-splice <in.ll> <out.metallib> [out.ll]\n", .{});
+    var bad: []const u8 = "";
+    const cli = parseCli(if (args.len > 0) args[1..] else args, &bad) catch |err| {
+        switch (err) {
+            error.UnknownTarget => {
+                std.debug.print("air-splice: unknown --target '{s}'; known targets:", .{bad});
+                for (target.profiles) |p| std.debug.print(" {t}", .{p.name});
+                std.debug.print("\n", .{});
+            },
+            error.UnknownOption => std.debug.print("air-splice: unknown option '{s}'\n", .{bad}),
+            error.OptionAfterFile => std.debug.print("air-splice: '{s}' comes after a file argument; options go before <in.ll>\n", .{bad}),
+            error.WrongArgCount => std.debug.print("usage: air-splice [--target=<profile>] [--allow-unverified] <in.ll> <out.metallib> [out.ll]\n", .{}),
+            error.UnverifiedTarget => std.debug.print("air-splice: refusing --target={s}: {s}. Pass --allow-unverified (zig build: -Dallow-unverified-target=true) to build it anyway, e.g. to run zig build check on that macOS\n", .{ bad, target.unverifiedReason(target.fromName(bad).?).? }),
+        }
         std.process.exit(1);
+    };
+    const profile = cli.profile;
+    if (target.unverifiedReason(profile)) |why| {
+        std.debug.print("air-splice: warning: building an UNVERIFIED {t} library: {s}\n", .{ profile.name, why });
     }
 
     const cwd = Io.Dir.cwd();
-    const input = try cwd.readFileAlloc(io, args[1], arena, .unlimited);
-    const rewritten = convert(arena, input) catch |err| {
-        std.debug.print("air-splice: {s}: {t}\n", .{ args[1], err });
+    const input = try cwd.readFileAlloc(io, cli.input, arena, .unlimited);
+    const rewritten = convertWith(arena, input, .{ .profile = profile }) catch |err| {
+        std.debug.print("air-splice: {s}: {t}\n", .{ cli.input, err });
         return err;
     };
 
-    if (args.len == 4) {
+    if (cli.text_output) |path| {
         var text: List = .empty;
         try text.appendSlice(arena, rewritten);
-        try metadata.printModule(arena, &text, try samplerGlobals(arena, rewritten));
-        try cwd.writeFile(io, .{ .sub_path = args[3], .data = text.items });
+        try metadata.printModule(arena, &text, try samplerGlobals(arena, rewritten), profile);
+        try cwd.writeFile(io, .{ .sub_path = path, .data = text.items });
     }
 
     var functions: [metadata.function_metadata.len]metallib.Function = undefined;
@@ -94,9 +157,7 @@ pub fn main(init: std.process.Init) !void {
         const bitcode = assembler.assemble(arena, rewritten, .{
             .entry = fm.name,
             .fm = fm,
-            .triple = air_triple,
-            .datalayout = air_datalayout,
-        }) catch |err| {
+        }, profile) catch |err| {
             std.debug.print("air-splice: assembling {s}: {t}\n", .{ fm.name, err });
             return err;
         };
@@ -110,8 +171,8 @@ pub fn main(init: std.process.Init) !void {
             .bitcode = bitcode,
         };
     }
-    const image = try metallib.pack(arena, &functions, "default.metallib");
-    try cwd.writeFile(io, .{ .sub_path = args[2], .data = image });
+    const image = try metallib.pack(arena, &functions, "default.metallib", profile);
+    try cwd.writeFile(io, .{ .sub_path = cli.output, .data = image });
 }
 
 // ── Comptime: what the manifest tells us about each entry point ─────────────
@@ -272,6 +333,8 @@ pub const ConvertOptions = struct {
     /// Fail when a manifest entry has no `define` in the input. The build
     /// wants that; tests feed fixed IR that defines only some entries.
     require_all_entries: bool = true,
+    /// Deployment target whose triple the text is stamped with.
+    profile: target.Profile = target.default,
 };
 
 /// Rewrite Zig's IR into AIR-flavoured IR text. Metadata is not included;
@@ -292,11 +355,11 @@ pub fn convertWith(gpa: Allocator, raw: []const u8, options: ConvertOptions) Err
     var lines = std.mem.splitScalar(u8, src, '\n');
     while (lines.next()) |line| {
         if (std.mem.startsWith(u8, line, "target datalayout")) {
-            try out.print(gpa, "target datalayout = \"{s}\"\n", .{air_datalayout});
+            try out.print(gpa, "target datalayout = \"{s}\"\n", .{target.datalayout});
             continue;
         }
         if (std.mem.startsWith(u8, line, "target triple")) {
-            try out.print(gpa, "target triple = \"{s}\"\n", .{air_triple});
+            try out.print(gpa, "target triple = \"{s}\"\n", .{options.profile.triple});
             continue;
         }
         if (std.mem.startsWith(u8, line, "; Function Attrs") or
@@ -1192,6 +1255,7 @@ test {
     _ = assembler;
     _ = metadata;
     _ = metallib;
+    _ = target;
 }
 
 test "parseDefine strips linkage and finds params" {
@@ -1301,7 +1365,7 @@ test "D4 helpers: reachable non-entry defines are kept, lifetime dropped, ptx_ke
     // The result assembles for the fragment entry with the helpers inside.
     inline for (metadata.function_metadata) |fm| {
         if (comptime std.mem.eql(u8, fm.name, "fragmentShader")) {
-            const bc = try assembler.assemble(gpa, out, .{ .entry = fm.name, .fm = fm, .triple = air_triple, .datalayout = air_datalayout });
+            const bc = try assembler.assemble(gpa, out, .{ .entry = fm.name, .fm = fm }, target.default);
             try std.testing.expectEqualStrings("BC\xC0\xDE", bc[0..4]);
         }
     }
@@ -1376,7 +1440,7 @@ test "D4 quoted identifiers: generic helpers `@\"mod.Vec(4).sum\"` are followed,
     // The assembler resolves the quoted calls.
     inline for (metadata.function_metadata) |fm| {
         if (comptime std.mem.eql(u8, fm.name, "fragmentShader")) {
-            const bc = try assembler.assemble(gpa, out, .{ .entry = fm.name, .fm = fm, .triple = air_triple, .datalayout = air_datalayout });
+            const bc = try assembler.assemble(gpa, out, .{ .entry = fm.name, .fm = fm }, target.default);
             try std.testing.expectEqualStrings("BC\xC0\xDE", bc[0..4]);
         }
     }
@@ -1441,7 +1505,7 @@ test "D4 quoted named types: the r5_generic shape (quoted `%` type + quoted `@` 
     // And both entries assemble.
     inline for (metadata.function_metadata) |fm| {
         if (comptime (std.mem.eql(u8, fm.name, "fragmentShader") or std.mem.eql(u8, fm.name, "vertexShader"))) {
-            const bc = try assembler.assemble(gpa, out, .{ .entry = fm.name, .fm = fm, .triple = air_triple, .datalayout = air_datalayout });
+            const bc = try assembler.assemble(gpa, out, .{ .entry = fm.name, .fm = fm }, target.default);
             try std.testing.expectEqualStrings("BC\xC0\xDE", bc[0..4]);
         }
     }
@@ -1513,7 +1577,7 @@ test "D4 kernels: an entry block that a phi names by number gets an explicit lab
     // bodies that never name their entry block keep no label (see the
     // kernel test above: its output starts with the first instruction).
     try std.testing.expect(find(out, "@my_shader.helper") == null);
-    const bc = try assembler.assemble(gpa, out, .{ .entry = "reduceKernel", .fm = reduce_fm, .triple = air_triple, .datalayout = air_datalayout });
+    const bc = try assembler.assemble(gpa, out, .{ .entry = "reduceKernel", .fm = reduce_fm }, target.default);
     try std.testing.expectEqualStrings("BC\xC0\xDE", bc[0..4]);
 }
 
@@ -1590,14 +1654,14 @@ test "convert rewrites a Zig sret vertex function into AIR form and the result a
     var n: usize = 0;
     inline for (metadata.function_metadata) |fm| {
         if (find(out, "@" ++ fm.name ++ "(") != null) {
-            const bc = try assembler.assemble(gpa, out, .{ .entry = fm.name, .fm = fm, .triple = air_triple, .datalayout = air_datalayout });
+            const bc = try assembler.assemble(gpa, out, .{ .entry = fm.name, .fm = fm }, target.default);
             try std.testing.expectEqualStrings("BC\xC0\xDE", bc[0..4]);
             functions[n] = .{ .name = fm.name, .stage = if (fm.stage == .vertex) .vertex else .fragment, .bitcode = bc };
             n += 1;
         }
     }
     try std.testing.expectEqual(2, n);
-    const image = try metallib.pack(gpa, functions[0..n], "default.metallib");
+    const image = try metallib.pack(gpa, functions[0..n], "default.metallib", target.default);
     try std.testing.expectEqualStrings("MTLB", image[0..4]);
 }
 
@@ -1672,7 +1736,7 @@ test "D2/D4 fragment struct return: Zig's sret FragOut becomes a packed literal 
     // It assembles with the MRT metadata.
     inline for (metadata.function_metadata) |fm| {
         if (comptime std.mem.eql(u8, fm.name, "fragmentShaderMRT")) {
-            const bc = try assembler.assemble(gpa, out, .{ .entry = fm.name, .fm = fm, .triple = air_triple, .datalayout = air_datalayout });
+            const bc = try assembler.assemble(gpa, out, .{ .entry = fm.name, .fm = fm }, target.default);
             try std.testing.expectEqualStrings("BC\xC0\xDE", bc[0..4]);
         }
     }
@@ -1816,14 +1880,14 @@ test "D4 kernels: `define ptx_kernel void @name` is an entry, header rebuilt fro
     var n: usize = 0;
     inline for (metadata.function_metadata) |fm| {
         if (fm.stage == .kernel and find(out, "@" ++ fm.name ++ "(") != null) {
-            const bc = try assembler.assemble(gpa, out, .{ .entry = fm.name, .fm = fm, .triple = air_triple, .datalayout = air_datalayout });
+            const bc = try assembler.assemble(gpa, out, .{ .entry = fm.name, .fm = fm }, target.default);
             try std.testing.expectEqualStrings("BC\xC0\xDE", bc[0..4]);
             functions[n] = .{ .name = fm.name, .stage = .kernel, .bitcode = bc };
             n += 1;
         }
     }
     try std.testing.expectEqual(4, n);
-    const image = try metallib.pack(gpa, functions[0..n], "default.metallib");
+    const image = try metallib.pack(gpa, functions[0..n], "default.metallib", target.default);
     try std.testing.expectEqualStrings("MTLB", image[0..4]);
 }
 
@@ -1942,4 +2006,50 @@ test "D5.12c texture calls carry Apple's signature: status pair unpacked, sample
     const samplers = try samplerGlobals(gpa, "@s.state = private unnamed_addr addrspace(2) constant [2 x i64] [i64 1, i64 0], align 8\n@other = private unnamed_addr constant [4 x i8] c\"abc\\00\", align 1\n");
     try std.testing.expectEqual(@as(usize, 1), samplers.len);
     try std.testing.expectEqualStrings("s.state", samplers[0]);
+}
+
+test "air-splice command line: options, targets, and a misplaced flag" {
+    var bad: []const u8 = "";
+    const plain = try parseCli(&.{ "in.ll", "out.metallib" }, &bad);
+    try std.testing.expectEqual(target.Name.macos26, plain.profile.name);
+    try std.testing.expectEqualStrings("in.ll", plain.input);
+    try std.testing.expectEqualStrings("out.metallib", plain.output);
+    try std.testing.expect(plain.text_output == null);
+    const full = try parseCli(&.{ "--target=macos26", "in.ll", "out.metallib", "out.ll" }, &bad);
+    try std.testing.expectEqualStrings("out.ll", full.text_output.?);
+    // Unverified targets are refused unless explicitly allowed.
+    try std.testing.expectError(error.UnverifiedTarget, parseCli(&.{ "--target=macos15", "in.ll", "out.metallib" }, &bad));
+    try std.testing.expectEqualStrings("macos15", bad);
+    const allowed = try parseCli(&.{ "--target=macos15", "--allow-unverified", "in.ll", "out.metallib" }, &bad);
+    try std.testing.expectEqual(target.Name.macos15, allowed.profile.name);
+    const allowed_first = try parseCli(&.{ "--allow-unverified", "--target=macos13", "in.ll", "out.metallib" }, &bad);
+    try std.testing.expectEqual(target.Name.macos13, allowed_first.profile.name);
+    // A flag after a file would otherwise be taken as a file name.
+    try std.testing.expectError(error.OptionAfterFile, parseCli(&.{ "in.ll", "--target=macos15", "out.metallib" }, &bad));
+    try std.testing.expectEqualStrings("--target=macos15", bad);
+    try std.testing.expectError(error.OptionAfterFile, parseCli(&.{ "in.ll", "out.metallib", "--allow-unverified" }, &bad));
+    try std.testing.expectError(error.OptionAfterFile, parseCli(&.{ "in.ll", "-target=macos15", "out.metallib" }, &bad));
+    try std.testing.expectEqualStrings("-target=macos15", bad);
+    // A bare `--` is not a known option.
+    try std.testing.expectError(error.UnknownOption, parseCli(&.{ "--", "in.ll", "out.metallib" }, &bad));
+    // A repeated --target: the last one wins.
+    const repeated = try parseCli(&.{ "--target=macos15", "--target=macos26", "in.ll", "out.metallib" }, &bad);
+    try std.testing.expectEqual(target.Name.macos26, repeated.profile.name);
+    try std.testing.expectError(error.WrongArgCount, parseCli(&.{ "in.ll", "out.metallib", "out.ll", "extra" }, &bad));
+    try std.testing.expectError(error.UnknownTarget, parseCli(&.{ "--target=macos99", "in.ll", "out.metallib" }, &bad));
+    try std.testing.expectError(error.UnknownTarget, parseCli(&.{ "--target=", "in.ll", "out.metallib" }, &bad));
+    try std.testing.expectError(error.UnknownOption, parseCli(&.{ "--frobnicate", "in.ll", "out.metallib" }, &bad));
+    try std.testing.expectError(error.WrongArgCount, parseCli(&.{"in.ll"}, &bad));
+    try std.testing.expectError(error.WrongArgCount, parseCli(&.{}, &bad));
+}
+
+test "the printed IR carries the chosen deployment target's triple" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const src = "target datalayout = \"e-p:64:64\"\ntarget triple = \"nvptx64-nvidia-cuda\"\n";
+    const out15 = try convertWith(arena.allocator(), src, .{ .require_all_entries = false, .profile = target.get(.macos15) });
+    try std.testing.expect(find(out15, "target triple = \"air64_v27-apple-macosx15.0.0\"") != null);
+    try std.testing.expect(find(out15, "air64_v28") == null);
+    const out26 = try convertWith(arena.allocator(), src, .{ .require_all_entries = false });
+    try std.testing.expect(find(out26, "target triple = \"air64_v28-apple-macosx26.0.0\"") != null);
 }

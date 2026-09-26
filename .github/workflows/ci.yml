@@ -1,0 +1,88 @@
+# Build, test and (where the runner has a Metal GPU) run the library on
+# GitHub's macOS runners: the second and third machines this project was
+# never validated on. See docs/pipeline.md "Continuous integration".
+name: ci
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-15, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # build.zig.zon is the single source of truth for the pinned nightly.
+      # Old nightlies disappear from ziglang.org; setup-zig also tries the
+      # community mirrors, and this step fails if none of them has it.
+      - name: Read the pinned Zig version
+        id: zig
+        run: echo "version=$(sed -n 's/.*\.minimum_zig_version = "\(.*\)".*/\1/p' build.zig.zon)" >> "$GITHUB_OUTPUT"
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ steps.zig.outputs.version }}
+          # Both legs share the job id and download the same tarball, so
+          # without this they would compute the same cache key and one leg's
+          # cache would never be saved.
+          cache-key: ${{ matrix.os }}
+
+      - name: Runner
+        run: |
+          sw_vers
+          zig version
+          echo "MACOS_MAJOR=$(sw_vers -productVersion | cut -d. -f1)" >> "$GITHUB_ENV"
+
+      # Also compiles metallib-check, which needs no GPU to build.
+      - name: Unit tests (no GPU needed)
+        run: zig build test
+
+      # `install` compiles and links the app; `metallib` installs the library.
+      - name: Build the app and default.metallib (macos26 profile)
+        run: zig build install metallib
+
+      # The default library targets macOS 26 and cannot load on older macOS.
+      # GitHub's arm64 runners are VMs that may expose an "Apple Paravirtual
+      # device" rather than no device, so the checks can run on a virtual GPU;
+      # confirm any failure here on a real Mac before blaming the library.
+      # With no device at all, metallib-check prints SKIP: the step then still
+      # passes (green), with a ::warning:: annotation and a line in the job
+      # summary saying nothing was checked.
+      - name: Runtime checks, default library
+        if: env.MACOS_MAJOR >= 26
+        run: |
+          set +e
+          out=$(zig build check -- zig-out/bin/default.metallib 2>&1); rc=$?
+          set -e
+          echo "$out"
+          if grep -q '^SKIP no Metal device' <<<"$out"; then
+            echo "::warning::no Metal device on this runner; runtime checks skipped"
+            echo "Runtime checks skipped: no Metal device on ${{ matrix.os }}." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          exit $rc
+
+      # The open question target.zig cannot answer on macOS 26: does macOS 15
+      # read this project's opaque-pointer bitcode under an AIR 2.7 stamp? The
+      # macOS 26 upgrader refuses it; macOS 15 reads 2.7 natively. Expected to
+      # be unknown, so a failure here does not fail the run.
+      - name: Experiment, unverified macos15 library on macOS 15
+        if: env.MACOS_MAJOR == 15
+        continue-on-error: true
+        run: |
+          zig build metallib -Dmetal-target=macos15 -Dallow-unverified-target=true
+          set +e
+          out=$(zig build check -- zig-out/bin/default.metallib 2>&1); rc=$?
+          set -e
+          echo "$out"
+          if grep -q '^SKIP no Metal device' <<<"$out"; then
+            echo "::warning::no Metal device on this runner; the macos15 experiment could not run"
+            echo "macos15 experiment skipped: no Metal device on ${{ matrix.os }}." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          exit $rc
