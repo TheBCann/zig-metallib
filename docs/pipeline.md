@@ -269,6 +269,7 @@ host build.
 | `zig build test` | the `air_splice` module's tests (assembler, metadata, divergence, packer, sampler encoder) |
 | `zig build metallib` | installs `zig-out/bin/default.metallib` and `shader.air.ll` |
 | `zig build check -- <lib>` | loads any `.metallib` into Metal, builds every pipeline, runs the dispatch and render self-tests |
+| `zig build check -- --kernel=<name> <lib>` | builds one compute pipeline from *any* library, no manifest: the control CI uses on an Apple-compiled kernel |
 | `-Dshader-optimize=<mode>` | optimize mode of the GPU module (`fast` default; `safe` keeps Zig's safety checks) |
 | `-Dmetal-target=<profile>` | the macOS the library targets: `macos26` (default), `macos15`, `macos14`, `macos13` ([air-format.md §1.7](air-format.md#17-deployment-targets)) |
 | `-Dallow-unverified-target=true` | build a profile other than `macos26` anyway (they are refused by default; see below) |
@@ -295,14 +296,23 @@ that fails on 26), that profile becomes verifiable.
 `.github/workflows/ci.yml` runs on GitHub's `macos-15` and `macos-latest` runners. It
 reads the Zig version from `build.zig.zon` and runs `zig build test`, which also
 compiles `metallib-check`. It then runs `zig build install metallib`, which compiles the
-app and installs the library. The runtime checks run where the runner is macOS 26 or
-newer, and on macOS 15 the experiment above runs without failing the build. GitHub's
-arm64 runners are virtual machines and may expose an "Apple Paravirtual device", so the
-checks can run on a virtual GPU; confirm a failure there on a real Mac before blaming
-the library. With no Metal device at all, `metallib-check` prints `SKIP no Metal device`
-and exits 77. The step still passes (green), but it adds a `::warning::` annotation and
-a job-summary line saying nothing was checked. ziglang.org deletes old nightlies, so the
-setup step fails when no mirror still serves the pinned version.
+app and installs the library. A control step follows: Apple's own compiler builds a
+trivial kernel from MSL written inside the workflow (the repo keeps no `.metal` files),
+`metallib-check --kernel=control` builds its pipeline, and on macOS 26 runners Apple
+also re-assembles this project's printed IR and runs the full check on it. The job
+summary tabulates the GPU's name and each result. If the pipeline from Apple's own
+kernel fails too, the runner's GPU is the cause; if it passes and ours fails, the cause
+is this project's output, and the Apple-assembled IR tells our assembler and packer
+apart from the IR itself. A missing Metal toolchain, a failed Apple compile and a runner
+without a Metal device each get their own "not run" row, so none of them reads as a GPU
+failure. The runtime checks run where the runner is macOS 26 or newer, and on macOS 15
+the experiment above runs without failing the build. GitHub's arm64 runners are virtual
+machines and may expose an "Apple Paravirtual device", so the checks can run on a
+virtual GPU; confirm a failure there on a real Mac before blaming the library. With no
+Metal device at all, `metallib-check` prints `SKIP no Metal device` and exits 77. The
+step still passes (green), but it adds a `::warning::` annotation and a job-summary line
+saying nothing was checked. ziglang.org deletes old nightlies, so the setup step fails
+when no mirror still serves the pinned version.
 
 ---
 

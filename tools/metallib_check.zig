@@ -19,10 +19,19 @@
 //!     pixel per attachment back through a blit and compares it with what
 //!     the shaders must produce (the discarded pixel included).
 //! Prints one `ok  ...` line per check, `FAIL ...` and exit code 1 otherwise.
+//! An `info device` line names the GPU the checks ran on (a CI runner's VM
+//! reports a paravirtual device, not an Apple GPU), and every FAIL from a
+//! Metal call that returns an NSError carries the whole error (domain, code,
+//! userInfo), not only its one-line summary.
 //! Without a Metal device (a CI runner, say) it prints `SKIP ...` and exits 77.
 //! All Metal calls go through objc.msgSend; no C or Objective-C sources.
 //!
-//! Usage: metallib-check <file.metallib>
+//! With `--kernel=<name>` it skips the manifest and builds a compute pipeline
+//! for one function of any library, e.g. a kernel Apple's compiler built: the
+//! control that tells "this GPU cannot build pipelines" apart from "this
+//! project's output is rejected" (.github/workflows/ci.yml).
+//!
+//! Usage: metallib-check [--kernel=<name>] <file.metallib>
 
 const std = @import("std");
 const objc = @import("objc");
@@ -56,6 +65,7 @@ const MTLTextureUsageShaderWrite: u64 = 2;
 const MTLPrimitiveTypeTriangle: u64 = 3;
 const MTLSamplerMinMagFilterNearest: u64 = 0;
 const MTLSamplerAddressModeClampToEdge: u64 = 0;
+const MTLFunctionTypeKernel: u64 = 3;
 
 /// Passed by value through objc_msgSend; the comptime signature builder in
 /// objc.zig gives the call the C ABI, which handles the 24-byte struct.
@@ -75,18 +85,25 @@ pub fn main(init: std.process.Init) !void {
     const io = init.io;
 
     const args = try init.minimal.args.toSlice(arena);
-    if (args.len != 2) {
-        std.debug.print("usage: metallib-check <file.metallib>\n", .{});
+    var kernel_only: ?[:0]const u8 = null;
+    var path: []const u8 = undefined;
+    if (args.len == 3 and std.mem.startsWith(u8, args[1], "--kernel=") and args[1].len > "--kernel=".len) {
+        kernel_only = args[1]["--kernel=".len..];
+        path = args[2];
+    } else if (args.len == 2 and !std.mem.startsWith(u8, args[1], "-")) {
+        path = args[1];
+    } else {
+        std.debug.print("usage: metallib-check [--kernel=<name>] <file.metallib>\n", .{});
         std.process.exit(2);
     }
-    const bytes = try std.Io.Dir.cwd().readFileAlloc(io, args[1], arena, .unlimited);
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(io, path, arena, .unlimited);
 
     // Which deployment target the library is stamped for (tools/air/target.zig).
     const stamp = container.readStamp(bytes) orelse {
         if (std.mem.startsWith(u8, bytes, "MTLB")) {
-            std.debug.print("FAIL {s} is truncated: {d} bytes, shorter than the 88-byte MTLB header\n", .{ args[1], bytes.len });
+            std.debug.print("FAIL {s} is truncated: {d} bytes, shorter than the 88-byte MTLB header\n", .{ path, bytes.len });
         } else {
-            std.debug.print("FAIL {s} is not a .metallib (no MTLB header)\n", .{args[1]});
+            std.debug.print("FAIL {s} is not a .metallib (no MTLB header)\n", .{path});
         }
         std.process.exit(1);
     };
@@ -120,6 +137,10 @@ pub fn main(init: std.process.Init) !void {
         std.debug.print("SKIP no Metal device available; nothing was checked\n", .{});
         std.process.exit(77);
     };
+    // Which GPU the checks run on: "Apple M3" on a Mac, a paravirtual device
+    // inside a virtual machine such as a CI runner.
+    const device_name = objc.msgSend(?objc.Object, device, "name", .{});
+    std.debug.print("info device {s}\n", .{if (device_name) |n| objc.msgSend([*:0]const u8, n, "UTF8String", .{}) else "(unnamed)"});
 
     const data = objc.dispatch_data_create(bytes.ptr, bytes.len, null, null) orelse return error.DispatchDataFailed;
     defer objc.dispatch_release(data);
@@ -130,6 +151,33 @@ pub fn main(init: std.process.Init) !void {
         std.process.exit(1);
     };
     std.debug.print("ok  newLibraryWithData ({d} bytes)\n", .{bytes.len});
+
+    // Control mode: one compute pipeline from any library, no manifest.
+    if (kernel_only) |name| {
+        const ns_name = objc.createNSString(name) orelse {
+            std.debug.print("FAIL --kernel={s}: not a valid UTF-8 function name\n", .{name});
+            std.process.exit(2);
+        };
+        const function = objc.msgSend(?objc.Object, library, "newFunctionWithName:", .{ns_name}) orelse {
+            std.debug.print("FAIL newFunctionWithName: {s} not found\n", .{name});
+            std.process.exit(1);
+        };
+        std.debug.print("ok  function {s}\n", .{name});
+        // Only a kernel makes a compute pipeline. A vertex function gets an
+        // unrelated error and a fragment one crashes MTLCompilerService, which
+        // would read as "unsupported IR" rather than "wrong function".
+        const function_type = objc.msgSend(u64, function, "functionType", .{});
+        if (function_type != MTLFunctionTypeKernel) {
+            std.debug.print("FAIL {s} is not a kernel function (MTLFunctionType {d}; 1 is vertex, 2 fragment, 3 kernel)\n", .{ name, function_type });
+            std.process.exit(1);
+        }
+        const pso = objc.msgSend(?objc.Object, device, "newComputePipelineStateWithFunction:error:", .{ function, &err }) orelse {
+            std.debug.print("FAIL newComputePipelineState {s}: {s}\n", .{ name, errorText(err) });
+            std.process.exit(1);
+        };
+        std.debug.print("ok  kernel {s} maxTotalThreadsPerThreadgroup={d}\n", .{ name, objc.msgSend(u64, pso, "maxTotalThreadsPerThreadgroup", .{}) });
+        return;
+    }
 
     // One MTLFunction per manifest entry, and a compute pipeline per kernel.
     var functions: [shader.functions.len]objc.Object = undefined;
@@ -1001,8 +1049,12 @@ fn testInstancedMRT(device: objc.Object, vfn: objc.Object, ffn: objc.Object) !vo
     });
 }
 
+/// The whole NSError, `-description`: domain, code and every userInfo entry
+/// (the localized summary is one of them). A bare "Compilation failed" says
+/// nothing about where or why; the domain names the component that refused
+/// (an `AGXMetal...` GPU compiler, for instance) and userInfo may hold more.
 fn errorText(err: ?objc.Object) [*:0]const u8 {
     const e = err orelse return "(no NSError)";
-    const desc = objc.msgSend(?objc.Object, e, "localizedDescription", .{}) orelse return "(no description)";
+    const desc = objc.msgSend(?objc.Object, e, "description", .{}) orelse return "(no description)";
     return objc.msgSend([*:0]const u8, desc, "UTF8String", .{});
 }

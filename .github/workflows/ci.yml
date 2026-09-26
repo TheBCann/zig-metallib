@@ -46,6 +46,90 @@ jobs:
       - name: Build the app and default.metallib (macos26 profile)
         run: zig build install metallib
 
+      # Control for the runtime checks below: can this runner's GPU build a
+      # pipeline at all? Apple's own compiler builds a trivial kernel from MSL
+      # written here (the repo keeps no .metal files), and on macOS 26 runners
+      # it also re-assembles this project's printed IR. Read it with the
+      # runtime check that follows (the default library on macOS 26, the
+      # macos15 experiment on macOS 15):
+      #   control fails           -> the runner's (virtual) GPU, not this project
+      #   control ok, ours fails  -> this project's output; the Apple-assembled
+      #                              IR then tells our assembler and packer
+      #                              apart from the IR itself
+      # Apple's compile, a missing toolchain and a runner without a Metal device
+      # get their own "not run" rows, so none of them reads as a GPU failure.
+      # Diagnostic only: it never fails the run. Results go to the job summary.
+      - name: Control, Apple-compiled kernels on this runner's GPU
+        continue-on-error: true
+        run: |
+          # Xcode 26 ships the Metal toolchain as a separate component. If it is
+          # missing and cannot be fetched, say so instead of blaming the GPU.
+          xcrun metal --version >/dev/null 2>&1 || xcodebuild -downloadComponent MetalToolchain || true
+          if xcrun metal --version >/dev/null 2>&1; then toolchain=ok; else toolchain=missing; fi
+          cat > "$RUNNER_TEMP/control.metal" <<'EOF'
+          #include <metal_stdlib>
+          kernel void control(device float *a [[buffer(0)]], uint i [[thread_position_in_grid]]) { a[i] = a[i] * 2.0f; }
+          EOF
+          # A check's state: ok, fail, or why it did not run. `zig build`
+          # turns metallib-check's exit 77 into 1, so SKIP is read from the
+          # output, as in the runtime-check steps.
+          state() { if grep -q '^SKIP no Metal device' <<<"$1"; then echo nodevice; elif [ "$2" -eq 0 ]; then echo ok; else echo fail; fi; }
+          set +e
+          device=
+          compile=unavailable
+          control=unavailable
+          ours_apple=unavailable
+          if [ "$toolchain" = ok ]; then
+            if xcrun metal -mmacosx-version-min="$MACOS_MAJOR.0" "$RUNNER_TEMP/control.metal" -o "$RUNNER_TEMP/control.metallib"; then
+              compile=ok
+              out=$(zig build check -- --kernel=control "$RUNNER_TEMP/control.metallib" 2>&1); rc=$?
+              echo "$out"
+              device=$(grep -m1 '^info device ' <<<"$out" | cut -d' ' -f3-)
+              control=$(state "$out" "$rc")
+            else
+              compile=fail
+              control=notrun
+            fi
+            ours_apple=skipped
+            if [ "$MACOS_MAJOR" -ge 26 ]; then
+              if xcrun metal -Xclang -opaque-pointers zig-out/bin/shader.air.ll -o "$RUNNER_TEMP/xcheck.metallib"; then
+                xout=$(zig build check -- "$RUNNER_TEMP/xcheck.metallib" 2>&1); rc=$?
+                echo "$xout"
+                ours_apple=$(state "$xout" "$rc")
+              else
+                ours_apple=assemble-fail
+              fi
+            fi
+          fi
+          set -e
+          result() {
+            case "$1" in
+              ok) echo ok ;;
+              fail) echo FAIL ;;
+              assemble-fail) echo "FAIL (Apple's assembler rejected the IR)" ;;
+              nodevice) echo "not run (no Metal device)" ;;
+              notrun) echo "not run (Apple's compile failed)" ;;
+              skipped) echo "skipped (needs macOS 26)" ;;
+              unavailable) echo "not run (no Metal toolchain on this runner)" ;;
+              *) echo "$1" ;;
+            esac
+          }
+          {
+            echo "### GPU control on ${{ matrix.os }}"
+            echo "| check | result |"
+            echo "| --- | --- |"
+            echo "| Metal toolchain (xcrun metal) | $toolchain |"
+            echo "| GPU | ${device:-unknown} |"
+            echo "| Apple's compiler builds the MSL kernel | $(result $compile) |"
+            echo "| pipeline from Apple's kernel (the control) | $(result $control) |"
+            echo "| this project's IR, assembled by Apple | $(result $ours_apple) |"
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ "$control" = nodevice ] || [ "$ours_apple" = nodevice ]; then
+            echo "::warning::no Metal device on this runner; the GPU control could not run"
+          fi
+          case "$control" in ok | nodevice) ;; *) exit 1 ;; esac
+          case "$ours_apple" in ok | skipped | nodevice) ;; *) exit 1 ;; esac
+
       # The default library targets macOS 26 and cannot load on older macOS.
       # GitHub's arm64 runners are VMs that may expose an "Apple Paravirtual
       # device" rather than no device, so the checks can run on a virtual GPU;
