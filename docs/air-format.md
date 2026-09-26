@@ -175,9 +175,13 @@ target datalayout = "e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-f3
 do we: the module contains the entry point, every function it reaches through calls, and
 only the globals and declarations those name.
 
-**Bitcode version.** For an AIR 2.8 (macOS 26) library, Metal's runtime accepts bitcode
-written by a current LLVM with **opaque pointers**, even though Apple's own compiler
-still emits typed pointers for every target. That does **not** hold for older targets.
+**Bitcode version.** For an AIR 2.8 (macOS 26) library, Metal's runtime on Apple
+silicon (measured on an M3) accepts bitcode written by a current LLVM with **opaque
+pointers**, even though Apple's own compiler still emits typed pointers for every
+target. GitHub's virtual GPU ("Apple Paravirtual device", macOS 26.6.2) does not: it
+builds a pipeline from Apple's typed-pointer control kernel and fails with
+`CompilerError Code=2` on the same kernel compiled with `-Xclang -opaque-pointers`
+(CI run 36266828343). That does **not** hold for older targets.
 macOS 26 loads an older-AIR library through an *upgrader*, and pipeline creation fails
 with `Failed to upgrade function bitcode` on opaque-pointer bitcode stamped AIR 2.7,
 2.6 or 2.5. Apple's typed-pointer libraries for those targets upgrade fine, and Apple's

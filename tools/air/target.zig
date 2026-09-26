@@ -47,8 +47,10 @@
 //! One difference is NOT captured by the profile: Apple's compiler emits
 //! typed-pointer bitcode for every target (including macOS 26), while this
 //! project's assembler emits opaque pointers, the only kind
-//! std.zig.llvm.Builder can write. For AIR 2.8 that is fine: macOS 26 reads it
-//! directly and every check passes. For the older profiles it is not. macOS 26
+//! std.zig.llvm.Builder can write. For AIR 2.8 that is fine on Apple silicon:
+//! macOS 26 reads it directly and every check passes on an M3. (GitHub's
+//! virtual GPU, "Apple Paravirtual device", rejects opaque pointers even at
+//! AIR 2.8, Apple's own included; see docs/air-format.md.) For the older profiles it is not. macOS 26
 //! loads an older-AIR library through an upgrader, and pipeline creation fails
 //! with "Failed to upgrade function bitcode" on our output with the macOS 15,
 //! 14 and 13 stamps, while Apple's typed-pointer libraries for the same targets

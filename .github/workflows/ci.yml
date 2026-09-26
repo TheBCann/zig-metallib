@@ -16,7 +16,7 @@ jobs:
         os: [macos-15, macos-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # build.zig.zon is the single source of truth for the pinned nightly.
       # Old nightlies disappear from ziglang.org; setup-zig also tries the
@@ -59,7 +59,8 @@ jobs:
       # A third rung has Apple compile the same control kernel with opaque
       # pointers, the only kind this project's assembler writes. On macOS 26
       # runners: typed passes and opaque fails -> this GPU's compiler rejects
-      # opaque pointers (on a real M3 both pass for a macOS 26 target). On
+      # opaque pointers (on a real M3 both pass for a macOS 26 target); that
+      # is what run 36266828343 showed on GitHub's virtual GPU. On
       # macOS 15 the rung compiles for AIR 2.7, which a real M3 on macOS 26
       # also fails ("Failed to upgrade function bitcode"), so only a pass
       # there says something: opaque pointers accepted under AIR 2.7. The
@@ -184,7 +185,7 @@ jobs:
           first=$(grep -m1 '^FAIL' <<<"$out" | cut -c1-200)
           if [ "$rc" -ne 0 ] && grep -q '^info device .*Paravirtual' <<<"$out" \
             && grep -q '^FAIL newComputePipelineState .*Domain=CompilerError Code=2' <<<"$first"; then
-            echo "::warning::GitHub's virtual GPU (Apple Paravirtual device) could not build a compute pipeline from this project's IR, the known failure from CI run 36263730445; informational only, real Apple GPUs stay strict. First failure: $first"
+            echo "::warning::GitHub's virtual GPU (Apple Paravirtual device) could not build a compute pipeline from this project's IR, the known failure from CI run 36263730445 (it rejects opaque pointers, confirmed in run 36266828343); informational only, real Apple GPUs stay strict. First failure: $first"
             echo "Runtime checks on ${{ matrix.os }}: FAILED on the virtual GPU (Apple Paravirtual device), reported as informational. First failure: \`$first\`" >> "$GITHUB_STEP_SUMMARY"
             exit 0
           fi

@@ -308,8 +308,10 @@ without a Metal device each get their own "not run" row, so none of them reads a
 failure. A further rung has Apple compile the same control kernel with opaque pointers,
 the only kind this project's assembler writes. On macOS 26 runners, if the typed
 original passes and the opaque one fails, opaque pointers are what that GPU's compiler
-rejects; on a real M3 both pass for a macOS 26 target. On macOS 15 the rung compiles for
-AIR 2.7, which a real M3 fails too, so only a pass there says something (opaque pointers
+rejects; on a real M3 both pass for a macOS 26 target. That is what CI run 36266828343
+measured on GitHub's virtual GPU: the typed control kernel built a pipeline and the
+opaque one failed with `CompilerError Code=2`. On macOS 15 the rung compiles for AIR
+2.7, which a real M3 fails too, so only a pass there says something (opaque pointers
 accepted under AIR 2.7); a failure is labelled inconclusive. The runtime checks run
 where the runner is macOS 26 or newer, and on macOS 15 the experiment above runs without
 failing the build. GitHub's runners expose only a virtual GPU ("Apple Paravirtual

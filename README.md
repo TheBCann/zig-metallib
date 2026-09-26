@@ -82,7 +82,11 @@ The 42 checks cover 15 entry points — 2 vertex, 3 fragment, 10 kernels — inc
   only a virtual GPU ("Apple Paravirtual device"), though. On the 26.6.2 runner it
   could not build the first compute pipeline (`scaleKernel`) from this project's IR,
   even when Apple assembled it, while it built one from Apple's MSL-compiled control
-  kernel; the checker stops at the first failure, so nothing after it was tried. On
+  kernel; the checker stops at the first failure, so nothing after it was tried. The
+  cause is opaque pointers: in a later run the same Apple control kernel built a
+  pipeline when compiled with typed pointers and failed when compiled with
+  `-Xclang -opaque-pointers`, same kernel, same compiler (CI run 36266828343), while
+  both pass on the M3. This project's assembler writes only opaque pointers. On
   15.7.9 only the unverified macOS 15 library could run, and it failed the same way,
   which settles nothing. That one known failure is reported as informational on the
   virtual GPU; any other failure there, and any failure on a real GPU, fails the run
@@ -123,8 +127,8 @@ Julia. What is different here:
   compute;
 - Metal's runtime compiler on Apple silicon (measured on an M3, macOS 26.3) accepts
   **opaque-pointer, LLVM-20-era bitcode for macOS 26 (AIR 2.8)**, even though Apple's
-  own compiler still emits typed pointers. GitHub's virtual GPU does not build
-  pipelines from it (see *One real GPU* above). For older
+  own compiler still emits typed pointers. GitHub's virtual GPU rejects opaque
+  pointers even at AIR 2.8, Apple's own included (see *One real GPU* above). For older
   targets the typed-pointer requirement other projects work around is real: macOS 26
   refuses opaque pointers under an AIR 2.7-or-older stamp, and Apple's assembler
   reproduces the refusal. Both findings were measured here, not assumed.
