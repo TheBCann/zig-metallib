@@ -38,7 +38,7 @@ zig build check -- zig-out/bin/default.metallib         # load into Metal, run e
 xcrun metal-objdump -d zig-out/bin/default.metallib     # read our container back
 ```
 
-Requires a nightly Zig (pinned to **0.17.0-dev.2257+3bfb29994** in `build.zig.zon`) and
+Requires a nightly Zig (pinned to **0.17.0-dev.2307+392b17125** in `build.zig.zon`) and
 macOS 26 or newer to run the result. `std.zig.llvm.Builder` is an internal
 standard-library API and moves between nightlies, so `zig build` warns when a different
 Zig runs it. ziglang.org deletes old nightlies, so an exact pin may need a community
