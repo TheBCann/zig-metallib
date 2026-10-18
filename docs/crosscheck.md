@@ -61,6 +61,12 @@ arithmetic and logical `>>`), signed and unsigned division and remainder (`@divT
 `@bitReverse`, `@abs`, the overflow bit of `@mulWithOverflow`, and `if`/`else` selects on
 one or two signed or unsigned comparisons.
 
+Other integer widths, through helpers that return i32: truncation to `i8`/`u8`/`i16`/`u16`
+and sign- or zero-extension back, `i8` wrapping add, `u16` wrapping multiply, the high 32
+bits of the exact 64-bit signed and unsigned products, a 64-bit average, and the high half
+of a 64-bit shift. The 64-bit operations cannot overflow: the product of two 32-bit values
+always fits in 64 bits.
+
 Every generated expression is defined for all 2^64 input pairs, so a GPU/CPU difference
 can never be undefined behaviour diverging between targets:
 
@@ -113,14 +119,16 @@ On an Apple M3 (macOS 26.3, Zig 0.18.0-dev.253):
   which is the first end-to-end trigger of the `METAL` bucket.
 - **Sweep with the findings excluded**, seeds 1–100: all 100 match. The menus changed, so
   these are 100 fresh programs; no failure beyond the three findings showed up.
+- **Integer widths added**: 200 generated bodies clean under Debug safety, a 100-seed
+  sweep with all 100 matching, and each of the 10 new operations matching in a
+  one-operator kernel. No new findings.
 - The default build is untouched: `default.metallib` is byte-identical with and without
   the bench.
 
 ## Next
 
-- Narrower and wider integer types, then control flow (statements, bounded loops),
-  vectors and floats. Floats need explicit tolerance rules (contraction, denormals,
-  transcendental precision).
+- Control flow (statements, bounded loops), vectors and floats. Floats need explicit
+  tolerance rules (contraction, denormals, transcendental precision).
 - A reducer that shrinks a failing seed to a minimal program before it is reported.
 - Later, the same generated shaders on Asahi Linux's Mesa stack once its M3 GPU driver
   works, so the two compilers can be compared on the same hardware.

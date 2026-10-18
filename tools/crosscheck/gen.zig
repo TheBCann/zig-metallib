@@ -65,19 +65,31 @@ const Op = enum {
     ov_add, // @addWithOverflow overflow bit
     ov_sub, // @subWithOverflow overflow bit
     ov_mul, // @mulWithOverflow overflow bit
+    // integer widths, through helpers: unary truncate-then-extend
+    t8s, // i8, sign-extended back
+    t8u, // u8, zero-extended back
+    t16s, // i16
+    t16u, // u16
+    // integer widths, binary
+    add8, // i8 +%, sign-extended back
+    mul16, // u16 *%, zero-extended back
+    mulhi_s, // high 32 bits of the exact i64 product
+    mulhi_u, // high 32 bits of the exact u64 product
+    avg64, // (x + y) >> 1 computed in i64, so it cannot overflow
+    shl64hi, // high 32 bits of a u64 shift left by (y & 63)
     // ternary
     select, // if (cond) x else y, cond = one or two comparisons
 };
 
 const leaves = [_]Op{ .a, .b, .constant };
-const unary = [_]Op{ .bnot, .neg, .popcount, .clz, .ctz, .bswap, .bitrev, .abs };
+const unary = [_]Op{ .bnot, .neg, .popcount, .clz, .ctz, .bswap, .bitrev, .abs, .t8s, .t8u, .t16s, .t16u };
 // Known findings are left out of the menus so new sweeps surface new problems
 // rather than rediscovering these (docs/crosscheck.md "Findings"; reproducers
 // in tools/crosscheck/known/): `.mul_sat` (`*|`) crashes Metal's compiler,
 // `.ov_add` / `.ov_sub` overflow bits come back wrong. Add them back here to
 // re-test, e.g. on a newer macOS.
 const binary_inline = [_]Op{ .add, .sub, .mul, .band, .bor, .bxor, .add_sat, .sub_sat, .min_s, .max_s };
-const binary_helper = [_]Op{ .shl, .ashr, .lshr, .div_trunc, .div_floor, .rem_s, .mod_s, .div_u, .rem_u, .min_u, .max_u, .ov_mul };
+const binary_helper = [_]Op{ .shl, .ashr, .lshr, .div_trunc, .div_floor, .rem_s, .mod_s, .div_u, .rem_u, .min_u, .max_u, .ov_mul, .add8, .mul16, .mulhi_s, .mulhi_u, .avg64, .shl64hi };
 
 /// Constants that tend to expose codegen edge cases: identities, sign
 /// boundaries, single bits, all-ones masks, and shift amounts near 31/32.
@@ -146,6 +158,36 @@ const helpers =
     \\}
     \\inline fn ovMul(x: i32, y: i32) i32 {
     \\    return @mulWithOverflow(x, y)[1];
+    \\}
+    \\inline fn t8s(x: i32) i32 {
+    \\    return @as(i8, @truncate(x));
+    \\}
+    \\inline fn t8u(x: i32) i32 {
+    \\    return @as(u8, @truncate(u(x)));
+    \\}
+    \\inline fn t16s(x: i32) i32 {
+    \\    return @as(i16, @truncate(x));
+    \\}
+    \\inline fn t16u(x: i32) i32 {
+    \\    return @as(u16, @truncate(u(x)));
+    \\}
+    \\inline fn add8(x: i32, y: i32) i32 {
+    \\    return @as(i8, @truncate(x)) +% @as(i8, @truncate(y));
+    \\}
+    \\inline fn mul16(x: i32, y: i32) i32 {
+    \\    return @as(u16, @truncate(u(x))) *% @as(u16, @truncate(u(y)));
+    \\}
+    \\inline fn mulhiS(x: i32, y: i32) i32 {
+    \\    return @truncate((@as(i64, x) * @as(i64, y)) >> 32);
+    \\}
+    \\inline fn mulhiU(x: i32, y: i32) i32 {
+    \\    return s(@truncate((@as(u64, u(x)) * @as(u64, u(y))) >> 32));
+    \\}
+    \\inline fn avg64(x: i32, y: i32) i32 {
+    \\    return @truncate((@as(i64, x) + @as(i64, y)) >> 1);
+    \\}
+    \\inline fn shl64hi(x: i32, y: i32) i32 {
+    \\    return s(@truncate((@as(u64, u(x)) << @as(u6, @truncate(u(y)))) >> 32));
     \\}
     \\
 ;
@@ -232,6 +274,16 @@ const Gen = struct {
             .ov_add => try g.call2("ovAdd", d),
             .ov_sub => try g.call2("ovSub", d),
             .ov_mul => try g.call2("ovMul", d),
+            .t8s => try g.wrap1("t8s(", d, ")"),
+            .t8u => try g.wrap1("t8u(", d, ")"),
+            .t16s => try g.wrap1("t16s(", d, ")"),
+            .t16u => try g.wrap1("t16u(", d, ")"),
+            .add8 => try g.call2("add8", d),
+            .mul16 => try g.call2("mul16", d),
+            .mulhi_s => try g.call2("mulhiS", d),
+            .mulhi_u => try g.call2("mulhiU", d),
+            .avg64 => try g.call2("avg64", d),
+            .shl64hi => try g.call2("shl64hi", d),
             .select => {
                 // The comparison operands are kept shallower than the arms.
                 try w.writeAll("(if (");
