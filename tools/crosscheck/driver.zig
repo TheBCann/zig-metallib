@@ -9,7 +9,7 @@
 //! usage. The seed is reported so a finding can be reproduced with
 //! `zig build crosscheck -Dseed=<N>`.
 //!
-//! Usage: crosscheck-driver --seed=<u64> <crosscheck.metallib>
+//! Usage: crosscheck-driver --seed=<u64> [--body=<file>] <crosscheck.metallib>
 
 const std = @import("std");
 const objc = @import("objc");
@@ -83,12 +83,17 @@ pub fn main(init: std.process.Init) !void {
     const args = try init.minimal.args.toSlice(arena);
     var seed: ?u64 = null;
     var path: ?[]const u8 = null;
+    // Set when build.zig ran a hand-written body (-Dcrosscheck-body), so the
+    // messages name that file instead of a seed.
+    var body_file: ?[]const u8 = null;
     for (args[1..]) |arg| {
         if (std.mem.startsWith(u8, arg, "--seed=")) {
             seed = std.fmt.parseInt(u64, arg["--seed=".len..], 10) catch {
                 std.debug.print("crosscheck-driver: bad --seed value\n", .{});
                 std.process.exit(2);
             };
+        } else if (std.mem.startsWith(u8, arg, "--body=")) {
+            body_file = arg["--body=".len..];
         } else if (std.mem.startsWith(u8, arg, "-")) {
             std.debug.print("crosscheck-driver: unknown option '{s}'\n", .{arg});
             std.process.exit(2);
@@ -100,11 +105,11 @@ pub fn main(init: std.process.Init) !void {
         }
     }
     const s = seed orelse {
-        std.debug.print("usage: crosscheck-driver --seed=<u64> <crosscheck.metallib>\n", .{});
+        std.debug.print("usage: crosscheck-driver --seed=<u64> [--body=<file>] <crosscheck.metallib>\n", .{});
         std.process.exit(2);
     };
     const lib_path = path orelse {
-        std.debug.print("usage: crosscheck-driver --seed=<u64> <crosscheck.metallib>\n", .{});
+        std.debug.print("usage: crosscheck-driver --seed=<u64> [--body=<file>] <crosscheck.metallib>\n", .{});
         std.process.exit(2);
     };
     std.debug.print("info seed {d}  body.seed {d}  n {d}\n", .{ s, crosscheck_body.seed, n });
@@ -192,6 +197,14 @@ pub fn main(init: std.process.Init) !void {
             );
             mismatches += 1;
         }
+    }
+    if (body_file) |f| {
+        if (mismatches == 0) {
+            std.debug.print("ok  crosscheck body {s}: {d}/{d} match\n", .{ f, n, n });
+            std.process.exit(0);
+        }
+        std.debug.print("FAIL crosscheck body {s}: {d}/{d} mismatched (reproduce: zig build crosscheck -Dcrosscheck-body={s})\n", .{ f, mismatches, n, f });
+        std.process.exit(1);
     }
     if (mismatches == 0) {
         std.debug.print("ok  crosscheck seed {d}: {d}/{d} match\n", .{ s, n, n });

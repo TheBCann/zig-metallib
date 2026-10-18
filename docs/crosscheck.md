@@ -13,6 +13,7 @@ shader. Random programs reach IR shapes nobody wrote by hand.
 ```sh
 zig build crosscheck -Dseed=7              # one generated kernel, GPU vs CPU
 tools/crosscheck/sweep.sh 1 200            # a range of seeds, each outcome sorted
+zig build crosscheck -Dcrosscheck-body=path/to/body.zig   # a hand-written body
 ```
 
 `sweep.sh` runs under macOS's stock `/bin/bash` (3.2). Every seed lands in one bucket:
@@ -31,6 +32,10 @@ Anything but a match is saved under `zig-out/crosscheck/<seed>/` as the generate
 -Dseed=<seed>` and reduced. The script exits 1 if any seed was a MISMATCH, REFUSED, METAL
 or ERROR.
 
+`-Dcrosscheck-body=<file>` runs a hand-written or reduced body through the same pipeline
+instead of a generated one. The file must define `pub const seed: u64` and
+`pub fn body(a: i32, b: i32) i32`.
+
 ## How it works
 
 1. `tools/crosscheck/gen.zig` turns a seed into `crosscheck_body.zig`, whose
@@ -47,38 +52,75 @@ or ERROR.
 The kernel's shape is fixed (two inputs, one output, a count, the thread id), so only
 `body` changes between seeds. That keeps the manifest and the GPU runner constant.
 
-## Why only some operators (milestone 1)
+## What the generator emits
 
-The generator uses only operators that are total in Zig: `+%`, `-%`, `*%`, `&`, `|`, `^`
-and `~`, plus wrapping negation (`0 -% x`). Every generated expression is defined for all
-2^64 input pairs, so a GPU/CPU difference can never be undefined behaviour diverging
-between targets. Ordinary `+` would overflow into undefined behaviour, which LLVM may
-legally compile differently for nvptx and aarch64.
+All on i32: wrapping `+% -% *%`, saturating `+| -|`, bitwise `& | ^ ~`, wrapping
+negation, `@min`/`@max` (signed, and unsigned through a bit-cast), shifts (`<<`,
+arithmetic and logical `>>`), signed and unsigned division and remainder (`@divTrunc`,
+`@divFloor`, `@rem`, `@mod`, `/`, `%`), `@popCount`, `@clz`, `@ctz`, `@byteSwap`,
+`@bitReverse`, `@abs`, the overflow bit of `@mulWithOverflow`, and `if`/`else` selects on
+one or two signed or unsigned comparisons.
 
-Shifts, division, comparisons and selects, narrower and wider integer types, vectors,
-control flow and floats come next, each added only after its exact semantics, and how to
-keep generated code free of undefined behaviour, are pinned down. Floats will need
-explicit tolerance rules (contraction, denormals, transcendental precision).
+Every generated expression is defined for all 2^64 input pairs, so a GPU/CPU difference
+can never be undefined behaviour diverging between targets:
+
+- arithmetic either wraps or saturates; ordinary `+` would overflow into undefined
+  behaviour, which LLVM may legally compile differently for nvptx and aarch64;
+- shift amounts are masked to 5 bits, and Zig's `<<` wraps (LLVM `shl` without
+  `nsw`/`nuw`);
+- division and remainder go through helpers that return the dividend for a zero divisor
+  and for `minInt / -1`. `@rem` and `@mod` need the `minInt` guard too: Zig's Debug build
+  defines `@rem(minInt, -1)` as 0, but its release lowering is a plain LLVM `srem`, which
+  is undefined for that input.
+
+The host driver is a Debug build, so its safety checks double as an undefined-behaviour
+detector for the generator: a slip would panic on the CPU (bucket `ERROR`) instead of
+silently diverging.
+
+Operations with a known finding (below) are left out of the generator so new sweeps
+surface new problems. `tools/crosscheck/gen.zig` says where to add them back.
+
+## Findings
+
+Found on an Apple M3, macOS 26.3, with Zig 0.18.0-dev.253. Each has a one-line reproducer
+in `tools/crosscheck/known/`:
+
+| Operation | Zig lowers it to | Result | Reproducer |
+| --- | --- | --- | --- |
+| `a *\| b` (saturating multiply) | `llvm.smul.fix.sat.i32` | building the compute pipeline fails: Metal's compiler service connection is interrupted | `zig build crosscheck -Dcrosscheck-body=tools/crosscheck/known/mul_sat.zig` |
+| `@addWithOverflow(a, b)[1]` | overflow bit of `llvm.sadd.with.overflow.i32` | GPU and CPU disagree on 1,990 of 4,096 inputs | `zig build crosscheck -Dcrosscheck-body=tools/crosscheck/known/add_overflow_bit.zig` |
+| `@subWithOverflow(a, b)[1]` | overflow bit of `llvm.ssub.with.overflow.i32` | GPU and CPU disagree on 2,103 of 4,096 inputs | `zig build crosscheck -Dcrosscheck-body=tools/crosscheck/known/sub_overflow_bit.zig` |
+
+This project's assembler passes all three intrinsics to Metal unchanged
+(`tools/air/intrinsics.zig`). The overflow bit of `@mulWithOverflow` matches.
 
 ## What has been verified
 
-On an Apple M3 (macOS 26.3, Zig 0.18.0-dev.253), 2026-10-18:
+On an Apple M3 (macOS 26.3, Zig 0.18.0-dev.253):
 
-- 66 seeds (1–41, 100–108, 200–215), 270,336 GPU/CPU comparisons, all match. Finding no
-  bug with these operators is expected: they are the most heavily used integer
-  operations. Milestone 1 establishes the pipeline the riskier constructs will run on.
-- The buckets were checked by injecting one failure of each kind: a wrong CPU answer
-  sorted as `MISMATCH`, invalid generated Zig as `ERROR`, and a threadgroup barrier under
-  a per-thread `if` (which the assembler's divergence check refuses) as `REFUSED`. The
-  `METAL` and `SKIP` buckets match the driver's exact output lines but have not yet been
-  triggered end to end.
+- **Milestone 1** (wrapping arithmetic and bitwise operators only): 66 seeds, 270,336
+  GPU/CPU comparisons, all match. The buckets were checked by injecting one failure of
+  each kind: a wrong CPU answer sorted as `MISMATCH`, invalid generated Zig as `ERROR`,
+  and a threadgroup barrier under a per-thread `if` (which the assembler's divergence
+  check refuses) as `REFUSED`. `SKIP` matches the driver's exact output line but has not
+  been triggered end to end.
+- **Expanded generator**, before any GPU run: 200 generated bodies compile and run
+  without a safety-check panic in a Debug build over an edge-value grid plus 2,000 random
+  input pairs each.
+- **First GPU sweep** of the expanded generator, seeds 1–100: 82 match, 11 `METAL`, 7
+  `MISMATCH`, no `REFUSED` or `ERROR`. Every `METAL` seed used `*|`. One-operator kernels
+  then tested each operation on its own: all match except the three findings above,
+  which is the first end-to-end trigger of the `METAL` bucket.
+- **Sweep with the findings excluded**, seeds 1–100: all 100 match. The menus changed, so
+  these are 100 fresh programs; no failure beyond the three findings showed up.
 - The default build is untouched: `default.metallib` is byte-identical with and without
   the bench.
 
 ## Next
 
-- Widen the generator, starting with shifts and guarded division, then types, control
-  flow and floats. This is what will start producing REFUSED and MISMATCH results.
+- Narrower and wider integer types, then control flow (statements, bounded loops),
+  vectors and floats. Floats need explicit tolerance rules (contraction, denormals,
+  transcendental precision).
 - A reducer that shrinks a failing seed to a minimal program before it is reported.
 - Later, the same generated shaders on Asahi Linux's Mesa stack once its M3 GPU driver
   works, so the two compilers can be compared on the same hardware.
