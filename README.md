@@ -36,6 +36,8 @@ zig build test                                         # 91 tests
 zig build metallib                                     # zig-out/bin/{default.metallib,shader.air.ll}
 zig build check -- zig-out/bin/default.metallib         # load into Metal, run everything
 xcrun metal-objdump -d zig-out/bin/default.metallib     # read our container back
+zig build crosscheck -Dseed=7                          # random kernel: GPU vs CPU
+tools/crosscheck/sweep.sh 1 200                        # many seeds, each outcome sorted
 ```
 
 Requires the Zig nightly **0.18.0-dev.253+16d31ceed** (pinned in `build.zig.zon`,
@@ -62,6 +64,7 @@ are read back and compared.
 | `zig build test` | rewriter, assembler, metadata, packer, uniformity analysis, target profiles | 91 tests pass |
 | `zig build` | Zig → IR → container, end to end | builds |
 | `zig build check -- …` | Metal loads it, compiles every pipeline, and the GPU computes the right answers | **42 ok, 0 fail** |
+| `tools/crosscheck/sweep.sh` | randomly generated integer kernels compute the same on the GPU as on the CPU ([docs/crosscheck.md](docs/crosscheck.md)) | 66 seeds, all match |
 | `xcrun metal-objdump -d` | our container is readable by Apple's own tooling | passes |
 | `xcrun metal` on `shader.air.ll` | Apple's assembler accepts our printed IR; the library *it* builds also passes `zig build check` | **42 ok, 0 fail** |
 
@@ -155,8 +158,11 @@ tools/air/metadata.zig      manifest → !air.* metadata (text and bitcode)
 tools/air/metallib.zig      MTLB container writer
 tools/air/target.zig        deployment-target profiles: triple, versions, header stamps
 tools/metallib_check.zig    loads a library into Metal and runs every entry point
+tools/crosscheck/           differential test bench: generator, GPU/CPU driver, sweep
+src/engine/crosscheck_harness.zig  fixed GPU kernel wrapper for the bench
 docs/pipeline.md            how the pipeline works, and how to add a shader
 docs/air-format.md          the container, bitcode dialect and metadata reference
+docs/crosscheck.md          the differential test bench
 .github/workflows/ci.yml    build, test and runtime checks on GitHub's macOS runners
 ```
 
@@ -166,3 +172,6 @@ docs/air-format.md          the container, bitcode dialect and metadata referenc
   GPU helper surface, and what to do when something fails.
 - **[docs/air-format.md](docs/air-format.md)** — the `.metallib` container byte
   layout, the AIR bitcode dialect, the metadata nodes and the sampler word.
+- **[docs/crosscheck.md](docs/crosscheck.md)** — the differential test bench: random
+  kernels run on the GPU and the CPU and compared, how outcomes are sorted, and what is
+  verified so far.

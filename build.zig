@@ -145,4 +145,82 @@ pub fn build(b: *std.Build) void {
     // Compile (not run) metallib-check too: nothing else builds it without a
     // GPU, so a compile error in it would otherwise pass `zig build test`.
     test_step.dependOn(&check.step);
+
+    // ── 7. Differential test bench: `zig build crosscheck -Dseed=N` ─────────────
+    // tools/crosscheck/gen.zig writes a random total i32 `body(a, b)` for the seed.
+    // That ONE generated file is compiled twice: into the GPU kernel
+    // (src/engine/crosscheck_harness.zig -> a second air-splice -> crosscheck.metallib)
+    // and into the host driver, which runs the kernel on the Metal device and
+    // `body` on the CPU over the same inputs and compares. A mismatch is a
+    // codegen bug. None of this is built by the default steps.
+    const crosscheck_seed = b.option(u64, "seed", "Seed for `zig build crosscheck` (default 1)") orelse 1;
+
+    const crosscheck_gen = b.addExecutable(.{
+        .name = "crosscheck-gen",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/crosscheck/gen.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const run_crosscheck_gen = b.addRunArtifact(crosscheck_gen);
+    run_crosscheck_gen.addArg(b.fmt("--seed={d}", .{crosscheck_seed}));
+    const crosscheck_body_src = run_crosscheck_gen.addOutputFileArg2("crosscheck_body.zig", .{});
+
+    // GPU side: harness + generated body for nvptx, exactly like the shader.
+    const crosscheck_body_gpu = b.createModule(.{ .root_source_file = crosscheck_body_src, .target = gpu_target, .optimize = shader_optimize });
+    const crosscheck_shader_obj = b.addObject(.{
+        .name = "crosscheck_shader",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/engine/crosscheck_harness.zig"),
+            .target = gpu_target,
+            .optimize = shader_optimize,
+            .imports = &.{.{ .name = "crosscheck_body", .module = crosscheck_body_gpu }},
+        }),
+        .use_llvm = true,
+    });
+    crosscheck_shader_obj.bundle_ubsan_rt = false;
+
+    // A second air-splice whose manifest is the harness.
+    const crosscheck_body_host = b.createModule(.{ .root_source_file = crosscheck_body_src, .target = target, .optimize = optimize });
+    const crosscheck_manifest = b.createModule(.{
+        .root_source_file = b.path("src/engine/crosscheck_harness.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "crosscheck_body", .module = crosscheck_body_host }},
+    });
+    const crosscheck_splice = b.addExecutable(.{
+        .name = "crosscheck-air-splice",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/air_splice.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "shader", .module = crosscheck_manifest }},
+        }),
+    });
+    const run_crosscheck_splice = b.addRunArtifact(crosscheck_splice);
+    run_crosscheck_splice.addFileArg(crosscheck_shader_obj.getEmittedLlvmIr());
+    const crosscheck_metallib = run_crosscheck_splice.addOutputFileArg2("crosscheck.metallib", .{});
+
+    // Host side: the driver runs `body` on the CPU and the kernel on the GPU.
+    const crosscheck_driver = b.addExecutable(.{
+        .name = "crosscheck-driver",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/crosscheck/driver.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "objc", .module = objc_mod },
+                .{ .name = "crosscheck_body", .module = crosscheck_body_host },
+            },
+        }),
+    });
+    crosscheck_driver.root_module.linkSystemLibrary("c", .{});
+    crosscheck_driver.root_module.linkSystemLibrary("objc", .{});
+    crosscheck_driver.root_module.linkFramework("Foundation", .{});
+    crosscheck_driver.root_module.linkFramework("Metal", .{});
+    const run_crosscheck = b.addRunArtifact(crosscheck_driver);
+    run_crosscheck.addArg(b.fmt("--seed={d}", .{crosscheck_seed}));
+    run_crosscheck.addFileArg(crosscheck_metallib);
+    b.step("crosscheck", "Differential test: one generated kernel on the GPU vs the CPU (-Dseed=N)").dependOn(&run_crosscheck.step);
 }
