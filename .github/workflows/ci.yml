@@ -18,9 +18,10 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      # build.zig.zon is the single source of truth for the pinned nightly.
-      # Old nightlies disappear from ziglang.org; setup-zig also tries the
-      # community mirrors, and this step fails if none of them has it.
+      # build.zig.zon is the single source of truth for the pinned Zig. It is
+      # a tagged release because ziglang.org deletes old nightlies within days;
+      # setup-zig also tries the community mirrors, and this step fails if
+      # none of them has the pinned version.
       - name: Read the pinned Zig version
         id: zig
         run: echo "version=$(sed -n 's/.*\.minimum_zig_version = "\(.*\)".*/\1/p' build.zig.zon)" >> "$GITHUB_OUTPUT"

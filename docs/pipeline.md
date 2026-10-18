@@ -32,14 +32,19 @@ Zig's targets. NVPTX is the closest target that accepts the address spaces we ne
 | Zig spelling | NVPTX space | AIR space | Use |
 | --- | --- | --- | --- |
 | `[*]addrspace(.global) T` | 1 | 1 device | `device T*` buffers, textures |
-| `*addrspace(.param) const T` | 4 | 2 constant | `constant T*` uniform buffers |
+| `*addrspace(.param) const T` | 4 (101 on 0.18-dev) | 2 constant | `constant T*` uniform buffers |
 | `[*]addrspace(.shared) T` | 3 | 3 threadgroup | `threadgroup T*` buffers |
 | `var x: [N]T addrspace(.shared)` | 3 | 3 threadgroup | static threadgroup memory |
 | (unqualified) | 0 | 0 thread | locals |
 
-Zig rejects a spelled `addrspace(.constant)` on NVPTX, hence `.param` plus the
-assembler's 4 → 2 renumbering. Address spaces 4 and 5 both crash Metal's runtime
-compiler, so neither survives into the bitcode. Nothing else NVPTX-specific is kept:
+Zig rejects `*addrspace(.constant)` pointers on NVPTX ("pointers with address space
+'constant' are not supported on nvptx", on 0.17.0 and the 0.18 nightlies alike), hence
+`.param` plus the assembler's renumbering to 2. Zig 0.17.0 lowers `.param` to NVPTX 4.
+The 0.18 nightlies adopt LLVM's NVPTX numbering, so `.param` becomes the entry-param space
+101 and 4 becomes NVPTX's `constant`, which a `const` declaration in `addrspace(.constant)`
+can still produce. Both mean Metal's constant space, so the assembler maps 101 → 2 and
+4 → 2. Address spaces 4 and 5 both crash
+Metal's runtime compiler and Metal has no 101, so none of them survives into the bitcode. Nothing else NVPTX-specific is kept:
 `ptx_kernel` calling conventions are dropped, and `llvm.nvvm.*` intrinsics are refused
 outright (thread ids are explicit manifest parameters, not intrinsics).
 
@@ -64,7 +69,8 @@ no-return, so a barrier after a bounds check is still accepted.
 
 ## 2–3. The rewrite (`tools/air_splice.zig`)
 
-The IR Zig emits is LLVM-20-era and NVPTX-shaped; Apple's reader is LLVM-15-era and
+The IR Zig emits comes from LLVM 22 (Zig 0.17.0; LLVM 23 on the 0.18 nightlies) and is
+NVPTX-shaped; Apple's reader is LLVM-15-era and
 AIR-shaped. The rewrite is pure text and does:
 
 - **target**: `datalayout` and `triple` → `air64_v28-apple-macosx26.0.0`.
@@ -84,8 +90,9 @@ AIR-shaped. The rewrite is pure text and does:
 - **cleanup**: attribute groups, Zig metadata, and flags newer than Apple's LLVM
   (`captures(none)`, `initializes(...)`, `dead_on_unwind`, gep `nuw`/`nusw`, `nneg`,
   `disjoint`, `samesign`).
-- **address spaces**: 4 → 2 and `ptr addrspace(5)` → `ptr` in the text, so the debug
-  `.ll` matches what the assembler lowers.
+- **address spaces**: 4 and 101 → 2 (nvptx `.param`: 4 on Zig 0.17.0, 101 on the 0.18
+  nightlies) and `ptr addrspace(5)` → `ptr` in the text, so the debug `.ll` matches what
+  the assembler lowers.
 - **texture intrinsics**: the `declare` is replaced by Apple's canonical signature and
   each call becomes a call returning `{ <colour>, i8 }` plus `extractvalue 0`; sampler
   operands are retyped to `ptr addrspace(2)` and sampler words are printed in address
@@ -278,7 +285,7 @@ host build.
 `air-splice [--target=<profile>] [--allow-unverified] <in.ll> <out.metallib> [out.ll]`.
 
 `zig build` prints a warning when the running Zig differs from the version pinned in
-`build.zig.zon`, because `std.zig.llvm.Builder` changes between nightlies.
+`build.zig.zon`, because `std.zig.llvm.Builder` changes between Zig versions.
 
 ### Deployment targets
 
@@ -325,8 +332,9 @@ it adds a `::warning::` and a job-summary line naming it, and does not fail the 
 other failure on the virtual GPU, and any failure on a real Apple GPU, fails the run.
 With no Metal device at all, `metallib-check` prints `SKIP no Metal device` and exits
 77. The step still passes (green), but it adds a `::warning::` annotation and a
-job-summary line saying nothing was checked. ziglang.org deletes old nightlies, so the
-setup step fails when no mirror still serves the pinned version.
+job-summary line saying nothing was checked. The pinned Zig is a tagged release, which
+ziglang.org keeps (it deletes old nightlies within days); the setup step fails only if
+neither ziglang.org nor a community mirror serves the pinned version.
 
 ---
 

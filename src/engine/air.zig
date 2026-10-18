@@ -15,7 +15,8 @@ pub const Stage = enum { vertex, fragment, kernel };
 /// AIR address space of a buffer argument: device = 1, constant = 2,
 /// threadgroup = 3. In the shader body the matching Zig parameter is
 /// `[*]addrspace(.global) T` (device), `*addrspace(.param) const T`
-/// (constant; nvptx addrspace 4, renumbered by the assembler) or
+/// (constant; nvptx addrspace 4, or 101 on the Zig 0.18 nightlies,
+/// renumbered by the assembler) or
 /// `[*]addrspace(.shared) T` (threadgroup).
 pub const Space = enum(u8) {
     device = 1,

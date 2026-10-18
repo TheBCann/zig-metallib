@@ -15,7 +15,8 @@
 //!     minimal `Io`) that talks to the host, not the default threaded IO.
 //!   * Buffer pointers use `addrspace(.global)`, which lowers to LLVM
 //!     addrspace(1) == Metal's `device` address space. Constant buffers are
-//!     `*addrspace(.param) const T` (nvptx 4, renumbered to Metal's 2), and
+//!     `*addrspace(.param) const T` (nvptx 4, or 101 on the Zig 0.18
+//!     nightlies; renumbered to Metal's 2), and
 //!     static threadgroup memory is `var x: [N]T addrspace(.shared)`.
 //!   * Kernels are `callconv(.kernel)`, take their built-in ids as explicit
 //!     parameters (described by `.builtin` manifest args) and call the AIR

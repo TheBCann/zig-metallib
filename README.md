@@ -32,17 +32,19 @@ what we produce.
 ```sh
 zig build                                              # shaders + library + app
 zig build run                                          # opens a window, textured triangle
-zig build test                                         # 90 tests
+zig build test                                         # 91 tests
 zig build metallib                                     # zig-out/bin/{default.metallib,shader.air.ll}
 zig build check -- zig-out/bin/default.metallib         # load into Metal, run everything
 xcrun metal-objdump -d zig-out/bin/default.metallib     # read our container back
 ```
 
-Requires a nightly Zig (pinned to **0.17.0-dev.2307+392b17125** in `build.zig.zon`) and
-macOS 26 or newer to run the result. `std.zig.llvm.Builder` is an internal
-standard-library API and moves between nightlies, so `zig build` warns when a different
-Zig runs it. ziglang.org deletes old nightlies, so an exact pin may need a community
-mirror to fetch.
+Requires Zig **0.17.0** (the tagged release, pinned in `build.zig.zon`) and macOS 26 or
+newer to run the result. `std.zig.llvm.Builder` is an internal standard-library API and
+moves between Zig versions, so `zig build` warns when a different Zig runs it. The pin is
+a release because ziglang.org deletes old nightlies within days, which stops CI and
+anyone else from fetching them. The 0.18.0-dev nightlies (checked on dev.223 and
+dev.253) also build it and pass every check; Zig 0.18 changed the IR the shader compiles
+to, so their `default.metallib` bytes differ from 0.17.0's.
 
 ## What is verified, and how
 
@@ -54,7 +56,7 @@ are read back and compared.
 
 | gate | what it proves | result |
 | --- | --- | --- |
-| `zig build test` | rewriter, assembler, metadata, packer, uniformity analysis, target profiles | 90 tests pass |
+| `zig build test` | rewriter, assembler, metadata, packer, uniformity analysis, target profiles | 91 tests pass |
 | `zig build` | Zig → IR → container, end to end | builds |
 | `zig build check -- …` | Metal loads it, compiles every pipeline, and the GPU computes the right answers | **42 ok, 0 fail** |
 | `xcrun metal-objdump -d` | our container is readable by Apple's own tooling | passes |
@@ -126,7 +128,7 @@ Julia. What is different here:
 - it does **graphics** (vertex/fragment, MRT, depth, textures, samplers), not only
   compute;
 - Metal's runtime compiler on Apple silicon (measured on an M3, macOS 26.3) accepts
-  **opaque-pointer, LLVM-20-era bitcode for macOS 26 (AIR 2.8)**, even though Apple's
+  **opaque-pointer, LLVM-22-era bitcode for macOS 26 (AIR 2.8)**, even though Apple's
   own compiler still emits typed pointers. GitHub's virtual GPU rejects opaque
   pointers even at AIR 2.8, Apple's own included (see *One real GPU* above). For older
   targets the typed-pointer requirement other projects work around is real: macOS 26

@@ -239,7 +239,7 @@ pub fn lowerReduce(b: *Builder, wip: *WipFunction, declarer: anytype, op: Reduce
     // Bool vectors: `or` is "any lane set", `and` is "all lanes set".
     if (elem_ty == .i1 and (op == .@"or" or op == .@"and")) {
         var name_buf: [32]u8 = undefined;
-        const name = std.fmt.bufPrint(&name_buf, "air.{s}.v{d}i1", .{ if (op == .@"or") "any" else "all", n }) catch unreachable;
+        const name = std.mem.print(&name_buf, "air.{s}.v{d}i1", .{ if (op == .@"or") "any" else "all", n }) catch unreachable;
         const fn_ty = try b.fnType(.i1, &.{vec_ty}, .normal);
         const callee = try declarer.declare(name, fn_ty);
         return wip.call(.normal, .ccc, .none, fn_ty, callee, &.{vec}, "");
@@ -262,7 +262,7 @@ pub fn lowerReduce(b: *Builder, wip: *WipFunction, declarer: anytype, op: Reduce
             else => return error.Unsupported,
         };
         var name_buf: [32]u8 = undefined;
-        const name = std.fmt.bufPrint(&name_buf, "llvm.{s}.{s}", .{ if (op == .fmax) "maxnum" else "minnum", suffix }) catch unreachable;
+        const name = std.mem.print(&name_buf, "llvm.{s}.{s}", .{ if (op == .fmax) "maxnum" else "minnum", suffix }) catch unreachable;
         minmax_ty = try b.fnType(elem_ty, &.{ elem_ty, elem_ty }, .normal);
         minmax_callee = try declarer.declare(name, minmax_ty);
     }
@@ -475,7 +475,7 @@ test "rename table: every suffix, powi/ldexp suffix handling, pass-through" {
     }
     for ([_][]const u8{ "fadd", "fmul", "fmax", "fmin", "add", "mul", "and", "or", "xor", "umax", "umin", "smax", "smin" }, 0..) |op, i| {
         var buf: [64]u8 = undefined;
-        const name = try std.fmt.bufPrint(&buf, "llvm.vector.reduce.{s}.v4i32", .{op});
+        const name = try std.mem.print(&buf, "llvm.vector.reduce.{s}.v4i32", .{op});
         const l = try classify(gpa, name);
         try std.testing.expectEqual(@as(ReduceOp, @fromBackingInt(@intCast(i))), l.reduce);
     }

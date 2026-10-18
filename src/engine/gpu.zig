@@ -15,7 +15,8 @@
 //!
 //! Address spaces (DESIGN.md D1): `addrspace(.global)` = device (1),
 //! `addrspace(.shared)` = threadgroup (3), `addrspace(.param)` = constant (2
-//! after the assembler renumbers nvptx's 4).
+//! after the assembler renumbers nvptx's 4, which the Zig 0.18 nightlies
+//! spell 101).
 //!
 //! Texture helpers (sample2D, read2D, write2D, ...) and constexpr samplers
 //! sit below the compute section.

@@ -19,9 +19,10 @@
 //!
 //! AIR facts baked in here (DESIGN.md D1/D5, research r06/r11/r13):
 //!   * Metal knows address spaces 0 (thread), 1 (device), 2 (constant) and
-//!     3 (threadgroup). Zig's nvptx IR also uses 4 (param) and 5 (local);
-//!     both crash the runtime compiler, so types are renumbered 4 -> 2 and
-//!     5 -> 0 while parsing.
+//!     3 (threadgroup). Zig's nvptx IR also uses 4 (`.param` on Zig 0.17;
+//!     nvptx `constant` on the 0.18 nightlies, which spell `.param` 101) and
+//!     5 (local). 4 and 5 crash the runtime compiler and Metal has no 101,
+//!     so types are renumbered 4 and 101 -> 2 and 5 -> 0 while parsing.
 //!   * A module-level `constant` global left in address space 0 fails
 //!     pipeline creation with "Undefined symbols: ___anon_N"; such globals
 //!     are relocated to address space 2. A mutable (`global`) one in address
@@ -201,11 +202,13 @@ fn fail(line_no: usize, line: []const u8, msg: []const u8, err: Error) Error {
     return err;
 }
 
-/// Metal accepts only address spaces 0..3; Zig's nvptx IR also emits
-/// 4 (param -> Metal constant) and 5 (local -> Metal thread).
+/// Metal accepts only address spaces 0..3; Zig's nvptx IR also emits 4
+/// (`.param` on Zig 0.17, nvptx `constant` on the 0.18 nightlies) and 101
+/// (`.param` on the 0.18 nightlies, LLVM's entry-param space), both ->
+/// Metal constant, and 5 (local -> Metal thread).
 fn mapAddrSpace(n: u24) Builder.AddrSpace {
     return @fromBackingInt(@intCast(switch (n) {
-        4 => 2,
+        4, 101 => 2,
         5 => 0,
         else => n,
     }));
@@ -484,7 +487,7 @@ const ModuleState = struct {
             } else break; // section, comdat, metadata: irrelevant here
         }
         try m.globals.append(m.gpa, .{ .name = name, .index = variable.ptr(m.b).global, .fn_ty = null });
-        if (std.mem.indexOf(u8, line, "[2 x i64]") != null) try m.samplers.append(m.gpa, variable.ptr(m.b).global);
+        if (std.mem.find(u8, line, "[2 x i64]") != null) try m.samplers.append(m.gpa, variable.ptr(m.b).global);
     }
 
     // declare [cc] [ret attrs] RET @name(TY [attrs], ...) [attrs]
@@ -1153,7 +1156,7 @@ const FunctionState = struct {
                     if (n + 1 > next) next = n + 1;
                 }
             }
-            f.entry_name = try std.fmt.allocPrint(gpa, "{s}{d}", .{ numbered_prefix, next });
+            f.entry_name = try gpa.print("{s}{d}", .{ numbered_prefix, next });
             try names.append(gpa, f.entry_name.?);
             try counts.append(gpa, 0);
         }
@@ -2692,6 +2695,29 @@ test "D1/D5.10 address spaces: renumbering, constant relocation, value-typed ope
         \\}
         \\
     );
+}
+
+test "D1 address spaces: nvptx 101 (`.param` since Zig 0.18) and 4 (`constant`) both lower to Metal constant 2" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const gpa = arena.allocator();
+    const text = try testRoundTrip(gpa, test_header ++
+        \\@cst = private unnamed_addr addrspace(4) constant float 5.000000e-01, align 4
+        \\
+        \\define float @fragmentShader(i32 %__0, ptr addrspace(101) %__1, ptr addrspace(5) %__2) {
+        \\  %__4 = load float, ptr addrspace(101) %__1, align 4
+        \\  %__5 = load float, ptr addrspace(4) @cst, align 4
+        \\  %__6 = fadd float %__4, %__5
+        \\  store float %__6, ptr addrspace(5) %__2, align 4
+        \\  ret float %__6
+        \\}
+        \\
+    );
+    try std.testing.expect(!has(text, "addrspace(101)"));
+    try std.testing.expect(!has(text, "addrspace(4)"));
+    try std.testing.expect(has(text, "load float, ptr addrspace(2) %"));
+    try std.testing.expect(has(text, "@cst = private unnamed_addr addrspace(2) constant float") or has(text, "@cst = private addrspace(2) constant float"));
+    try std.testing.expect(has(text, "load float, ptr addrspace(2) @cst"));
 }
 
 test "D5.11 atomicrmw, cmpxchg, load/store atomic; fence is refused" {

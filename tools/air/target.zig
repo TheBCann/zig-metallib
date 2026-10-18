@@ -170,7 +170,7 @@ pub const Version = struct {
 test "every triple follows air64_v<20 + air minor>-apple-macosx<major>.0.0" {
     var buf: [64]u8 = undefined;
     for (profiles) |p| {
-        const want = try std.fmt.bufPrint(&buf, "air64_v{d}-apple-macosx{d}.0.0", .{ 20 + p.air_minor, p.macos_major });
+        const want = try std.mem.print(&buf, "air64_v{d}-apple-macosx{d}.0.0", .{ 20 + p.air_minor, p.macos_major });
         try std.testing.expectEqualStrings(want, p.triple);
     }
 }

@@ -31,8 +31,9 @@
 //!     ids wrapping at 65536 (review-b/r2/e4b.check.log); a fragment whose
 //!     parameters do not line up with the stage_in fields would get the
 //!     wrong varyings
-//!   * renumbers nvptx address spaces in the text (4 -> 2, `ptr addrspace(5)`
-//!     -> `ptr`) so the debug `.ll` matches what the assembler lowers (D1)
+//!   * renumbers nvptx address spaces in the text (101 and 4 -> 2,
+//!     `ptr addrspace(5)` -> `ptr`) so the debug `.ll` matches what the
+//!     assembler lowers (D1)
 //! Assembler (air/assembler.zig): rewritten text -> bitcode via
 //!   std.zig.llvm.Builder, one module per entry point, with `!air.*`
 //!   metadata derived from the shader manifest (air/metadata.zig).
@@ -434,9 +435,12 @@ pub fn convertWith(gpa: Allocator, raw: []const u8, options: ConvertOptions) Err
     var text: []u8 = try out.toOwnedSlice(gpa);
     for (renames.items) |r| text = try replaceToken(gpa, text, r.from, r.to);
     // Zig's nvptx address spaces the assembler renumbers (D1): `.param` is
-    // nvptx 4 = Metal constant 2; `.local` is nvptx 5 = Metal thread 0. The
-    // assembler ignores textual types of named values anyway; this keeps the
-    // debug `.ll` loadable by `xcrun metal` (Metal knows only spaces 0..3).
+    // nvptx 4 on Zig 0.17 and 101 (LLVM's entry-param space) on the 0.18
+    // nightlies, where 4 is nvptx's `constant`; all of them are Metal
+    // constant 2. `.local` is nvptx 5 = Metal thread 0. The assembler ignores
+    // textual types of named values anyway; this keeps the debug `.ll`
+    // loadable by `xcrun metal` (Metal knows only spaces 0..3).
+    text = try replaceAll(gpa, text, "addrspace(101)", "addrspace(2)");
     text = try replaceAll(gpa, text, "addrspace(4)", "addrspace(2)");
     text = try replaceAll(gpa, text, "ptr addrspace(5)", "ptr");
     return text;
@@ -554,8 +558,8 @@ fn emitFunction(
         if (matchesEntry(unquote(d.full_name), info.name)) {
             seen[i] = true;
             try renames.append(gpa, .{
-                .from = try std.fmt.allocPrint(gpa, "@{s}", .{d.full_name}),
-                .to = try std.fmt.allocPrint(gpa, "@{s}", .{info.name}),
+                .from = try gpa.print("@{s}", .{d.full_name}),
+                .to = try gpa.print("@{s}", .{info.name}),
             });
             return emitShader(gpa, out, info, d, body);
         }
@@ -617,8 +621,8 @@ fn implicitEntryLabel(gpa: Allocator, params: []const Param, body: []const []con
         const n = std.fmt.parseInt(usize, p.name["%".len + rename_prefix.len ..], 10) catch continue;
         if (n + 1 > next) next = n + 1;
     }
-    const label = try std.fmt.allocPrint(gpa, "{s}{d}", .{ rename_prefix, next });
-    const ref = try std.fmt.allocPrint(gpa, "%{s}", .{label});
+    const label = try gpa.print("{s}{d}", .{ rename_prefix, next });
+    const ref = try gpa.print("%{s}", .{label});
     for (body) |raw| if (hasToken(raw, ref)) return label;
     return null;
 }
@@ -726,10 +730,11 @@ fn emitShader(
 }
 
 /// An IR parameter type in AIR spelling: the same renumbering `convertWith`
-/// applies to the whole text (D1: nvptx `.param` 4 -> constant 2, `.local`
-/// 5 -> thread 0), so a manifest type compares equal to what Zig declared.
+/// applies to the whole text (D1: nvptx 101 and 4 -> constant 2, `.local` 5
+/// -> thread 0), so a manifest type compares equal to what Zig declared.
 fn airParamType(gpa: Allocator, ty: []const u8) Error![]u8 {
-    const t = try replaceAll(gpa, ty, "addrspace(4)", "addrspace(2)");
+    const p = try replaceAll(gpa, ty, "addrspace(101)", "addrspace(2)");
+    const t = try replaceAll(gpa, p, "addrspace(4)", "addrspace(2)");
     return replaceAll(gpa, t, "ptr addrspace(5)", "ptr");
 }
 
@@ -1010,7 +1015,7 @@ fn rewriteTextureCall(gpa: Allocator, line: []u8) Error![]u8 {
     while (name_end < line.len and line[name_end] != '(') name_end += 1;
     if (name_end == line.len) return line;
     const ti = intrinsics.textureIntrinsic(line[at + 1 .. name_end]) orelse return line;
-    const args_end = std.mem.lastIndexOfScalar(u8, line, ')') orelse return line;
+    const args_end = std.mem.findScalarLast(u8, line, ')') orelse return line;
     if (args_end < name_end) return line;
     const ty = typeSpanBefore(line, at) orelse return line;
 
@@ -1042,7 +1047,7 @@ fn rewriteTextureCall(gpa: Allocator, line: []u8) Error![]u8 {
         if (arg_index > 0) try out.appendSlice(gpa, ", ");
         const trimmed = std.mem.trim(u8, arg, " \t");
         if (ti.sampler_param == arg_index) {
-            const space = std.mem.lastIndexOfScalar(u8, trimmed, ' ') orelse return line;
+            const space = std.mem.findScalarLast(u8, trimmed, ' ') orelse return line;
             try out.print(gpa, "ptr addrspace(2) {s}", .{trimmed[space + 1 ..]});
         } else try out.appendSlice(gpa, trimmed);
     }
@@ -1672,6 +1677,8 @@ test "D2/D4 fragment struct return: Zig's sret FragOut becomes a packed literal 
     // Shape of research/verify-render-bindings/v4_frag.ll for
     // my_shader.fragmentShaderMRT: the discard branch precedes the stores,
     // the FragOut is laid out { <4 x float>, <4 x half>, float, [4 x i8] }.
+    // The header uses the 0.18 nightlies' spelling (`nofree` on the sret
+    // pointer, the `.param` uniforms in addrspace(101)).
     const input =
         \\target datalayout = "e-p6:32:32-i64:64"
         \\target triple = "nvptx64-nvidia-cuda12.5.0-unknown"
@@ -1684,9 +1691,9 @@ test "D2/D4 fragment struct return: Zig's sret FragOut becomes a packed literal 
         \\
         \\declare void @air.discard_fragment() local_unnamed_addr
         \\
-        \\define private fastcc void @my_shader.fragmentShaderMRT(ptr dead_on_unwind noalias writeonly sret(%my_shader.FragOut) align 16 captures(none) initializes((0, 28)) %0, <4 x float> %1, i32 %2, <2 x float> %3, i1 %4, <2 x float> %5, ptr addrspace(4) readonly align 16 captures(none) %6) unnamed_addr #1 {
-        \\  %8 = getelementptr inbounds nuw i8, ptr addrspace(4) %6, i64 84
-        \\  %9 = load i32, ptr addrspace(4) %8, align 4
+        \\define private fastcc void @my_shader.fragmentShaderMRT(ptr dead_on_unwind noalias nofree writeonly sret(%my_shader.FragOut) align 16 captures(none) initializes((0, 28)) %0, <4 x float> %1, i32 %2, <2 x float> %3, i1 %4, <2 x float> %5, ptr addrspace(101) readonly align 16 captures(none) %6) unnamed_addr #1 {
+        \\  %8 = getelementptr inbounds nuw i8, ptr addrspace(101) %6, i64 84
+        \\  %9 = load i32, ptr addrspace(101) %8, align 4
         \\  %10 = and i32 %9, 1
         \\  %11 = icmp eq i32 %10, 0
         \\  %12 = extractelement <2 x float> %5, i64 0
@@ -1742,7 +1749,7 @@ test "D2/D4 fragment struct return: Zig's sret FragOut becomes a packed literal 
     }
     // A fragment struct return that Zig did not pass via sret is refused.
     const by_value =
-        \\define private fastcc <4 x float> @my_shader.fragmentShaderMRT(<4 x float> %0, i32 %1, <2 x float> %2, i1 %3, <2 x float> %4, ptr addrspace(4) %5) {
+        \\define private fastcc <4 x float> @my_shader.fragmentShaderMRT(<4 x float> %0, i32 %1, <2 x float> %2, i1 %3, <2 x float> %4, ptr addrspace(101) %5) {
         \\  ret <4 x float> zeroinitializer
         \\}
         \\
@@ -1756,7 +1763,7 @@ test "D4 entries: vertex/fragment parameter counts and types are checked against
     const gpa = arena.allocator();
     // fragmentShaderMRT with a parameter for point_size, which Metal never passes.
     const with_point_size =
-        \\define private fastcc void @my_shader.fragmentShaderMRT(ptr sret(%my_shader.FragOut) %0, <4 x float> %1, float %2, i32 %3, <2 x float> %4, i1 %5, <2 x float> %6, ptr addrspace(4) %7) {
+        \\define private fastcc void @my_shader.fragmentShaderMRT(ptr sret(%my_shader.FragOut) %0, <4 x float> %1, float %2, i32 %3, <2 x float> %4, i1 %5, <2 x float> %6, ptr addrspace(101) %7) {
         \\  ret void
         \\}
         \\
@@ -1764,7 +1771,7 @@ test "D4 entries: vertex/fragment parameter counts and types are checked against
     try std.testing.expectError(error.ParamCountMismatch, convertWith(gpa, with_point_size, .{ .require_all_entries = false }));
     // front_facing declared as u32 instead of bool.
     const wrong_builtin =
-        \\define private fastcc void @my_shader.fragmentShaderMRT(ptr sret(%my_shader.FragOut) %0, <4 x float> %1, i32 %2, <2 x float> %3, i32 %4, <2 x float> %5, ptr addrspace(4) %6) {
+        \\define private fastcc void @my_shader.fragmentShaderMRT(ptr sret(%my_shader.FragOut) %0, <4 x float> %1, i32 %2, <2 x float> %3, i32 %4, <2 x float> %5, ptr addrspace(101) %6) {
         \\  ret void
         \\}
         \\
@@ -1772,7 +1779,7 @@ test "D4 entries: vertex/fragment parameter counts and types are checked against
     try std.testing.expectError(error.ParamTypeMismatch, convertWith(gpa, wrong_builtin, .{ .require_all_entries = false }));
     // vertexShaderInstanced missing its base_instance parameter.
     const short_vertex =
-        \\define private fastcc void @my_shader.vertexShaderInstanced(ptr sret(%my_shader.VertexOutInstanced) %0, i32 %1, i32 %2, i32 %3, ptr addrspace(1) %4, ptr addrspace(4) %5) {
+        \\define private fastcc void @my_shader.vertexShaderInstanced(ptr sret(%my_shader.VertexOutInstanced) %0, i32 %1, i32 %2, i32 %3, ptr addrspace(1) %4, ptr addrspace(101) %5) {
         \\  ret void
         \\}
         \\
@@ -1780,12 +1787,15 @@ test "D4 entries: vertex/fragment parameter counts and types are checked against
     try std.testing.expectError(error.ParamCountMismatch, convertWith(gpa, short_vertex, .{ .require_all_entries = false }));
 }
 
-test "D4 kernels: `define ptx_kernel void @name` is an entry, header rebuilt from the manifest, addrspace(4) -> (2), signext/zeroext dropped" {
+test "D4 kernels: `define ptx_kernel void @name` is an entry, header rebuilt from the manifest, addrspace(101) -> (2), signext/zeroext dropped" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const gpa = arena.allocator();
-    // Shape of the IR Zig 0.17.0-dev emits for src/engine/my_shader.zig's
-    // kernels (research/_results/r06.txt ir_patterns 8, 10, 11).
+    // Shape of src/engine/my_shader.zig's kernels from
+    // research/_results/r06.txt ir_patterns 8, 10, 11 (Zig 0.17.0-dev), with
+    // the parameter spellings of the 0.18 nightlies: `.param` pointers in
+    // addrspace(101) and `nofree` on writeonly device pointers. Zig 0.17.0
+    // writes `.param` as addrspace(4); that spelling is checked below.
     const input =
         \\target datalayout = "e-p6:32:32-i64:64"
         \\target triple = "nvptx64-nvidia-cuda12.5.0-unknown"
@@ -1794,14 +1804,14 @@ test "D4 kernels: `define ptx_kernel void @name` is an entry, header rebuilt fro
         \\
         \\@my_shader.scratch = private unnamed_addr addrspace(3) global [64 x float] undef, align 4
         \\
-        \\define ptx_kernel void @scaleKernel(ptr addrspace(1) readonly align 4 captures(none) %0, ptr addrspace(1) writeonly align 4 captures(none) %1, ptr addrspace(4) readonly align 4 captures(none) %2, i32 noundef %3) local_unnamed_addr #0 {
-        \\  %5 = load i32, ptr addrspace(4) %2, align 4
+        \\define ptx_kernel void @scaleKernel(ptr addrspace(1) readonly align 4 captures(none) %0, ptr addrspace(1) nofree writeonly align 4 captures(none) %1, ptr addrspace(101) readonly align 4 captures(none) %2, i32 noundef %3) local_unnamed_addr #0 {
+        \\  %5 = load i32, ptr addrspace(101) %2, align 4
         \\  %6 = icmp ult i32 %3, %5
         \\  br i1 %6, label %7, label %14
         \\
         \\7:
-        \\  %8 = getelementptr inbounds nuw i8, ptr addrspace(4) %2, i64 4
-        \\  %9 = load float, ptr addrspace(4) %8, align 4
+        \\  %8 = getelementptr inbounds nuw i8, ptr addrspace(101) %2, i64 4
+        \\  %9 = load float, ptr addrspace(101) %8, align 4
         \\  %10 = zext nneg i32 %3 to i64
         \\  %11 = getelementptr inbounds [4 x i8], ptr addrspace(1) %0, i64 %10
         \\  %12 = load float, ptr addrspace(1) %11, align 4
@@ -1814,7 +1824,7 @@ test "D4 kernels: `define ptx_kernel void @name` is an entry, header rebuilt fro
         \\  ret void
         \\}
         \\
-        \\define ptx_kernel void @reverseKernel(ptr addrspace(1) readonly align 4 captures(none) %0, ptr addrspace(1) writeonly align 4 captures(none) %1, i32 %2, i32 %3, i32 %4, i32 %5) local_unnamed_addr #1 {
+        \\define ptx_kernel void @reverseKernel(ptr addrspace(1) readonly align 4 captures(none) %0, ptr addrspace(1) nofree writeonly align 4 captures(none) %1, i32 %2, i32 %3, i32 %4, i32 %5) local_unnamed_addr #1 {
         \\  %7 = zext i32 %5 to i64
         \\  %8 = getelementptr inbounds [4 x i8], ptr addrspace(3) @my_shader.scratch, i64 %7
         \\  %9 = zext i32 %2 to i64
@@ -1828,7 +1838,7 @@ test "D4 kernels: `define ptx_kernel void @name` is an entry, header rebuilt fro
         \\  ret void
         \\}
         \\
-        \\define ptx_kernel void @sumKernel(ptr addrspace(1) readonly align 4 captures(none) %0, ptr addrspace(1) writeonly align 4 captures(none) %1, i32 noundef %2, i32 %3, i32 %4) local_unnamed_addr #1 {
+        \\define ptx_kernel void @sumKernel(ptr addrspace(1) readonly align 4 captures(none) %0, ptr addrspace(1) nofree writeonly align 4 captures(none) %1, i32 noundef %2, i32 %3, i32 %4) local_unnamed_addr #1 {
         \\  %6 = zext i32 %2 to i64
         \\  %7 = getelementptr inbounds [4 x i8], ptr addrspace(1) %0, i64 %6
         \\  %8 = load float, ptr addrspace(1) %7, align 4
@@ -1862,8 +1872,13 @@ test "D4 kernels: `define ptx_kernel void @name` is an entry, header rebuilt fro
     try std.testing.expect(find(out, "define void @countKernel(ptr addrspace(1) %__0, ptr addrspace(1) %__1, i32 %__2) {") != null);
     try std.testing.expect(find(out, "ptx_kernel") == null);
     // nvptx `.param` loads become Metal constant-space loads in the text too.
+    try std.testing.expect(find(out, "addrspace(101)") == null);
     try std.testing.expect(find(out, "addrspace(4)") == null);
     try std.testing.expect(find(out, "%__5 = load i32, ptr addrspace(2) %__2, align 4") != null);
+    // Zig 0.17.0's spelling of the same kernels (`.param` in addrspace(4),
+    // no `nofree`) rewrites to exactly the same text.
+    const input_017 = try replaceAll(gpa, try replaceAll(gpa, input, " nofree", ""), "addrspace(101)", "addrspace(4)");
+    try std.testing.expectEqualStrings(out, try convertWith(gpa, input_017, .{ .require_all_entries = false }));
     // Threadgroup global and barrier untouched.
     try std.testing.expect(find(out, "@my_shader.scratch = private unnamed_addr addrspace(3) global [64 x float] undef, align 4") != null);
     try std.testing.expect(find(out, "tail call void @air.wg.barrier(i32 2, i32 1)") != null);
@@ -1950,15 +1965,16 @@ test "D4 kernels: parameter types are checked against the manifest (review-b E2/
         \\
     ;
     try std.testing.expectError(error.ParamTypeMismatch, convertWith(gpa, wrong_space, .{ .require_all_entries = false }));
-    // The matching declaration (Zig's `.param` space 4 for the constant
-    // buffer, `zeroext` on the u16) passes and gets the manifest header.
+    // The matching declaration (the `.param` constant buffer in addrspace(101)
+    // as the 0.18 nightlies write it, `zeroext` on the u16) passes and gets
+    // the manifest header.
     const good =
         \\define ptx_kernel void @tgBufKernel(ptr addrspace(1) readonly %0, ptr addrspace(1) writeonly %1, ptr addrspace(3) %2, <3 x i32> %3, i16 zeroext %4, i32 noundef %5) {
         \\  %7 = zext i16 %4 to i64
         \\  ret void
         \\}
         \\
-        \\define ptx_kernel void @scaleKernel(ptr addrspace(1) %0, ptr addrspace(1) %1, ptr addrspace(4) %2, i32 %3) {
+        \\define ptx_kernel void @scaleKernel(ptr addrspace(1) %0, ptr addrspace(1) %1, ptr addrspace(101) %2, i32 %3) {
         \\  ret void
         \\}
         \\
@@ -1966,6 +1982,25 @@ test "D4 kernels: parameter types are checked against the manifest (review-b E2/
     const out = try convertWith(gpa, good, .{ .require_all_entries = false });
     try std.testing.expect(find(out, "define void @tgBufKernel(ptr addrspace(1) %__0, ptr addrspace(1) %__1, ptr addrspace(3) %__2, <3 x i32> %__3, i16 %__4, i32 %__5) {") != null);
     try std.testing.expect(find(out, "define void @scaleKernel(ptr addrspace(1) %__0, ptr addrspace(1) %__1, ptr addrspace(2) %__2, i32 %__3) {") != null);
+    // Zig 0.17.0 writes `.param` as nvptx 4 (nvptx's `constant` on the 0.18
+    // nightlies); both are Metal constant space, so 4 is accepted too, in
+    // the header check and in the body text.
+    const pre_018 =
+        \\define ptx_kernel void @scaleKernel(ptr addrspace(1) %0, ptr addrspace(1) %1, ptr addrspace(4) %2, i32 %3) {
+        \\  %5 = load i32, ptr addrspace(4) %2, align 4
+        \\  %6 = getelementptr inbounds nuw i8, ptr addrspace(4) %2, i64 4
+        \\  %7 = load float, ptr addrspace(4) %6, align 4
+        \\  ret void
+        \\}
+        \\
+    ;
+    const out_pre_018 = try convertWith(gpa, pre_018, .{ .require_all_entries = false });
+    try std.testing.expect(find(out_pre_018, "define void @scaleKernel(ptr addrspace(1) %__0, ptr addrspace(1) %__1, ptr addrspace(2) %__2, i32 %__3) {") != null);
+    try std.testing.expect(find(out_pre_018, "addrspace(4)") == null);
+    try std.testing.expect(find(out_pre_018, "%__5 = load i32, ptr addrspace(2) %__2, align 4") != null);
+    try std.testing.expect(find(out_pre_018, "%__6 = getelementptr inbounds i8, ptr addrspace(2) %__2, i64 4") != null);
+    try std.testing.expect(find(out_pre_018, "%__7 = load float, ptr addrspace(2) %__6, align 4") != null);
+    try std.testing.expectEqualStrings("ptr addrspace(2)", try airParamType(gpa, "ptr addrspace(101)"));
     try std.testing.expectEqualStrings("ptr addrspace(2)", try airParamType(gpa, "ptr addrspace(4)"));
     try std.testing.expectEqualStrings("ptr", try airParamType(gpa, "ptr addrspace(5)"));
     try std.testing.expectEqualStrings("<3 x i32>", try airParamType(gpa, "<3 x i32>"));

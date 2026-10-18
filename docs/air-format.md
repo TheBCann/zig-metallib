@@ -203,8 +203,11 @@ parse the equivalent *text*.
 | 2 | constant |
 | 3 | threadgroup |
 
-Nothing else exists. NVPTX's 4 (param) and 5 (local) both crash the runtime compiler, so
-the assembler renumbers 4 → 2 and 5 → 0.
+Nothing else exists. Zig 0.17.0's NVPTX IR uses 4 for `.param` and 5 for `.local`
+(ordinary locals are space 0); the
+0.18 nightlies use LLVM's numbering, where `.param` is 101 and 4 is NVPTX's `constant`.
+4 and 5 both crash the runtime compiler and Metal has no 101, so the assembler renumbers
+4 → 2, 101 → 2 and 5 → 0.
 
 **Program-scope data must live in address space 2.** A `constant` global left in space 0
 fails pipeline creation with `Undefined symbols: ___anon_N`; a *mutable* global in

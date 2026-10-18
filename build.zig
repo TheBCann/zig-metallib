@@ -7,13 +7,13 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    // The project pins one Zig nightly in build.zig.zon. The assembler is
-    // built on std.zig.llvm.Builder, which changes between nightlies, so say
-    // up front when the running compiler differs rather than leaving the
+    // The project pins one exact Zig version in build.zig.zon. The assembler
+    // is built on std.zig.llvm.Builder, which changes between Zig versions, so
+    // say up front when the running compiler differs rather than leaving the
     // mismatch to surface as an unrelated-looking compile error.
     if (!std.mem.eql(u8, builtin.zig_version_string, zon.minimum_zig_version)) {
         std.log.warn("this project is pinned to Zig {s} (build.zig.zon) but this is Zig {s}; " ++
-            "std.zig.llvm.Builder changes between nightlies, so build errors may come from the version mismatch", .{ zon.minimum_zig_version, builtin.zig_version_string });
+            "std.zig.llvm.Builder changes between Zig versions, so build errors may come from the version mismatch", .{ zon.minimum_zig_version, builtin.zig_version_string });
     }
 
     // The oldest macOS the generated library must load on (tools/air/target.zig).
@@ -32,7 +32,7 @@ pub fn build(b: *std.Build) void {
     // `no_panic` handler in my_shader.zig); the assembler's uniformity
     // analysis treats the trapping blocks as no-return, so the barriers
     // after a bounds check stay accepted. Used as a verification build.
-    const shader_optimize = b.option(std.builtin.OptimizeMode, "shader-optimize", "Optimize mode of the GPU shader module: fast (default), safe, debug, small") orelse .fast;
+    const shader_optimize = b.option(std.lang.Optimize, "shader-optimize", "Optimize mode of the GPU shader module: fast (default), safe, debug, small") orelse .fast;
     const gpu_target = b.resolveTargetQuery(.{
         .cpu_arch = .nvptx64,
         .os_tag = .cuda,
@@ -71,10 +71,10 @@ pub fn build(b: *std.Build) void {
     run_splice.addArg(b.fmt("--target={t}", .{metal_target}));
     if (allow_unverified) run_splice.addArg("--allow-unverified");
     run_splice.addFileArg(shader_ir);
-    const metallib = run_splice.addOutputFileArg("default.metallib");
+    const metallib = run_splice.addOutputFileArg2("default.metallib", .{});
     // Debug text output: the rewritten IR plus metadata, also accepted by
     // `xcrun metal -Xclang -opaque-pointers` for cross-checking.
-    const air_ll = run_splice.addOutputFileArg("shader.air.ll");
+    const air_ll = run_splice.addOutputFileArg2("shader.air.ll", .{});
 
     // ── 4. The app ─────────────────────────────────────────────────────────
     const objc_mod = b.addModule("objc", .{
