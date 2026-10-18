@@ -332,9 +332,11 @@ it adds a `::warning::` and a job-summary line naming it, and does not fail the 
 other failure on the virtual GPU, and any failure on a real Apple GPU, fails the run.
 With no Metal device at all, `metallib-check` prints `SKIP no Metal device` and exits
 77. The step still passes (green), but it adds a `::warning::` annotation and a
-job-summary line saying nothing was checked. The pinned Zig is a tagged release, which
-ziglang.org keeps (it deletes old nightlies within days); the setup step fails only if
-neither ziglang.org nor a community mirror serves the pinned version.
+job-summary line saying nothing was checked. The setup step fails when neither
+ziglang.org nor a community mirror serves the pinned version. The pin is a nightly, and
+ziglang.org deletes old nightlies within days, so when that step fails, move the pin to a
+current nightly. The `zig-0.17.0` tag pins the Zig 0.17.0 release, which stays
+downloadable.
 
 ---
 

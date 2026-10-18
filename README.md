@@ -38,13 +38,16 @@ zig build check -- zig-out/bin/default.metallib         # load into Metal, run e
 xcrun metal-objdump -d zig-out/bin/default.metallib     # read our container back
 ```
 
-Requires Zig **0.17.0** (the tagged release, pinned in `build.zig.zon`) and macOS 26 or
-newer to run the result. `std.zig.llvm.Builder` is an internal standard-library API and
-moves between Zig versions, so `zig build` warns when a different Zig runs it. The pin is
-a release because ziglang.org deletes old nightlies within days, which stops CI and
-anyone else from fetching them. The 0.18.0-dev nightlies (checked on dev.223 and
-dev.253) also build it and pass every check; Zig 0.18 changed the IR the shader compiles
-to, so their `default.metallib` bytes differ from 0.17.0's.
+Requires the Zig nightly **0.18.0-dev.253+16d31ceed** (pinned in `build.zig.zon`,
+downloadable from [ziglang.org](https://ziglang.org/download/)) and macOS 26 or newer to
+run the result. `std.zig.llvm.Builder` is an internal standard-library API and moves
+between Zig versions, so `zig build` warns when a different Zig runs it. ziglang.org
+deletes old nightlies within days; once this one is gone, CI fails at its setup step until
+the pin moves to a current nightly. For a toolchain that stays downloadable, check out the
+**`zig-0.17.0`** tag, which pins the Zig 0.17.0 release. Zig 0.17.0 also builds this
+commit. Zig 0.18 changed the IR the shader compiles to, so `default.metallib` differs
+between the two (`1969ef4d…` on 0.17.0, `97bd644c…` on the 0.18 nightlies), and both
+pass all 42 checks.
 
 ## What is verified, and how
 
