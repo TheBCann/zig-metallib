@@ -152,13 +152,30 @@ identifier scanner lacked `-`, so a label such as `.unr-lcssa` (LLVM's name afte
 unrolling) would not have been recognised as a block and its branch target would have been
 truncated, defeating the block-order pass for that shape; `-Doptimize` could switch the CPU
 side out of Debug; the reproduce hints omitted the seed and named the wrong step for the
-Apple run; and the Apple step's result was cached across toolchain updates. The sixth is a
-**known limitation, not fixed**: the assembler types a `phi` of pointers from the incoming
-values it has already seen in text order (`phiPointerType`), so a pointer `phi` whose
-non-null incoming is defined in a later block can be typed as address space 0 instead of
-the relocated constant space 2 and refused. No generated program contains pointer phis
-(bodies are pure integer code), and the sample shader is unaffected; a proper fix is an
-order-independent pointer-type inference pass in the assembler.
+Apple run; and the Apple step's result was cached across toolchain updates. The sixth was
+a limitation in the assembler, since fixed: it typed a `phi` of pointers from the incoming
+values it had already seen in text order (`phiPointerType`), so a pointer `phi` whose only
+non-null incoming is defined in a later block kept address space 0 instead of the relocated
+constant space 2 and was refused. The assembler now lowers a function again when the phi's
+real address space shows up later: in its incomings once the body is lowered, in a `select`
+or `icmp` against a relocated pointer, through values derived from the phi by
+`getelementptr` or `select` (the pointer-bump idiom), or through another phi that depends
+on it (a conditional update kept as a branch, or an lcssa phi of an inner loop). Each
+retry settles one more phi, and the final attempt still checks every type, so a wrong
+guess is refused rather than emitted (`lowerDefine` and `retryIfUnsettledPhi` in
+`tools/air/assembler.zig`). A `select` between a pointer and `null` takes the pointer's
+address space in either order. This fix was itself reviewed the same way: five findings
+confirmed and fixed (the retry bound, phis vetoing each other, derived values), two refuted,
+one of them by showing Metal accepts the unused declaration an abandoned attempt can leave
+behind. Residual gap: a settled phi whose mismatching incoming is a non-phi value derived
+from two unsettled phis is still refused; the general remedy is an order-independent
+pointer-type pre-pass, which the retry approximates one phi per attempt. Two real shader
+bodies with these shapes live in `tools/crosscheck/regress/` and must keep matching:
+
+```sh
+zig build crosscheck -Dcrosscheck-body=tools/crosscheck/regress/pointer_phi_join.zig
+zig build crosscheck -Dcrosscheck-body=tools/crosscheck/regress/pointer_phi_select.zig
+```
 
 The review harness is saved as `.claude/workflows/crosscheck-review.js`; from Claude Code,
 `/crosscheck-review` runs it again after changes to the bench or the splice.

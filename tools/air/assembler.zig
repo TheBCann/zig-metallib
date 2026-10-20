@@ -103,6 +103,10 @@ pub const Error = error{
     UndefinedBlock,
     UndefinedGlobal,
     EntryPointMissing,
+    /// Internal: `resolvePhis` found a pointer phi whose incomings agree on a
+    /// type other than the one it was created with; `lowerDefine` records the
+    /// type and lowers the function again. Never escapes the assembler.
+    RetryPhiTypes,
 };
 
 pub const Options = struct {
@@ -617,24 +621,47 @@ const ModuleState = struct {
         });
     }
 
+    /// D1: a `phi ptr` is created with the type its already-defined incomings
+    /// agree on (`phiPointerType`). When none is defined yet, as for a
+    /// loop-carried pointer in a header laid out before its latch, it keeps
+    /// the textual type, and `resolvePhis` may then find that the incomings
+    /// really agree on another pointer type, a relocated constant table's.
+    /// It records that type in `hints` and the function is lowered again,
+    /// which only `finish` would have made permanent; each retry settles one
+    /// phi, so the loop is bounded by the number of phis.
     fn lowerDefine(m: *ModuleState, di: usize) Error!void {
         const gpa = m.gpa;
         const d = m.defines.items[di];
         const body = d.body.?;
-        var f = FunctionState{
-            .m = m,
-            .ret_ty = d.ret_ty,
-            .wip = try WipFunction.init(m.b, .{ .function = d.func.?, .strip = true }),
-            .line_level = if (di < m.funcs.len) m.funcs[di].line_level else &.{},
-        };
-        defer f.deinit();
-        for (d.param_names, 0..) |pname, i| {
-            try f.locals.append(gpa, .{ .name = pname, .value = f.wip.arg(@intCast(i)) });
+        var hints: std.StringHashMapUnmanaged(Type) = .empty;
+        defer hints.deinit(gpa);
+        while (true) {
+            var f = FunctionState{
+                .m = m,
+                .ret_ty = d.ret_ty,
+                .wip = try WipFunction.init(m.b, .{ .function = d.func.?, .strip = true }),
+                .line_level = if (di < m.funcs.len) m.funcs[di].line_level else &.{},
+                .phi_hints = &hints,
+            };
+            defer f.deinit();
+            for (d.param_names, 0..) |pname, i| {
+                try f.locals.append(gpa, .{ .name = pname, .value = f.wip.arg(@intCast(i)) });
+            }
+            try f.createBlocks(body, d.param_names);
+            // Every retry records a hint for a phi that had none (a hinted phi
+            // is `inferred` next time and never hinted again), so the count
+            // grows by one per attempt and is bounded by the body's phis.
+            const hints_before = hints.count();
+            f.lowerAndResolve(body, d.header_line) catch |err| switch (err) {
+                error.RetryPhiTypes => {
+                    if (hints.count() > hints_before) continue;
+                    return fail(d.header_line, "", "pointer phi types did not settle", error.Syntax);
+                },
+                else => return err,
+            };
+            try f.wip.finish();
+            return;
         }
-        try f.createBlocks(body, d.param_names);
-        try f.lowerBody(body, d.header_line);
-        try f.resolvePhis();
-        try f.wip.finish();
     }
 
     /// Apple's signature for a texture intrinsic, parsed from the IR text in
@@ -1077,6 +1104,10 @@ const BlockRef = struct { name: []const u8, index: BlockIndex, incoming: u32 };
 const PendingPhi = struct {
     phi: WipFunction.WipPhi,
     ty: Type,
+    /// The phi's result name, the key of `FunctionState.phi_hints`.
+    name: []const u8,
+    /// Whether `ty` came from the incomings (or a hint) rather than the text.
+    inferred: bool,
     /// Each incoming is `(value text, block name)`.
     incoming: []const [2][]const u8,
     /// Predecessor count of the block holding the phi; the Builder requires
@@ -1091,6 +1122,14 @@ const FunctionState = struct {
     m: *ModuleState,
     ret_ty: Type,
     wip: WipFunction,
+    /// Pointer phi types settled by an earlier attempt at this function
+    /// (`lowerDefine`), keyed by the phi's result name.
+    phi_hints: *std.StringHashMapUnmanaged(Type),
+    /// D1: pointer values a gep, select or phi derived from a pointer phi
+    /// that still carries its textual type, mapped to that phi's index in
+    /// `phis`. A type mismatch at such a value reveals the phi's real
+    /// address space (retryIfUnsettledPhi, resolvePhis).
+    derived: std.AutoHashMapUnmanaged(Value, usize) = .empty,
     locals: std.ArrayList(Local) = .empty,
     blocks: std.ArrayList(BlockRef) = .empty,
     phis: std.ArrayList(PendingPhi) = .empty,
@@ -1107,6 +1146,7 @@ const FunctionState = struct {
         const gpa = f.m.gpa;
         for (f.phis.items) |p| gpa.free(p.incoming);
         f.phis.deinit(gpa);
+        f.derived.deinit(gpa);
         f.blocks.deinit(gpa);
         f.locals.deinit(gpa);
         if (f.entry_name) |n| gpa.free(n);
@@ -1314,28 +1354,66 @@ const FunctionState = struct {
             }
             // D1: named operands carry their real type, so a `phi ptr` over
             // relocated constants is really a phi of `ptr addrspace(2)`.
-            if (ty.isPointer(b)) ty = try f.phiPointerType(ty, incoming.items, c.line);
+            const phi_name = result orelse return fail(c.line, c.s, "phi without result", error.Syntax);
+            const textual = ty;
+            // A type settled by an earlier attempt at this function wins
+            // (lowerDefine); otherwise the incomings defined so far decide.
+            if (ty.isPointer(b)) ty = f.phi_hints.get(phi_name) orelse try f.phiPointerType(ty, incoming.items, c.line);
             const phi = try wip.phi(ty, "");
+            // D1: a pointer phi that kept its textual type and has an
+            // incoming derived from another such phi shares that phi's type.
+            if (ty.isPointer(b) and ty == textual) {
+                for (incoming.items) |inc| {
+                    const v = (try f.localValue(inc[0], c.line)) orelse continue;
+                    if (f.unsettledRoot(v)) |root| {
+                        try f.derived.put(m.gpa, phi.toValue(), root);
+                        break;
+                    }
+                }
+            }
             try f.phis.append(m.gpa, .{
                 .phi = phi,
                 .ty = ty,
+                .name = phi_name,
+                .inferred = ty != textual,
                 .incoming = try incoming.toOwnedSlice(m.gpa),
                 .block_incoming = f.blocks.items[f.current].incoming,
                 .line_no = c.line,
                 .line = c.s,
             });
-            try f.define(result orelse return fail(c.line, c.s, "phi without result", error.Syntax), phi.toValue());
+            try f.define(phi_name, phi.toValue());
             return;
         }
         if (std.mem.eql(u8, op, "select")) {
             const fast = skipFastMath(c);
             const cond = try f.operand(c);
             try c.expect(",");
-            const lhs = try f.operand(c);
+            // D1: a literal pointer (`null`, `undef`, `poison`) takes the real
+            // address space of the named operand on the other side, as phi
+            // incomings do: `select i1 %c, ptr %gep, ptr null` is how LLVM
+            // spells a conditional pointer into a relocated constant table.
+            const lhs_ty = try f.m.parseType(c);
+            _ = skipAttrs(c);
+            c.skipWs();
+            const lhs_start = c.i;
+            const lhs_named = c.i < c.s.len and (c.s[c.i] == '%' or c.s[c.i] == '@');
+            var lhs = try f.operandOfType(c, lhs_ty);
             try c.expect(",");
-            const rhs = try f.operand(c);
-            if (lhs.typeOfWip(wip) != rhs.typeOfWip(wip)) return fail(c.line, c.s, "select operands have different types", error.Syntax);
-            try f.define(result orelse return fail(c.line, c.s, "select without result", error.Syntax), try wip.select(fast, cond, lhs, rhs, ""));
+            const rhs_ty = try f.m.parseType(c);
+            const pointers = lhs_ty.isPointer(b) and rhs_ty.isPointer(b);
+            const rhs = try f.operandOfType(c, if (pointers) lhs.typeOfWip(wip) else rhs_ty);
+            if (pointers and !lhs_named and lhs.typeOfWip(wip) != rhs.typeOfWip(wip)) {
+                var lc = Cursor{ .s = c.s, .line = c.line };
+                lc.i = lhs_start;
+                lhs = try f.operandOfType(&lc, rhs.typeOfWip(wip));
+            }
+            if (lhs.typeOfWip(wip) != rhs.typeOfWip(wip)) {
+                try f.retryIfUnsettledPhi(lhs, rhs);
+                return fail(c.line, c.s, "select operands have different types", error.Syntax);
+            }
+            const sel = try wip.select(fast, cond, lhs, rhs, "");
+            if (pointers) try f.noteDerived(sel, &.{ lhs, rhs });
+            try f.define(result orelse return fail(c.line, c.s, "select without result", error.Syntax), sel);
             return;
         }
         if (std.mem.eql(u8, op, "icmp")) {
@@ -1346,7 +1424,10 @@ const FunctionState = struct {
             const lhs = try f.operand(c);
             try c.expect(",");
             const rhs = try f.operandOfType(c, lhs.typeOfWip(wip));
-            if (lhs.typeOfWip(wip) != rhs.typeOfWip(wip)) return fail(c.line, c.s, "icmp operands have different types", error.Syntax);
+            if (lhs.typeOfWip(wip) != rhs.typeOfWip(wip)) {
+                try f.retryIfUnsettledPhi(lhs, rhs);
+                return fail(c.line, c.s, "icmp operands have different types", error.Syntax);
+            }
             try f.define(result orelse return fail(c.line, c.s, "icmp without result", error.Syntax), try wip.icmp(cond, lhs, rhs, ""));
             return;
         }
@@ -1439,7 +1520,9 @@ const FunctionState = struct {
                 if (!c.eat(",")) break;
                 try indices.append(m.gpa, try f.operand(c));
             }
-            try f.define(result orelse return fail(c.line, c.s, "gep without result", error.Syntax), try wip.gep(kind, ty, base, indices.items, ""));
+            const gep = try wip.gep(kind, ty, base, indices.items, "");
+            try f.noteDerived(gep, &.{base});
+            try f.define(result orelse return fail(c.line, c.s, "gep without result", error.Syntax), gep);
             return;
         }
         if (std.mem.eql(u8, op, "load")) {
@@ -1820,37 +1903,114 @@ const FunctionState = struct {
         const b = f.m.b;
         var found: ?Type = null;
         for (incoming) |inc| {
-            const text = inc[0];
-            if (text.len < 2) continue;
-            var vc = Cursor{ .s = text, .line = line_no };
-            const real: Type = switch (text[0]) {
-                '@' => blk: {
-                    _ = vc.eat("@");
-                    const g = (try f.m.findGlobal(try f.m.globalName(&vc))) orelse continue;
-                    break :blk g.index.toConst().typeOf(b);
-                },
-                '%' => blk: {
-                    _ = vc.eat("%");
-                    const name = try f.m.quotedOrPlainName(&vc);
-                    for (f.locals.items) |l| if (std.mem.eql(u8, l.name, name)) break :blk l.value.typeOfWip(&f.wip);
-                    continue;
-                },
-                // `getelementptr inbounds (i8, ptr @tab, i64 16)`: a
-                // sub-slice of a relocated table; the constant inherits the
-                // base's address space. Building it here is harmless, the
-                // Builder interns constants.
-                'g' => blk: {
-                    if (!std.mem.startsWith(u8, text, "getelementptr")) continue;
-                    break :blk (try f.m.parseConst(&vc, textual)).typeOf(b);
-                },
-                else => continue,
-            };
+            const real = (try f.incomingType(inc[0], line_no, textual)) orelse continue;
             if (!real.isPointer(b)) return textual;
             if (found) |t| {
                 if (t != real) return textual;
             } else found = real;
         }
         return found orelse textual;
+    }
+
+    /// The real type of one phi incoming when it names something: a global,
+    /// a local defined so far, or a `getelementptr inbounds (i8, ptr @tab,
+    /// i64 16)` constant expression (a sub-slice of a relocated table, which
+    /// inherits the base's address space; building it here is harmless, the
+    /// Builder interns constants). Null for a literal (`null`, `undef`,
+    /// `poison`, numbers) or a local not defined yet.
+    fn incomingType(f: *FunctionState, text: []const u8, line_no: usize, textual: Type) Error!?Type {
+        const b = f.m.b;
+        if (text.len < 2) return null;
+        var vc = Cursor{ .s = text, .line = line_no };
+        switch (text[0]) {
+            '@' => {
+                _ = vc.eat("@");
+                const g = (try f.m.findGlobal(try f.m.globalName(&vc))) orelse return null;
+                return g.index.toConst().typeOf(b);
+            },
+            '%' => {
+                _ = vc.eat("%");
+                const name = try f.m.quotedOrPlainName(&vc);
+                for (f.locals.items) |l| if (std.mem.eql(u8, l.name, name)) return l.value.typeOfWip(&f.wip);
+                return null;
+            },
+            'g' => {
+                if (!std.mem.startsWith(u8, text, "getelementptr")) return null;
+                return (try f.m.parseConst(&vc, textual)).typeOf(b);
+            },
+            else => return null,
+        }
+    }
+
+    /// With the whole body lowered, the pointer type a phi's named incomings
+    /// agree on, or null when there is none or they disagree.
+    fn settledPointerType(f: *FunctionState, p: PendingPhi) Error!?Type {
+        const b = f.m.b;
+        var found: ?Type = null;
+        for (p.incoming) |inc| {
+            // An incoming that is, or derives from, a pointer phi still
+            // carrying its textual type says nothing about this phi's type.
+            if (try f.localValue(inc[0], p.line_no)) |v| if (f.unsettledRoot(v) != null) continue;
+            const real = (try f.incomingType(inc[0], p.line_no, p.ty)) orelse continue;
+            if (!real.isPointer(b)) return null;
+            if (found) |t| {
+                if (t != real) return null;
+            } else found = real;
+        }
+        return found;
+    }
+
+    /// One attempt at the body (lowerDefine retries on `RetryPhiTypes`).
+    fn lowerAndResolve(f: *FunctionState, body: []const []const u8, header_line: usize) Error!void {
+        try f.lowerBody(body, header_line);
+        try f.resolvePhis();
+    }
+
+    /// A pointer type mismatch between `a` and `b` where one of them is a phi
+    /// still carrying its textual type: that use reveals the phi's real
+    /// address space (a `select` or `icmp` against a relocated pointer), so
+    /// record the other operand's type for the phi and ask lowerDefine for
+    /// another attempt. Returns normally when neither operand is such a phi,
+    /// and the caller reports the mismatch.
+    fn retryIfUnsettledPhi(f: *FunctionState, a: Value, b: Value) Error!void {
+        const ta = a.typeOfWip(&f.wip);
+        const tb = b.typeOfWip(&f.wip);
+        if (!ta.isPointer(f.m.b) or !tb.isPointer(f.m.b)) return;
+        if (f.unsettledRoot(a)) |i| {
+            try f.phi_hints.put(f.m.gpa, f.phis.items[i].name, tb);
+            return error.RetryPhiTypes;
+        }
+        if (f.unsettledRoot(b)) |i| {
+            try f.phi_hints.put(f.m.gpa, f.phis.items[i].name, ta);
+            return error.RetryPhiTypes;
+        }
+    }
+
+    /// The index in `phis` of the pointer phi that `v` is, or was derived
+    /// from (`derived`), when that phi still carries its textual type.
+    fn unsettledRoot(f: *FunctionState, v: Value) ?usize {
+        if (!v.typeOfWip(&f.wip).isPointer(f.m.b)) return null;
+        for (f.phis.items, 0..) |p, i| if (!p.inferred and p.phi.toValue() == v) return i;
+        return f.derived.get(v);
+    }
+
+    /// Records `result` as derived from the first of `operands` that is, or
+    /// derives from, a pointer phi still carrying its textual type.
+    fn noteDerived(f: *FunctionState, result: Value, operands: []const Value) Error!void {
+        for (operands) |o| if (f.unsettledRoot(o)) |root| {
+            try f.derived.put(f.m.gpa, result, root);
+            return;
+        };
+    }
+
+    /// The local a phi incoming names (`%x`), when it is defined so far.
+    fn localValue(f: *FunctionState, text: []const u8, line_no: usize) Error!?Value {
+        if (text.len < 2 or text[0] != '%') return null;
+        var vc = Cursor{ .s = text, .line = line_no };
+        _ = vc.eat("%");
+        const name = try f.m.quotedOrPlainName(&vc);
+        for (f.locals.items) |l| if (std.mem.eql(u8, l.name, name)) return l.value;
+        return null;
     }
 
     fn resolvePhis(f: *FunctionState) Error!void {
@@ -1864,13 +2024,44 @@ const FunctionState = struct {
             defer vals.deinit(gpa);
             var blocks: std.ArrayList(BlockIndex) = .empty;
             defer blocks.deinit(gpa);
+            var mismatch = false;
             for (p.incoming) |inc| {
                 var vc = Cursor{ .s = inc[0], .line = p.line_no };
                 const v = try f.operandOfType(&vc, p.ty);
-                if (v.typeOfWip(&f.wip) != p.ty) return fail(p.line_no, p.line, "phi incoming value does not match the phi type", error.Syntax);
+                if (v.typeOfWip(&f.wip) != p.ty) mismatch = true;
                 try vals.append(gpa, v);
                 var bc = Cursor{ .s = p.line, .line = p.line_no };
                 try blocks.append(gpa, try f.block(inc[1], &bc));
+            }
+            if (mismatch) {
+                // A pointer phi that kept its textual type because nothing
+                // resolved when it was created: if its named incomings now
+                // agree on another pointer type, settle it and lower the
+                // function again (lowerDefine).
+                if (p.ty.isPointer(f.m.b)) {
+                    if (!p.inferred) {
+                        if (try f.settledPointerType(p)) |real| {
+                            if (real != p.ty) {
+                                try f.phi_hints.put(gpa, p.name, real);
+                                // The phi this one derives from must share it.
+                                if (f.derived.get(p.phi.toValue())) |root| try f.phi_hints.put(gpa, f.phis.items[root].name, real);
+                                return error.RetryPhiTypes;
+                            }
+                        }
+                    } else {
+                        // A settled phi whose mismatching incoming is, or
+                        // derives from, a phi still carrying its textual
+                        // type: that phi must have this one's type.
+                        for (vals.items) |v| {
+                            if (v.typeOfWip(&f.wip) == p.ty) continue;
+                            if (f.unsettledRoot(v)) |root| {
+                                try f.phi_hints.put(gpa, f.phis.items[root].name, p.ty);
+                                return error.RetryPhiTypes;
+                            }
+                        }
+                    }
+                }
+                return fail(p.line_no, p.line, "phi incoming value does not match the phi type", error.Syntax);
             }
             p.phi.finish(vals.items, blocks.items, &f.wip);
         }
@@ -3783,6 +3974,477 @@ test "D1 mutable module-level globals in address space 0 are refused with a hint
     try std.testing.expect(!has(text, "@acc"));
     try std.testing.expect(has(text, "addrspace(1) global float"));
     try std.testing.expect(has(text, "addrspace(3) global [64 x float] undef"));
+}
+
+test "D1 loop-carried pointer phi with a null start settles on the relocated space" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const gpa = arena.allocator();
+    // LLVM's layout for `var p: ?*const f32 = null; for (...) p = &tab[i];`:
+    // the header (and its phi) comes first, the only non-null incoming is a
+    // GEP of the relocated table defined later in the loop body. Nothing
+    // resolves when the phi is created, so it keeps `ptr`; resolvePhis then
+    // sees the GEP's `ptr addrspace(2)` and the function is lowered again.
+    const text = try testRoundTrip(gpa, test_header ++
+        \\@a = private unnamed_addr constant [4 x float] [float 1.000000e+00, float 2.000000e+00, float 3.000000e+00, float 4.000000e+00], align 4
+        \\define float @fragmentShader(i32 %__0) {
+        \\  br label %loop
+        \\loop:
+        \\  %p = phi ptr [ null, %__1 ], [ %next, %loop ]
+        \\  %i = phi i32 [ 0, %__1 ], [ %i.next, %loop ]
+        \\  %i.next = add i32 %i, 1
+        \\  %__7 = zext i32 %i to i64
+        \\  %next = getelementptr inbounds [4 x i8], ptr @a, i64 %__7
+        \\  %done = icmp eq i32 %i.next, 4
+        \\  br i1 %done, label %exit, label %loop
+        \\exit:
+        \\  %sel = select i1 %done, ptr %next, ptr %p
+        \\  %v = load float, ptr %sel, align 4
+        \\  ret float %v
+        \\}
+        \\
+    );
+    try std.testing.expect(has(text, "phi ptr addrspace(2) [ null, %"));
+    try std.testing.expect(has(text, "load float, ptr addrspace(2) %"));
+    // Lowered exactly once in the output despite the retry.
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, text, "phi ptr addrspace(2)"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, text, "define float @fragmentShader"));
+
+    // The same shape over an alloca stays in address space 0: no retry, no
+    // false relocation.
+    const text2 = try testRoundTrip(gpa, test_header ++
+        \\define float @fragmentShader(i32 %__0) {
+        \\  %buf = alloca [4 x float], align 16
+        \\  br label %loop
+        \\loop:
+        \\  %p = phi ptr [ null, %__1 ], [ %next, %loop ]
+        \\  %i = phi i32 [ 0, %__1 ], [ %i.next, %loop ]
+        \\  %i.next = add i32 %i, 1
+        \\  %__7 = zext i32 %i to i64
+        \\  %next = getelementptr inbounds [4 x i8], ptr %buf, i64 %__7
+        \\  store float 1.000000e+00, ptr %next, align 4
+        \\  %done = icmp eq i32 %i.next, 4
+        \\  br i1 %done, label %exit, label %loop
+        \\exit:
+        \\  %sel = select i1 %done, ptr %next, ptr %p
+        \\  %v = load float, ptr %sel, align 4
+        \\  ret float %v
+        \\}
+        \\
+    );
+    try std.testing.expect(has(text2, "phi ptr [ null, %"));
+    try std.testing.expect(!has(text2, "addrspace(2)"));
+}
+
+test "D1 select between a relocated pointer and null takes the constant space, either order" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const gpa = arena.allocator();
+    // `const q = if (c) &tab[i] else null;` as LLVM spells it, both orders.
+    const text = try testRoundTrip(gpa, test_header ++
+        \\@a = private unnamed_addr constant [4 x float] [float 1.000000e+00, float 2.000000e+00, float 3.000000e+00, float 4.000000e+00], align 4
+        \\define float @fragmentShader(i32 %__0, i1 %__1) {
+        \\  %__3 = zext i32 %__0 to i64
+        \\  %g = getelementptr inbounds [4 x i8], ptr @a, i64 %__3
+        \\  %s1 = select i1 %__1, ptr %g, ptr null
+        \\  %s2 = select i1 %__1, ptr null, ptr %g
+        \\  %isnull = icmp eq ptr %s1, null
+        \\  %s3 = select i1 %isnull, ptr %s2, ptr %g
+        \\  %v = load float, ptr %s3, align 4
+        \\  ret float %v
+        \\}
+        \\
+    );
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, text, "ptr addrspace(2) null"));
+    try std.testing.expect(has(text, "load float, ptr addrspace(2) %"));
+    try std.testing.expect(!has(text, "select i1 %") or !has(text, ", ptr null"));
+}
+
+// Helpers for the D1 retry tests below.
+const probe_tab =
+    \\@a = private unnamed_addr constant [4 x float] [float 1.000000e+00, float 2.000000e+00, float 3.000000e+00, float 4.000000e+00], align 4
+    \\
+;
+
+const tab_a_qd = "@a = private unnamed_addr constant [4 x float] [float 1.000000e+00, float 2.000000e+00, float 3.000000e+00, float 4.000000e+00], align 4\n";
+
+const refute_tab =
+    \\@a = private unnamed_addr constant [8 x float] [float 1.0, float 2.0, float 3.0, float 4.0, float 5.0, float 6.0, float 7.0, float 8.0], align 4
+    \\
+;
+
+const refute_r1_module = test_header ++
+    \\@a = private unnamed_addr constant [8 x float] [float 1.0, float 2.0, float 3.0, float 4.0, float 5.0, float 6.0, float 7.0, float 8.0], align 4
+    \\define float @fragmentShader(i32 %__0, i1 %__1) {
+    \\  %idx = zext i32 %__0 to i64
+    \\  %gb = getelementptr inbounds [4 x i8], ptr @a, i64 %idx
+    \\  br label %L1
+    \\L1:
+    \\  %h1 = phi ptr [ null, %__2 ], [ %g, %L3 ]
+    \\  %e = getelementptr inbounds i8, ptr %h1, i64 4
+    \\  br label %L2
+    \\L2:
+    \\  %q = phi ptr [ null, %L1 ], [ %g, %L3 ]
+    \\  %s2 = select i1 %__1, ptr %q, ptr %e
+    \\  br label %L3
+    \\L3:
+    \\  %h0 = phi ptr [ null, %L2 ], [ %g, %L3 ]
+    \\  %c0 = icmp eq ptr %h0, %gb
+    \\  %s1 = select i1 %c0, ptr %h1, ptr %h0
+    \\  %g = getelementptr inbounds [4 x i8], ptr @a, i64 %idx
+    \\  switch i32 %__0, label %exit [
+    \\    i32 0, label %L1
+    \\    i32 1, label %L2
+    \\    i32 2, label %L3
+    \\  ]
+    \\exit:
+    \\  %v = load float, ptr %s1, align 4
+    \\  ret float %v
+    \\}
+    \\
+;
+
+fn probe(label: []const u8, module: []const u8) void {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const gpa = arena.allocator();
+    std.debug.print("\n===== PROBE {s} =====\n", .{label});
+    const text = testRoundTrip(gpa, module) catch |err| {
+        std.debug.print("PROBE {s}: REFUSED {s}\n", .{ label, @errorName(err) });
+        return;
+    };
+    std.debug.print("PROBE {s}: OK\n{s}\n", .{ label, text });
+}
+
+fn probeModuleQD(label: []const u8, module: []const u8) void {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const gpa = arena.allocator();
+    std.debug.print("\n===== PROBE {s} =====\n", .{label});
+    const text = testRoundTrip(gpa, module) catch |err| {
+        std.debug.print("PROBE {s}: REFUSED {t}\n", .{ label, err });
+        return;
+    };
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    while (lines.next()) |l| {
+        if (std.mem.indexOf(u8, l, "phi ptr") != null or std.mem.indexOf(u8, l, "select i1") != null or std.mem.indexOf(u8, l, "icmp eq ptr") != null or std.mem.indexOf(u8, l, "getelementptr") != null and std.mem.indexOf(u8, l, "=") != null)
+            std.debug.print("  {s}\n", .{l});
+    }
+    std.debug.print("PROBE {s}: OK\n", .{label});
+}
+
+test "D1 retry: LLVM's pointer-bump idiom, a gep of the phi selected against the table" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const gpa = arena.allocator();
+    const text = try testRoundTrip(gpa, test_header ++
+        \\@bump.tab = private unnamed_addr constant [16 x i32] [i32 11, i32 22, i32 33, i32 44, i32 55, i32 66, i32 77, i32 88, i32 99, i32 110, i32 121, i32 132, i32 143, i32 154, i32 165, i32 176], align 4
+        \\define float @fragmentShader(i32 %__0, i32 %__1) {
+        \\  %13 = and i32 %__1, 7
+        \\  br label %14
+        \\14:
+        \\  %.09.i = phi ptr [ null, %__2 ], [ %spec.select.i, %14 ]
+        \\  %.048.i = phi i32 [ 0, %__2 ], [ %18, %14 ]
+        \\  %.not6.i = icmp eq ptr %.09.i, null
+        \\  %15 = shl nuw i32 1, %.048.i
+        \\  %16 = and i32 %15, %__0
+        \\  %.not7.i = icmp eq i32 %16, 0
+        \\  %.idx.i = select i1 %.not7.i, i64 0, i64 4
+        \\  %17 = getelementptr inbounds nuw i8, ptr %.09.i, i64 %.idx.i
+        \\  %spec.select.i = select i1 %.not6.i, ptr @bump.tab, ptr %17
+        \\  %18 = add nuw nsw i32 %.048.i, 1
+        \\  %exitcond.not.i = icmp eq i32 %.048.i, %13
+        \\  br i1 %exitcond.not.i, label %bump.body.exit, label %14
+        \\bump.body.exit:
+        \\  %.not5.i = icmp eq ptr %spec.select.i, null
+        \\  %.sroa.speculated.i = select i1 %.not5.i, ptr @bump.tab, ptr %spec.select.i
+        \\  %20 = load i32, ptr %.sroa.speculated.i, align 4
+        \\  %21 = add i32 %20, %__0
+        \\  %f = sitofp i32 %21 to float
+        \\  ret float %f
+        \\}
+        \\
+    );
+    try std.testing.expect(has(text, "phi ptr addrspace(2) [ null, %"));
+    try std.testing.expect(has(text, "load i32, ptr addrspace(2) %"));
+}
+
+test "D1 retry: select of the table and a gep of a null-started loop-carried phi" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const gpa = arena.allocator();
+    const text = try testRoundTrip(gpa, test_header ++ refute_tab ++
+        \\define float @fragmentShader(i32 %__0) {
+        \\  br label %loop
+        \\loop:
+        \\  %p = phi ptr [ null, %__1 ], [ %p.next, %loop ]
+        \\  %i = phi i32 [ 0, %__1 ], [ %i.next, %loop ]
+        \\  %isnull = icmp eq ptr %p, null
+        \\  %inc = getelementptr inbounds i8, ptr %p, i64 4
+        \\  %p.next = select i1 %isnull, ptr @a, ptr %inc
+        \\  %i.next = add i32 %i, 1
+        \\  %done = icmp eq i32 %i.next, %__0
+        \\  br i1 %done, label %exit, label %loop
+        \\exit:
+        \\  %v = load float, ptr %p.next, align 4
+        \\  ret float %v
+        \\}
+        \\
+    );
+    try std.testing.expect(has(text, "phi ptr addrspace(2) [ null, %"));
+    try std.testing.expect(has(text, "load float, ptr addrspace(2) %"));
+}
+
+test "D1 retry: icmp of a gep of the phi against the table" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const gpa = arena.allocator();
+    const text = try testRoundTrip(gpa, test_header ++ refute_tab ++
+        \\define float @fragmentShader(i32 %__0) {
+        \\  br label %loop
+        \\loop:
+        \\  %p = phi ptr [ null, %__1 ], [ %next, %loop ]
+        \\  %i = phi i32 [ 0, %__1 ], [ %i.next, %loop ]
+        \\  %inc = getelementptr inbounds i8, ptr %p, i64 4
+        \\  %hit = icmp eq ptr %inc, @a
+        \\  %__7 = zext i32 %i to i64
+        \\  %next = getelementptr inbounds [4 x i8], ptr @a, i64 %__7
+        \\  %i.next = add i32 %i, 1
+        \\  %cnt = icmp eq i32 %i.next, 4
+        \\  %done = or i1 %hit, %cnt
+        \\  br i1 %done, label %exit, label %loop
+        \\exit:
+        \\  %v = load float, ptr %next, align 4
+        \\  ret float %v
+        \\}
+        \\
+    );
+    try std.testing.expect(has(text, "phi ptr addrspace(2) [ null, %"));
+    try std.testing.expect(has(text, "icmp eq ptr addrspace(2) %"));
+}
+
+test "D1 retry: phi-of-phi conditional pointer update in reverse postorder" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const gpa = arena.allocator();
+    const text = try testRoundTrip(gpa, test_header ++ refute_tab ++
+        \\define float @fragmentShader(i32 %__0, i1 %__1) {
+        \\  %idx = zext i32 %__0 to i64
+        \\  br label %header
+        \\header:
+        \\  %p = phi ptr [ null, %__2 ], [ %q, %latch ]
+        \\  %i = phi i32 [ 0, %__2 ], [ %i.next, %latch ]
+        \\  %i.next = add i32 %i, 1
+        \\  %c = icmp ult i32 %i, %__0
+        \\  br i1 %c, label %body, label %exit
+        \\body:
+        \\  br i1 %__1, label %upd, label %latch
+        \\upd:
+        \\  %g = getelementptr inbounds [4 x i8], ptr @a, i64 %idx
+        \\  br label %latch
+        \\latch:
+        \\  %q = phi ptr [ %p, %body ], [ %g, %upd ]
+        \\  br label %header
+        \\exit:
+        \\  %isnull = icmp eq ptr %p, null
+        \\  br i1 %isnull, label %ret0, label %deref
+        \\ret0:
+        \\  ret float 0.0
+        \\deref:
+        \\  %v = load float, ptr %p, align 4
+        \\  ret float %v
+        \\}
+        \\
+    );
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, text, "phi ptr addrspace(2)"));
+    try std.testing.expect(has(text, "load float, ptr addrspace(2) %"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, text, "define float @fragmentShader"));
+}
+
+test "D1 retry: a phi mixing an alloca and a relocated table is still refused" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const gpa = arena.allocator();
+    try std.testing.expectError(error.Syntax, testRoundTrip(gpa, test_header ++ refute_tab ++
+        \\define float @fragmentShader(i32 %__0, i1 %__1) {
+        \\  %buf = alloca [4 x float], align 16
+        \\  %idx = zext i32 %__0 to i64
+        \\  br label %loop
+        \\loop:
+        \\  %p = phi ptr [ null, %__2 ], [ %next, %loop ]
+        \\  %i = phi i32 [ 0, %__2 ], [ %i.next, %loop ]
+        \\  %next = getelementptr inbounds [4 x i8], ptr %buf, i64 %idx
+        \\  %g = getelementptr inbounds [4 x i8], ptr @a, i64 %idx
+        \\  %s = select i1 %__1, ptr %p, ptr %g
+        \\  %i.next = add i32 %i, 1
+        \\  %done = icmp eq i32 %i.next, 4
+        \\  br i1 %done, label %exit, label %loop
+        \\exit:
+        \\  %v = load float, ptr %s, align 4
+        \\  ret float %v
+        \\}
+        \\
+    ));
+    try std.testing.expectError(error.Syntax, testRoundTrip(gpa, test_header ++ refute_tab ++
+        \\define float @fragmentShader(ptr %__0, i32 %__1, i1 %__2) {
+        \\  %idx = zext i32 %__1 to i64
+        \\  br label %loop
+        \\loop:
+        \\  %p = phi ptr [ %__0, %__3 ], [ %next, %loop ]
+        \\  %i = phi i32 [ 0, %__3 ], [ %i.next, %loop ]
+        \\  %next = getelementptr inbounds i8, ptr %p, i64 4
+        \\  %g = getelementptr inbounds [4 x i8], ptr @a, i64 %idx
+        \\  %s = select i1 %__2, ptr %next, ptr %g
+        \\  %i.next = add i32 %i, 1
+        \\  %done = icmp eq i32 %i.next, 4
+        \\  br i1 %done, label %exit, label %loop
+        \\exit:
+        \\  %v = load float, ptr %s, align 4
+        \\  ret float %v
+        \\}
+        \\
+    ));
+    try std.testing.expectError(error.Syntax, testRoundTrip(gpa, test_header ++ refute_tab ++
+        \\define float @fragmentShader(i32 %__0, i1 %__1) {
+        \\  %buf = alloca [4 x float], align 16
+        \\  %idx = zext i32 %__0 to i64
+        \\  br label %loop
+        \\loop:
+        \\  %p = phi ptr [ null, %__2 ], [ %g, %loop ]
+        \\  %q = phi ptr [ null, %__2 ], [ %n, %loop ]
+        \\  %i = phi i32 [ 0, %__2 ], [ %i.next, %loop ]
+        \\  %e = getelementptr inbounds i8, ptr %p, i64 4
+        \\  %s = select i1 %__1, ptr %q, ptr %e
+        \\  %g = getelementptr inbounds [4 x i8], ptr @a, i64 %idx
+        \\  %n = getelementptr inbounds [4 x i8], ptr %buf, i64 %idx
+        \\  %i.next = add i32 %i, 1
+        \\  %done = icmp eq i32 %i.next, 4
+        \\  br i1 %done, label %exit, label %loop
+        \\exit:
+        \\  %v = load float, ptr %s, align 4
+        \\  ret float %v
+        \\}
+        \\
+    ));
+}
+
+test "D1 retry: three loop-carried pointer phis settled in late, early, middle order" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const gpa = arena.allocator();
+    const text = testRoundTrip(gpa, refute_r1_module) catch |err| {
+        std.debug.print("\nREFUTE R1: REFUSED with {t}\n", .{err});
+        return err;
+    };
+    try std.testing.expectEqual(@as(usize, 3), std.mem.count(u8, text, "phi ptr addrspace(2)"));
+    try std.testing.expect(has(text, "load float, ptr addrspace(2) %"));
+    try std.testing.expect(!has(text, "select i1 %__1, ptr %"));
+}
+
+test "D1 retry: a settled outer phi fed by an lcssa phi of an unsettled inner phi" {
+    probe("J2", test_header ++ probe_tab ++
+        \\define float @fragmentShader(i32 %__0, i1 %__1) {
+        \\  %g0 = getelementptr inbounds [4 x i8], ptr @a, i64 0
+        \\  br label %outer
+        \\outer:
+        \\  %o = phi ptr [ %g0, %__2 ], [ %lcssa, %inner.exit ]
+        \\  %k = phi i32 [ 0, %__2 ], [ %k.next, %inner.exit ]
+        \\  %k.next = add i32 %k, 1
+        \\  br label %inner
+        \\inner:
+        \\  %q = phi ptr [ null, %outer ], [ %next, %inner ]
+        \\  %i = phi i32 [ 0, %outer ], [ %i.next, %inner ]
+        \\  %i.next = add i32 %i, 1
+        \\  %__9 = zext i32 %i to i64
+        \\  %next = getelementptr inbounds [4 x i8], ptr @a, i64 %__9
+        \\  %done = icmp eq i32 %i.next, 4
+        \\  br i1 %done, label %inner.exit, label %inner
+        \\inner.exit:
+        \\  %lcssa = phi ptr [ %q, %inner ]
+        \\  %odone = icmp eq i32 %k.next, 2
+        \\  br i1 %odone, label %exit, label %outer
+        \\exit:
+        \\  %v = load float, ptr %o, align 4
+        \\  ret float %v
+        \\}
+        \\
+    );
+}
+
+test "D1 retry: the mirror path over a genuine alloca and table mix stays refused" {
+    probe("J5", test_header ++ probe_tab ++
+        \\define float @fragmentShader(i32 %__0, i1 %__1) {
+        \\  %buf = alloca [4 x float], align 16
+        \\  %g0 = getelementptr inbounds [4 x i8], ptr @a, i64 0
+        \\  br label %outer
+        \\outer:
+        \\  %o = phi ptr [ %g0, %__2 ], [ %lcssa, %inner.exit ]
+        \\  %k = phi i32 [ 0, %__2 ], [ %k.next, %inner.exit ]
+        \\  %k.next = add i32 %k, 1
+        \\  br label %inner
+        \\inner:
+        \\  %q = phi ptr [ %buf, %outer ], [ %next, %inner ]
+        \\  %i = phi i32 [ 0, %outer ], [ %i.next, %inner ]
+        \\  %i.next = add i32 %i, 1
+        \\  %__9 = zext i32 %i to i64
+        \\  %next = getelementptr inbounds [4 x i8], ptr @a, i64 %__9
+        \\  %done = icmp eq i32 %i.next, 4
+        \\  br i1 %done, label %inner.exit, label %inner
+        \\inner.exit:
+        \\  %lcssa = phi ptr [ %q, %inner ]
+        \\  %odone = icmp eq i32 %k.next, 2
+        \\  br i1 %odone, label %exit, label %outer
+        \\exit:
+        \\  %v = load float, ptr %o, align 4
+        \\  ret float %v
+        \\}
+        \\
+    );
+}
+
+test "D1 retry: a two-level gep chain from the phi selected against the table" {
+    probeModuleQD("M2B", test_header ++ tab_a_qd ++
+        \\define float @fragmentShader(i32 %__0, i1 %__1) {
+        \\  br label %loop
+        \\loop:
+        \\  %p = phi ptr [ null, %__2 ], [ %r, %loop ]
+        \\  %i = phi i32 [ 0, %__2 ], [ %i.next, %loop ]
+        \\  %i.next = add i32 %i, 1
+        \\  %__7 = zext i32 %i to i64
+        \\  %next = getelementptr inbounds [4 x i8], ptr @a, i64 %__7
+        \\  %q = getelementptr i8, ptr %p, i64 4
+        \\  %q2 = getelementptr i8, ptr %q, i64 4
+        \\  %r = select i1 %__1, ptr %q2, ptr %next
+        \\  %done = icmp eq i32 %i.next, 4
+        \\  br i1 %done, label %exit, label %loop
+        \\exit:
+        \\  %v = load float, ptr %r, align 4
+        \\  ret float %v
+        \\}
+        \\
+    );
+}
+
+test "D1 retry: a select derived from the phi selected against the table" {
+    probeModuleQD("M3", test_header ++ tab_a_qd ++
+        \\define float @fragmentShader(i32 %__0, i1 %__1) {
+        \\  br label %loop
+        \\loop:
+        \\  %p = phi ptr [ null, %__2 ], [ %r, %loop ]
+        \\  %i = phi i32 [ 0, %__2 ], [ %i.next, %loop ]
+        \\  %i.next = add i32 %i, 1
+        \\  %__7 = zext i32 %i to i64
+        \\  %next = getelementptr inbounds [4 x i8], ptr @a, i64 %__7
+        \\  %q = select i1 %__1, ptr %p, ptr null
+        \\  %r = select i1 %__1, ptr %q, ptr %next
+        \\  %done = icmp eq i32 %i.next, 4
+        \\  br i1 %done, label %exit, label %loop
+        \\exit:
+        \\  %v = load float, ptr %r, align 4
+        \\  ret float %v
+        \\}
+        \\
+    );
 }
 
 test "D1 phi over getelementptr constant expressions into relocated tables" {

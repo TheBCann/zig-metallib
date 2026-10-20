@@ -594,7 +594,9 @@ fn blockLabel(line: []const u8) ?[]const u8 {
 /// entry: a definition dominates its non-phi uses, and a dominator precedes
 /// everything it dominates in that order, so every operand is defined before
 /// it is read. Phi incoming values name their predecessor by label and are
-/// resolved by the assembler at the end, so block order does not affect them.
+/// resolved by the assembler at the end; a pointer phi's address space is
+/// settled by the assembler's retry (`lowerDefine`), so block order does not
+/// affect them either.
 /// The entry block (the lines before the first label, usually unlabelled)
 /// stays first; blocks unreachable from it keep their order at the end.
 fn reorderBlocks(gpa: Allocator, body: []const []const u8) Error![]const []const u8 {
@@ -1640,6 +1642,46 @@ test "D4 block order: labels and values containing '-' are whole identifiers" {
     ;
     const out = try convertWith(gpa, input, .{ .require_all_entries = false });
     try std.testing.expect(find(out, "\nbody.unr-lcssa:").? < find(out, "\nexit:").?);
+    inline for (metadata.function_metadata) |fm| {
+        if (comptime std.mem.eql(u8, fm.name, "countKernel")) {
+            const bc = try assembler.assemble(gpa, out, .{ .entry = fm.name, .fm = fm }, target.default);
+            try std.testing.expectEqualStrings("BC\xC0\xDE", bc[0..4]);
+        }
+    }
+}
+
+test "D4 block order: a loop-carried pointer phi over a relocated table assembles after reordering" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const gpa = arena.allocator();
+    // Latch first, header second: before the reordering pass the GEP in the
+    // latch was textually earlier and typed the phi; after it the header
+    // comes first and the assembler's retry must settle the type instead.
+    const input =
+        \\@tab = private unnamed_addr constant [4 x i32] [i32 1, i32 2, i32 3, i32 4], align 4
+        \\
+        \\define ptx_kernel void @countKernel(ptr addrspace(1) %0, ptr addrspace(1) %1, i32 %2) {
+        \\  br label %header
+        \\latch:
+        \\  %idx = zext i32 %i to i64
+        \\  %p = getelementptr inbounds [4 x i8], ptr @tab, i64 %idx
+        \\  %i.next = add nuw nsw i32 %i, 1
+        \\  br label %header
+        \\header:
+        \\  %q = phi ptr [ null, %3 ], [ %p, %latch ]
+        \\  %i = phi i32 [ 0, %3 ], [ %i.next, %latch ]
+        \\  %done = icmp eq i32 %i, %2
+        \\  br i1 %done, label %exit, label %latch
+        \\exit:
+        \\  %sel = select i1 %done, ptr %q, ptr null
+        \\  %v = load i32, ptr %sel, align 4
+        \\  store i32 %v, ptr addrspace(1) %0, align 4
+        \\  ret void
+        \\}
+        \\
+    ;
+    const out = try convertWith(gpa, input, .{ .require_all_entries = false });
+    try std.testing.expect(find(out, "\nheader:").? < find(out, "\nlatch:").?);
     inline for (metadata.function_metadata) |fm| {
         if (comptime std.mem.eql(u8, fm.name, "countKernel")) {
             const bc = try assembler.assemble(gpa, out, .{ .entry = fm.name, .fm = fm }, target.default);
