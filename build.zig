@@ -158,6 +158,8 @@ pub fn build(b: *std.Build) void {
     // same pipeline instead of a generated one. It must define `pub const
     // seed: u64` and `pub fn body(a: i32, b: i32) i32`.
     const crosscheck_body_file = b.option([]const u8, "crosscheck-body", "Use this body file instead of generating one from -Dseed");
+    // Re-test the recorded findings, or give the reducer something to shrink.
+    const crosscheck_known = b.option(bool, "crosscheck-known", "Generator also emits the operations recorded as findings (docs/crosscheck.md)") orelse false;
 
     const crosscheck_gen = b.addExecutable(.{
         .name = "crosscheck-gen",
@@ -170,6 +172,7 @@ pub fn build(b: *std.Build) void {
     const crosscheck_body_src: std.Build.LazyPath = if (crosscheck_body_file) |path| .{ .cwd_relative = path } else blk: {
         const run_crosscheck_gen = b.addRunArtifact(crosscheck_gen);
         run_crosscheck_gen.addArg(b.fmt("--seed={d}", .{crosscheck_seed}));
+        if (crosscheck_known) run_crosscheck_gen.addArg("--include-known-findings");
         break :blk run_crosscheck_gen.addOutputFileArg2("crosscheck_body.zig", .{});
     };
 
@@ -235,8 +238,9 @@ pub fn build(b: *std.Build) void {
     // command that reproduces a failure: the inputs come from -Dseed even when
     // the body is hand-written, and the Apple step below must name itself.
     const crosscheck_body_opt: []const u8 = if (crosscheck_body_file) |path| b.fmt(" -Dcrosscheck-body={s}", .{path}) else "";
+    const crosscheck_known_opt: []const u8 = if (crosscheck_known) " -Dcrosscheck-known=true" else "";
     if (crosscheck_body_file) |path| run_crosscheck.addArg(b.fmt("--body={s}", .{path}));
-    run_crosscheck.addArg(b.fmt("--reproduce=zig build crosscheck -Dseed={d}{s}", .{ crosscheck_seed, crosscheck_body_opt }));
+    run_crosscheck.addArg(b.fmt("--reproduce=zig build crosscheck -Dseed={d}{s}{s}", .{ crosscheck_seed, crosscheck_known_opt, crosscheck_body_opt }));
     run_crosscheck.addFileArg(crosscheck_metallib);
     b.step("crosscheck", "Differential test: one generated kernel on the GPU vs the CPU (-Dseed=N)").dependOn(&run_crosscheck.step);
 
@@ -256,7 +260,34 @@ pub fn build(b: *std.Build) void {
     const run_crosscheck_apple = b.addRunArtifact(crosscheck_driver);
     run_crosscheck_apple.addArg(b.fmt("--seed={d}", .{crosscheck_seed}));
     if (crosscheck_body_file) |path| run_crosscheck_apple.addArg(b.fmt("--body={s}", .{path}));
-    run_crosscheck_apple.addArg(b.fmt("--reproduce=zig build crosscheck-apple -Dseed={d}{s}", .{ crosscheck_seed, crosscheck_body_opt }));
+    run_crosscheck_apple.addArg(b.fmt("--reproduce=zig build crosscheck-apple -Dseed={d}{s}{s}", .{ crosscheck_seed, crosscheck_known_opt, crosscheck_body_opt }));
     run_crosscheck_apple.addFileArg(crosscheck_apple_metallib);
     b.step("crosscheck-apple", "The crosscheck kernel with the library built by Apple's assembler from our IR (attribution)").dependOn(&run_crosscheck_apple.step);
+
+    // Reduction: `zig build reduce -Dseed=N` shrinks a failing seed's program to
+    // a minimal one that fails the same way, judging each candidate with
+    // `zig build crosscheck -Dcrosscheck-body=...` (tools/crosscheck/reduce.zig).
+    const crosscheck_reduce = b.addExecutable(.{
+        .name = "crosscheck-reduce",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/crosscheck/reduce.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const run_reduce = b.addRunArtifact(crosscheck_reduce);
+    run_reduce.addArg(b.fmt("--seed={d}", .{crosscheck_seed}));
+    if (crosscheck_known) run_reduce.addArg("--include-known-findings");
+    run_reduce.addPrefixedDirectoryArg("--repo=", b.path("."));
+    run_reduce.addArg(b.fmt("--zig={s}", .{b.graph.zig_exe}));
+    run_reduce.addArg("--out=zig-out/crosscheck/reduce");
+    run_reduce.has_side_effects = true;
+    b.step("reduce", "Shrink the failing crosscheck seed -Dseed=N to a minimal program (zig-out/crosscheck/reduce/<seed>/)").dependOn(&run_reduce.step);
+    // The reducer's own tests (classification, the engine) run with `zig build test`.
+    const reduce_tests = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("tools/crosscheck/reduce.zig"),
+        .target = target,
+        .optimize = optimize,
+    }) });
+    test_step.dependOn(&b.addRunArtifact(reduce_tests).step);
 }

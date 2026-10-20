@@ -38,6 +38,7 @@ zig build check -- zig-out/bin/default.metallib         # load into Metal, run e
 xcrun metal-objdump -d zig-out/bin/default.metallib     # read our container back
 zig build crosscheck -Dseed=7                          # random kernel: GPU vs CPU
 tools/crosscheck/sweep.sh 1 200                        # many seeds, each outcome sorted
+zig build reduce -Dseed=8                              # shrink a failing seed to a minimal program
 ```
 
 Requires the Zig nightly **0.18.0-dev.253+16d31ceed** (pinned in `build.zig.zon`,
@@ -158,7 +159,7 @@ tools/air/metadata.zig      manifest → !air.* metadata (text and bitcode)
 tools/air/metallib.zig      MTLB container writer
 tools/air/target.zig        deployment-target profiles: triple, versions, header stamps
 tools/metallib_check.zig    loads a library into Metal and runs every entry point
-tools/crosscheck/           differential test bench: generator, GPU/CPU driver, sweep
+tools/crosscheck/           differential test bench: program model, generator, reducer, GPU/CPU driver, sweep
 src/engine/crosscheck_harness.zig  fixed GPU kernel wrapper for the bench
 docs/pipeline.md            how the pipeline works, and how to add a shader
 docs/air-format.md          the container, bitcode dialect and metadata reference

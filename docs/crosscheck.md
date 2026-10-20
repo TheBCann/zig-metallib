@@ -49,6 +49,43 @@ or container. It needs the Metal toolchain (`xcrun metal --version`), and it re-
 on every run rather than from the build cache, so the verdict always reflects the
 installed toolchain.
 
+## Reducing a failure
+
+```sh
+zig build reduce -Dseed=8                        # shrink seed 8's program
+zig build reduce -Dseed=8 -Dcrosscheck-known=true   # the same with the known findings enabled
+```
+
+`crosscheck-reduce` (`tools/crosscheck/reduce.zig`) shrinks a failing seed's program to a
+minimal one that fails the same way. The generator builds a syntax tree before printing
+(`tools/crosscheck/program.zig`, shared by both tools), so the reduction is structural:
+delete statements and whole blocks, hoist the body of an `if`, `for` or `switch` into its
+parent, shorten loops, drop `else` branches and second comparisons, replace expressions
+by their children or by a leaf, and delete locals nothing references. Each candidate is
+judged by the real pipeline, `zig build crosscheck -Dcrosscheck-body=<candidate>`,
+classified as `sweep.sh` does, and kept only when the result is the same bucket with the
+same message (numbers blanked, so a line number does not make two instances of one failure
+look different; for a mismatch, any mismatch counts). Candidates stay valid Zig by
+construction: the printer declares a local `const` when it is never assigned and
+discards it when it is never read, loop control hoisted out of its loop is dropped, and a
+candidate that is invalid anyway lands in another bucket and is not kept. Every pass
+strictly shrinks the program, so the reduction terminates. Measured on seed 8 with the
+known findings enabled: 23 statements and 181 expression nodes down to 4 and 17, in 127
+pipeline runs and about seven minutes on the M3, leaving a program whose mismatch is
+visibly the `@subWithOverflow` bit.
+
+The result goes to `zig-out/crosscheck/reduce/<seed>/`: `original.zig`, `reduced.zig`
+(its header records the failure and the sizes before and after) and `candidate.zig`, the
+last candidate tried. The candidates are built in a cache directory of their own under
+that folder, deleted when the reduction ends: every candidate is a new body, and hundreds
+of kernel, library and driver builds would otherwise fill the project's cache and the disk.
+The reduced file runs like any other body:
+`zig build crosscheck -Dcrosscheck-body=zig-out/crosscheck/reduce/<seed>/reduced.zig`.
+
+`-Dcrosscheck-known=true` makes the generator emit the operations recorded under
+"Findings" again. It exists to re-test them on a newer macOS, and to give the reducer
+something to shrink: with it, seed 8 mismatches.
+
 ## How it works
 
 1. `tools/crosscheck/gen.zig` turns a seed into `crosscheck_body.zig`, whose
