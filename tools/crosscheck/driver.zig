@@ -9,9 +9,10 @@
 //! usage. The seed is reported so a finding can be reproduced with
 //! `zig build crosscheck -Dseed=<N>`.
 //!
-//! Usage: crosscheck-driver --seed=<u64> [--body=<file>] <crosscheck.metallib>
+//! Usage: crosscheck-driver --seed=<u64> [--body=<file>] [--reproduce=<command>] <crosscheck.metallib>
 
 const std = @import("std");
+const builtin = @import("builtin");
 const objc = @import("objc");
 const crosscheck_body = @import("crosscheck_body");
 
@@ -86,6 +87,8 @@ pub fn main(init: std.process.Init) !void {
     // Set when build.zig ran a hand-written body (-Dcrosscheck-body), so the
     // messages name that file instead of a seed.
     var body_file: ?[]const u8 = null;
+    // The exact command that reproduces this run, composed by build.zig.
+    var reproduce: ?[]const u8 = null;
     for (args[1..]) |arg| {
         if (std.mem.startsWith(u8, arg, "--seed=")) {
             seed = std.fmt.parseInt(u64, arg["--seed=".len..], 10) catch {
@@ -94,6 +97,8 @@ pub fn main(init: std.process.Init) !void {
             };
         } else if (std.mem.startsWith(u8, arg, "--body=")) {
             body_file = arg["--body=".len..];
+        } else if (std.mem.startsWith(u8, arg, "--reproduce=")) {
+            reproduce = arg["--reproduce=".len..];
         } else if (std.mem.startsWith(u8, arg, "-")) {
             std.debug.print("crosscheck-driver: unknown option '{s}'\n", .{arg});
             std.process.exit(2);
@@ -105,14 +110,16 @@ pub fn main(init: std.process.Init) !void {
         }
     }
     const s = seed orelse {
-        std.debug.print("usage: crosscheck-driver --seed=<u64> [--body=<file>] <crosscheck.metallib>\n", .{});
+        std.debug.print("usage: crosscheck-driver --seed=<u64> [--body=<file>] [--reproduce=<command>] <crosscheck.metallib>\n", .{});
         std.process.exit(2);
     };
     const lib_path = path orelse {
-        std.debug.print("usage: crosscheck-driver --seed=<u64> [--body=<file>] <crosscheck.metallib>\n", .{});
+        std.debug.print("usage: crosscheck-driver --seed=<u64> [--body=<file>] [--reproduce=<command>] <crosscheck.metallib>\n", .{});
         std.process.exit(2);
     };
-    std.debug.print("info seed {d}  body.seed {d}  n {d}\n", .{ s, crosscheck_body.seed, n });
+    // `cpu-build` must read `debug`: that build's safety checks are the
+    // undefined-behaviour detector (build.zig pins it).
+    std.debug.print("info seed {d}  body.seed {d}  n {d}  cpu-build {t}\n", .{ s, crosscheck_body.seed, n, builtin.mode });
 
     // The input stream is derived from the seed but kept distinct from the
     // generator's own draws, so inputs and expression vary independently.
@@ -203,13 +210,13 @@ pub fn main(init: std.process.Init) !void {
             std.debug.print("ok  crosscheck body {s}: {d}/{d} match\n", .{ f, n, n });
             std.process.exit(0);
         }
-        std.debug.print("FAIL crosscheck body {s}: {d}/{d} mismatched (reproduce: zig build crosscheck -Dcrosscheck-body={s})\n", .{ f, mismatches, n, f });
+        std.debug.print("FAIL crosscheck body {s}: {d}/{d} mismatched (reproduce: {s})\n", .{ f, mismatches, n, reproduce orelse "run it through zig build crosscheck" });
         std.process.exit(1);
     }
     if (mismatches == 0) {
         std.debug.print("ok  crosscheck seed {d}: {d}/{d} match\n", .{ s, n, n });
         std.process.exit(0);
     }
-    std.debug.print("FAIL crosscheck seed {d}: {d}/{d} mismatched (reproduce: zig build crosscheck -Dseed={d})\n", .{ s, mismatches, n, s });
+    std.debug.print("FAIL crosscheck seed {d}: {d}/{d} mismatched (reproduce: {s})\n", .{ s, mismatches, n, reproduce orelse "run it through zig build crosscheck" });
     std.process.exit(1);
 }

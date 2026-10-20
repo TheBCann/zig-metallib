@@ -188,7 +188,9 @@ pub fn build(b: *std.Build) void {
     crosscheck_shader_obj.bundle_ubsan_rt = false;
 
     // A second air-splice whose manifest is the harness.
-    const crosscheck_body_host = b.createModule(.{ .root_source_file = crosscheck_body_src, .target = target, .optimize = optimize });
+    // The CPU side is pinned to Debug whatever -Doptimize says: its safety
+    // checks are the bench's undefined-behaviour detector (docs/crosscheck.md).
+    const crosscheck_body_host = b.createModule(.{ .root_source_file = crosscheck_body_src, .target = target, .optimize = .debug });
     const crosscheck_manifest = b.createModule(.{
         .root_source_file = b.path("src/engine/crosscheck_harness.zig"),
         .target = target,
@@ -216,7 +218,7 @@ pub fn build(b: *std.Build) void {
         .root_module = b.createModule(.{
             .root_source_file = b.path("tools/crosscheck/driver.zig"),
             .target = target,
-            .optimize = optimize,
+            .optimize = .debug,
             .imports = &.{
                 .{ .name = "objc", .module = objc_mod },
                 .{ .name = "crosscheck_body", .module = crosscheck_body_host },
@@ -229,8 +231,12 @@ pub fn build(b: *std.Build) void {
     crosscheck_driver.root_module.linkFramework("Metal", .{});
     const run_crosscheck = b.addRunArtifact(crosscheck_driver);
     run_crosscheck.addArg(b.fmt("--seed={d}", .{crosscheck_seed}));
-    // So the driver's reproduce hint names the body file rather than a seed.
+    // The driver names the body file in its result lines and prints the exact
+    // command that reproduces a failure: the inputs come from -Dseed even when
+    // the body is hand-written, and the Apple step below must name itself.
+    const crosscheck_body_opt: []const u8 = if (crosscheck_body_file) |path| b.fmt(" -Dcrosscheck-body={s}", .{path}) else "";
     if (crosscheck_body_file) |path| run_crosscheck.addArg(b.fmt("--body={s}", .{path}));
+    run_crosscheck.addArg(b.fmt("--reproduce=zig build crosscheck -Dseed={d}{s}", .{ crosscheck_seed, crosscheck_body_opt }));
     run_crosscheck.addFileArg(crosscheck_metallib);
     b.step("crosscheck", "Differential test: one generated kernel on the GPU vs the CPU (-Dseed=N)").dependOn(&run_crosscheck.step);
 
@@ -243,9 +249,14 @@ pub fn build(b: *std.Build) void {
     apple_assemble.addFileArg(crosscheck_air_ll);
     apple_assemble.addArg("-o");
     const crosscheck_apple_metallib = apple_assemble.addOutputFileArg2("crosscheck.apple.metallib", .{});
+    // The Metal toolchain is not a hashed input of this step, so after an Xcode
+    // update the cache would keep serving a library assembled by the old
+    // compiler. Re-assemble every run instead (about a second).
+    apple_assemble.has_side_effects = true;
     const run_crosscheck_apple = b.addRunArtifact(crosscheck_driver);
     run_crosscheck_apple.addArg(b.fmt("--seed={d}", .{crosscheck_seed}));
     if (crosscheck_body_file) |path| run_crosscheck_apple.addArg(b.fmt("--body={s}", .{path}));
+    run_crosscheck_apple.addArg(b.fmt("--reproduce=zig build crosscheck-apple -Dseed={d}{s}", .{ crosscheck_seed, crosscheck_body_opt }));
     run_crosscheck_apple.addFileArg(crosscheck_apple_metallib);
     b.step("crosscheck-apple", "The crosscheck kernel with the library built by Apple's assembler from our IR (attribution)").dependOn(&run_crosscheck_apple.step);
 }

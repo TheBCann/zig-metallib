@@ -1280,8 +1280,10 @@ fn renameNumbered(gpa: Allocator, src: []const u8) Error![]u8 {
     return out.toOwnedSlice(gpa);
 }
 
+/// LLVM's unquoted identifier characters (`[-a-zA-Z$._0-9]`), the same set
+/// as the assembler's. '-' matters: loop unrolling names blocks `.unr-lcssa`.
 fn isIdentChar(c: u8) bool {
-    return std.ascii.isAlphanumeric(c) or c == '_' or c == '.' or c == '$';
+    return std.ascii.isAlphanumeric(c) or c == '_' or c == '.' or c == '$' or c == '-';
 }
 
 /// Replace whole-token occurrences of `from` with `to`.
@@ -1608,6 +1610,36 @@ test "D4 block order: a branch naming the same target twice is followed once" {
     // Each block appears exactly once.
     try std.testing.expect(findPos(out, find(out, "\nx:").? + 1, "\nx:") == null);
     try std.testing.expect(findPos(out, find(out, "\ny:").? + 1, "\ny:") == null);
+    inline for (metadata.function_metadata) |fm| {
+        if (comptime std.mem.eql(u8, fm.name, "countKernel")) {
+            const bc = try assembler.assemble(gpa, out, .{ .entry = fm.name, .fm = fm }, target.default);
+            try std.testing.expectEqualStrings("BC\xC0\xDE", bc[0..4]);
+        }
+    }
+}
+
+test "D4 block order: labels and values containing '-' are whole identifiers" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const gpa = arena.allocator();
+    // Loop unrolling names blocks like `.unr-lcssa`. If '-' ended an
+    // identifier, `body.unr-lcssa:` would not be seen as a label (so its lines
+    // would stay glued to `exit`) and the branch target would be read as
+    // `body.unr`, and `exit` would keep reading %v-1 before its definition.
+    const input =
+        \\define ptx_kernel void @countKernel(ptr addrspace(1) %0, ptr addrspace(1) %1, i32 %2) {
+        \\  br label %body.unr-lcssa
+        \\exit:
+        \\  store i32 %v-1, ptr addrspace(1) %0, align 4
+        \\  ret void
+        \\body.unr-lcssa:
+        \\  %v-1 = add nuw nsw i32 %2, 1
+        \\  br label %exit
+        \\}
+        \\
+    ;
+    const out = try convertWith(gpa, input, .{ .require_all_entries = false });
+    try std.testing.expect(find(out, "\nbody.unr-lcssa:").? < find(out, "\nexit:").?);
     inline for (metadata.function_metadata) |fm| {
         if (comptime std.mem.eql(u8, fm.name, "countKernel")) {
             const bc = try assembler.assemble(gpa, out, .{ .entry = fm.name, .fm = fm }, target.default);

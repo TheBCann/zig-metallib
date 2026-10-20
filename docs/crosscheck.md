@@ -37,11 +37,17 @@ or ERROR.
 instead of a generated one. The file must define `pub const seed: u64` and
 `pub fn body(a: i32, b: i32) i32`.
 
+A failing run prints the exact command that reproduces it: the seed is always part of it,
+because the inputs come from `-Dseed` even when the body is hand-written, and a failure
+seen through the Apple step names that step.
+
 `zig build crosscheck-apple` answers whose bug a finding is. It runs the same kernel, but
 the library is built from our printed IR by Apple's own assembler (`xcrun metal -Xclang
 -opaque-pointers`, as CI does for `shader.air.ll`) instead of `tools/air/assembler.zig`. A
 finding that persists is in Metal's GPU compiler; one that disappears is in our assembler
-or container. It needs the Metal toolchain (`xcrun metal --version`).
+or container. It needs the Metal toolchain (`xcrun metal --version`), and it re-assembles
+on every run rather than from the build cache, so the verdict always reflects the
+installed toolchain.
 
 ## How it works
 
@@ -91,14 +97,18 @@ GPU/CPU difference can never be undefined behaviour diverging between targets:
 - every loop is a `for` over a range of at most 8 iterations, so it ends; `break` and
   `continue` conditions are runtime values, never comptime-known, or the statements after
   them would be unreachable code, which Zig rejects;
+- signed `@min`/`@max` go through i32 helpers. A bare `@max(x, @as(i32, 0))` has the
+  narrowed type `u31` in Zig, which `@byteSwap` rejects (about 0.2% of seeds failed to
+  compile before this) and which would run every operator above it at that width;
 - division and remainder go through helpers that return the dividend for a zero divisor
   and for `minInt / -1`. `@rem` and `@mod` need the `minInt` guard too: Zig's Debug build
   defines `@rem(minInt, -1)` as 0, but its release lowering is a plain LLVM `srem`, which
   is undefined for that input.
 
-The host driver is a Debug build, so its safety checks double as an undefined-behaviour
+The host driver, and the body's host compilation, are pinned to Debug in `build.zig`
+whatever `-Doptimize` says, so their safety checks double as an undefined-behaviour
 detector for the generator: a slip would panic on the CPU (bucket `ERROR`) instead of
-silently diverging.
+silently diverging. The driver's `info` line shows `cpu-build debug` to prove it.
 
 Operations with a known finding (below) are left out of the generator so new sweeps
 surface new problems. `tools/crosscheck/gen.zig` says where to add them back.
@@ -135,6 +145,21 @@ order, so `default.metallib` changed bytes with this fix; the printed IR is the 
 multiset of unchanged blocks, and all 42 checks and Apple's assembler cross-check still
 pass.
 
+**Review, 2026-10-20.** An independent review of the generator, the block-order pass and
+the verdict path, with every finding checked by three skeptics (reproduce, trace, impact),
+confirmed six issues. Five are fixed: the `@min`/`@max` narrowing above; the splice's
+identifier scanner lacked `-`, so a label such as `.unr-lcssa` (LLVM's name after loop
+unrolling) would not have been recognised as a block and its branch target would have been
+truncated, defeating the block-order pass for that shape; `-Doptimize` could switch the CPU
+side out of Debug; the reproduce hints omitted the seed and named the wrong step for the
+Apple run; and the Apple step's result was cached across toolchain updates. The sixth is a
+**known limitation, not fixed**: the assembler types a `phi` of pointers from the incoming
+values it has already seen in text order (`phiPointerType`), so a pointer `phi` whose
+non-null incoming is defined in a later block can be typed as address space 0 instead of
+the relocated constant space 2 and refused. No generated program contains pointer phis
+(bodies are pure integer code), and the sample shader is unaffected; a proper fix is an
+order-independent pointer-type inference pass in the assembler.
+
 ## What has been verified
 
 On an Apple M3 (macOS 26.3, Zig 0.18.0-dev.253):
@@ -165,6 +190,10 @@ On an Apple M3 (macOS 26.3, Zig 0.18.0-dev.253):
   assembler bug described under "Findings"); after the fix those two match, four
   one-construct kernels (a plain bounded `for`, `break`, `continue`, nested loops with a
   `switch`) match, and a fresh 100-seed sweep is 100 match.
+- **After the review fixes**: 206 generated programs (seeds 1–200 plus the six that used
+  to fail to compile) are valid, free of undefined behaviour and terminating under Debug
+  safety; the six run and match on the GPU; a fresh 100-seed sweep is 100 match; the
+  default library is byte-identical; 96 unit tests.
 - The default build is untouched: `default.metallib` is byte-identical with and without
   the bench.
 

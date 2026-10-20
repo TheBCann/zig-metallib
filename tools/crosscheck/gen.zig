@@ -155,6 +155,12 @@ const helpers =
     \\inline fn maxU(x: i32, y: i32) i32 {
     \\    return s(@max(u(x), u(y)));
     \\}
+    \\inline fn minS(x: i32, y: i32) i32 {
+    \\    return @min(x, y);
+    \\}
+    \\inline fn maxS(x: i32, y: i32) i32 {
+    \\    return @max(x, y);
+    \\}
     \\inline fn ovAdd(x: i32, y: i32) i32 {
     \\    return @addWithOverflow(x, y)[1];
     \\}
@@ -561,8 +567,12 @@ const Printer = struct {
                 },
                 else => {
                     const name: []const u8 = switch (n.op) {
-                        .min_s => "@min",
-                        .max_s => "@max",
+                        // Through i32 helpers: a bare `@min`/`@max` with a
+                        // comptime-known operand gets a narrowed result type
+                        // (`@max(x, 0)` is u31), which `@byteSwap` rejects and
+                        // which would run every operator above it at that width.
+                        .min_s => "minS",
+                        .max_s => "maxS",
                         .shl => "shl",
                         .ashr => "ashr",
                         .lshr => "lshr",
