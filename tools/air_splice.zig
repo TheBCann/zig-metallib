@@ -1504,6 +1504,118 @@ test "D4 block order: a loop latch laid out before its header is moved after it 
     }
 }
 
+test "D4 block order: switch targets and a block that reads a case's value follow their definitions" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const gpa = arena.allocator();
+    // `tail` reads %a0, defined in case block `c0`, but is laid out first;
+    // the switch's case list spans several lines, as LLVM prints it.
+    const input =
+        \\define ptx_kernel void @countKernel(ptr addrspace(1) %0, ptr addrspace(1) %1, i32 %2) {
+        \\  switch i32 %2, label %dflt [
+        \\    i32 0, label %c0
+        \\    i32 1, label %c1
+        \\  ]
+        \\tail:
+        \\  store i32 %a0, ptr addrspace(1) %0, align 4
+        \\  ret void
+        \\c1:
+        \\  store i32 7, ptr addrspace(1) %1, align 4
+        \\  ret void
+        \\dflt:
+        \\  ret void
+        \\c0:
+        \\  %a0 = add nuw nsw i32 %2, 1
+        \\  br label %tail
+        \\}
+        \\
+    ;
+    const out = try convertWith(gpa, input, .{ .require_all_entries = false });
+    const switch_line = find(out, "switch i32").?;
+    try std.testing.expect(find(out, "\nc0:").? < find(out, "\ntail:").?);
+    try std.testing.expect(switch_line < find(out, "\nc0:").?);
+    try std.testing.expect(switch_line < find(out, "\nc1:").?);
+    try std.testing.expect(switch_line < find(out, "\ndflt:").?);
+    inline for (metadata.function_metadata) |fm| {
+        if (comptime std.mem.eql(u8, fm.name, "countKernel")) {
+            const bc = try assembler.assemble(gpa, out, .{ .entry = fm.name, .fm = fm }, target.default);
+            try std.testing.expectEqualStrings("BC\xC0\xDE", bc[0..4]);
+        }
+    }
+}
+
+test "D4 block order: `; preds` comments on labels are not edges, and an unreachable block goes last" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const gpa = arena.allocator();
+    // Real edges: entry -> {v, D}, D -> u, u -> v; D defines %val, u reads it.
+    // If the `; preds` comments on the label lines were taken as edges
+    // (u -> D from u's comment, v -> u from v's), the depth-first search
+    // from the entry would run v -> u -> D and put u before D, and the
+    // assembler would fail on %val. `dead` has no predecessor at all.
+    const input =
+        \\define ptx_kernel void @countKernel(ptr addrspace(1) %0, ptr addrspace(1) %1, i32 %2) {
+        \\  %c = icmp eq i32 %2, 0
+        \\  br i1 %c, label %v, label %D
+        \\dead:
+        \\  store i32 0, ptr addrspace(1) %1, align 4
+        \\  ret void
+        \\v:                                                ; preds = %3, %u
+        \\  ret void
+        \\u:                                                ; preds = %D
+        \\  store i32 %val, ptr addrspace(1) %0, align 4
+        \\  br label %v
+        \\D:                                                ; preds = %3
+        \\  %val = add nuw nsw i32 %2, 1
+        \\  br label %u
+        \\}
+        \\
+    ;
+    const out = try convertWith(gpa, input, .{ .require_all_entries = false });
+    const d_at = find(out, "\nD:").?;
+    const u_at = find(out, "\nu:").?;
+    const v_at = find(out, "\nv:").?;
+    const dead_at = find(out, "\ndead:").?;
+    try std.testing.expect(d_at < u_at);
+    try std.testing.expect(dead_at > v_at and dead_at > u_at and dead_at > d_at);
+    inline for (metadata.function_metadata) |fm| {
+        if (comptime std.mem.eql(u8, fm.name, "countKernel")) {
+            const bc = try assembler.assemble(gpa, out, .{ .entry = fm.name, .fm = fm }, target.default);
+            try std.testing.expectEqualStrings("BC\xC0\xDE", bc[0..4]);
+        }
+    }
+}
+
+test "D4 block order: a branch naming the same target twice is followed once" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const gpa = arena.allocator();
+    const input =
+        \\define ptx_kernel void @countKernel(ptr addrspace(1) %0, ptr addrspace(1) %1, i32 %2) {
+        \\  %c = icmp eq i32 %2, 0
+        \\  br i1 %c, label %x, label %x
+        \\y:
+        \\  store i32 %d, ptr addrspace(1) %0, align 4
+        \\  ret void
+        \\x:
+        \\  %d = add nuw nsw i32 %2, 2
+        \\  br label %y
+        \\}
+        \\
+    ;
+    const out = try convertWith(gpa, input, .{ .require_all_entries = false });
+    try std.testing.expect(find(out, "\nx:").? < find(out, "\ny:").?);
+    // Each block appears exactly once.
+    try std.testing.expect(findPos(out, find(out, "\nx:").? + 1, "\nx:") == null);
+    try std.testing.expect(findPos(out, find(out, "\ny:").? + 1, "\ny:") == null);
+    inline for (metadata.function_metadata) |fm| {
+        if (comptime std.mem.eql(u8, fm.name, "countKernel")) {
+            const bc = try assembler.assemble(gpa, out, .{ .entry = fm.name, .fm = fm }, target.default);
+            try std.testing.expectEqualStrings("BC\xC0\xDE", bc[0..4]);
+        }
+    }
+}
+
 test "D4 quoted identifiers: generic helpers `@\"mod.Vec(4).sum\"` are followed, kept verbatim and assemble" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
