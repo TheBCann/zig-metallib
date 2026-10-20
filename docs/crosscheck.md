@@ -160,15 +160,19 @@ in `tools/crosscheck/known/`:
 | `a *\| b` (saturating multiply) | `llvm.smul.fix.sat.i32` | building the compute pipeline fails: Metal's compiler service connection is interrupted | `zig build crosscheck -Dcrosscheck-body=tools/crosscheck/known/mul_sat.zig` |
 | `@addWithOverflow(a, b)[1]` | overflow bit of `llvm.sadd.with.overflow.i32` | GPU and CPU disagree on 1,990 of 4,096 inputs | `zig build crosscheck -Dcrosscheck-body=tools/crosscheck/known/add_overflow_bit.zig` |
 | `@subWithOverflow(a, b)[1]` | overflow bit of `llvm.ssub.with.overflow.i32` | GPU and CPU disagree on 2,103 of 4,096 inputs | `zig build crosscheck -Dcrosscheck-body=tools/crosscheck/known/sub_overflow_bit.zig` |
+| `@round(x)` on f32 | `llvm.round.f32` | returns `+0.0` where the result is `-0.0` (949 of 4,096 inputs; `floor`, `ceil`, `trunc` are exact) | `zig build crosscheck -Dcrosscheck-body=tools/crosscheck/known/round_negative_zero.zig` |
+| `@rem(x, y)` on f32 | `frem` | not the exact remainder: 0 for 1.02e-10, 8 for 6.91, `-inf` for finite operands (1,067 of 4,096) | `zig build crosscheck -Dcrosscheck-body=tools/crosscheck/known/rem_inexact.zig` |
 
-**Attribution: all three are faults in Metal's GPU compiler.** Each reproducer was also
+**Attribution: all five are faults in Metal's GPU compiler.** Each reproducer was also
 run through `zig build crosscheck-apple`, where Apple's own assembler builds the library
 from our printed IR, and failed identically: the same crash, and the same mismatch counts
-(1,990 and 2,103). That rules out this project's bitcode encoder and container. Our text
+(1,990, 2,103, 949 and 1,067). That rules out this project's bitcode encoder and container. Our text
 rewrite is ruled out too: the intrinsic declarations and calls in the rewritten IR are the
 ones Zig emitted, apart from the attribute group our cleanup drops from every `declare`.
-This project's assembler passes all three intrinsics to Metal unchanged
-(`tools/air/intrinsics.zig`). The overflow bit of `@mulWithOverflow` matches.
+This project's assembler passes all five intrinsics to Metal unchanged
+(`tools/air/intrinsics.zig`). The overflow bit of `@mulWithOverflow` matches. The two float
+findings came out of the probes behind [docs/crosscheck-float-policy.md](crosscheck-float-policy.md),
+which also records the GPU behaviours that are normalised rather than reported.
 
 **In this project.** The first sweep with control flow produced the bench's first
 `REFUSED` results: `air-splice: use of undefined value` on seeds 5 and 21. LLVM had laid a
@@ -216,6 +220,14 @@ zig build crosscheck -Dcrosscheck-body=tools/crosscheck/regress/pointer_phi_sele
 
 The review harness is saved as `.claude/workflows/crosscheck-review.js`; from Claude Code,
 `/crosscheck-review` runs it again after changes to the bench or the splice.
+
+**Float literals (fixed 2026-10-20).** LLVM 22 prints a float constant that does not
+round-trip through decimal as `f0x` plus the bit pattern of its own type (`float
+f0xCF000000`). Apple's LLVM-15-era reader rejects that spelling and so did this assembler,
+so any shader with such a constant was refused; the sample shader only escaped because its
+constants print in decimal. The assembler now parses the form, and the splice rewrites it
+to the legacy spelling (`0xC1E0000000000000`, `0xH3C00`) in the text it hands to Apple's
+assembler, which then accepts it (verified through `crosscheck-apple`).
 
 ## What has been verified
 

@@ -442,6 +442,10 @@ pub fn convertWith(gpa: Allocator, raw: []const u8, options: ConvertOptions) Err
     // loadable by `xcrun metal` (Metal knows only spaces 0..3).
     text = try replaceAll(gpa, text, "addrspace(101)", "addrspace(2)");
     text = try replaceAll(gpa, text, "addrspace(4)", "addrspace(2)");
+    // LLVM 22 prints float constants that do not round-trip through decimal
+    // as `f0x` + the bit pattern of their own type; Apple's LLVM-15-era
+    // reader only knows the legacy spellings, so write those.
+    text = try rewriteFloatLiterals(gpa, text);
     text = try replaceAll(gpa, text, "ptr addrspace(5)", "ptr");
     return text;
 }
@@ -1308,6 +1312,49 @@ fn replaceToken(gpa: Allocator, s: []const u8, from: []const u8, to: []const u8)
     return out.toOwnedSlice(gpa);
 }
 
+/// `f0xCF000000` (float) -> `0xC1E0000000000000` (the value as a double, the
+/// legacy spelling for a float constant), `f0x3C00` (half) -> `0xH3C00`,
+/// `f0x<16 digits>` (double) -> `0x<16 digits>`. Widening a float to a double
+/// is exact, NaN payloads included, so the value is unchanged.
+fn rewriteFloatLiterals(gpa: Allocator, src: []const u8) Error![]u8 {
+    var out: List = .empty;
+    var i: usize = 0;
+    while (i < src.len) {
+        const at_boundary = i == 0 or !isIdentChar(src[i - 1]);
+        if (at_boundary and std.mem.startsWith(u8, src[i..], "f0x")) {
+            var j = i + 3;
+            while (j < src.len and std.ascii.isHex(src[j])) j += 1;
+            const hex = src[i + 3 .. j];
+            const done: bool = switch (hex.len) {
+                4 => blk: {
+                    try out.appendSlice(gpa, "0xH");
+                    try out.appendSlice(gpa, hex);
+                    break :blk true;
+                },
+                8 => blk: {
+                    const bits = std.fmt.parseInt(u32, hex, 16) catch break :blk false;
+                    const wide: f64 = @floatCast(@as(f32, @bitCast(bits)));
+                    try out.print(gpa, "0x{X:0>16}", .{@as(u64, @bitCast(wide))});
+                    break :blk true;
+                },
+                16 => blk: {
+                    try out.appendSlice(gpa, "0x");
+                    try out.appendSlice(gpa, hex);
+                    break :blk true;
+                },
+                else => false,
+            };
+            if (done) {
+                i = j;
+                continue;
+            }
+        }
+        try out.append(gpa, src[i]);
+        i += 1;
+    }
+    return out.toOwnedSlice(gpa);
+}
+
 fn replaceAll(gpa: Allocator, s: []const u8, from: []const u8, to: []const u8) Error![]u8 {
     var out: List = .empty;
     var i: usize = 0;
@@ -1682,6 +1729,37 @@ test "D4 block order: a loop-carried pointer phi over a relocated table assemble
     ;
     const out = try convertWith(gpa, input, .{ .require_all_entries = false });
     try std.testing.expect(find(out, "\nheader:").? < find(out, "\nlatch:").?);
+    inline for (metadata.function_metadata) |fm| {
+        if (comptime std.mem.eql(u8, fm.name, "countKernel")) {
+            const bc = try assembler.assemble(gpa, out, .{ .entry = fm.name, .fm = fm }, target.default);
+            try std.testing.expectEqualStrings("BC\xC0\xDE", bc[0..4]);
+        }
+    }
+}
+
+test "D4 float literals: LLVM 22's f0x spellings become the legacy forms Apple's reader knows" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const gpa = arena.allocator();
+    const input =
+        \\@tab = private unnamed_addr constant [2 x float] [float f0x00800000, float 1.000000e+00], align 4
+        \\
+        \\define ptx_kernel void @countKernel(ptr addrspace(1) %0, ptr addrspace(1) %1, i32 %2) {
+        \\  %4 = load float, ptr addrspace(1) %0, align 4
+        \\  %5 = fadd float %4, f0xCF000000
+        \\  %6 = fptrunc float %5 to half
+        \\  %7 = fadd half %6, f0x3C00
+        \\  %8 = fpext half %7 to float
+        \\  store float %8, ptr addrspace(1) %1, align 4
+        \\  ret void
+        \\}
+        \\
+    ;
+    const out = try convertWith(gpa, input, .{ .require_all_entries = false });
+    try std.testing.expect(find(out, "f0x") == null);
+    try std.testing.expect(find(out, "fadd float %__4, 0xC1E0000000000000") != null);
+    try std.testing.expect(find(out, "fadd half %__6, 0xH3C00") != null);
+    try std.testing.expect(find(out, "[float 0x3810000000000000, float 1.000000e+00]") != null);
     inline for (metadata.function_metadata) |fm| {
         if (comptime std.mem.eql(u8, fm.name, "countKernel")) {
             const bc = try assembler.assemble(gpa, out, .{ .entry = fm.name, .fm = fm }, target.default);

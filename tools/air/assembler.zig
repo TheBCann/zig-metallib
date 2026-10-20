@@ -999,8 +999,21 @@ const ModuleState = struct {
 };
 
 /// LLVM prints `1.000000e+00`, `-0.5`, or hex IEEE-754 doubles `0x3FF0...`
-/// (and `0xH3C00` for half).
+/// (and `0xH3C00` for half). LLVM 22 also prints the bit pattern of the
+/// constant's own type, `f0x` + 4 (half), 8 (float) or 16 (double) hex
+/// digits, for values that do not round-trip through decimal; Apple's LLVM
+/// does not know that spelling, so the splice rewrites it in the text, and
+/// the assembler accepts it for inputs that did not pass through the splice.
 fn parseFloatLiteral(w: []const u8, c: *Cursor) Error!f64 {
+    if (std.mem.startsWith(u8, w, "f0x")) {
+        const hex = w[3..];
+        return switch (hex.len) {
+            4 => @floatCast(@as(f16, @bitCast(std.fmt.parseInt(u16, hex, 16) catch return fail(c.line, c.s, "bad f0x half literal", error.Syntax)))),
+            8 => @floatCast(@as(f32, @bitCast(std.fmt.parseInt(u32, hex, 16) catch return fail(c.line, c.s, "bad f0x float literal", error.Syntax)))),
+            16 => @bitCast(std.fmt.parseInt(u64, hex, 16) catch return fail(c.line, c.s, "bad f0x double literal", error.Syntax)),
+            else => fail(c.line, c.s, "bad f0x float literal: expected 4, 8 or 16 hex digits", error.Syntax),
+        };
+    }
     if (std.mem.startsWith(u8, w, "0xH")) {
         const bits = std.fmt.parseInt(u16, w[3..], 16) catch return fail(c.line, c.s, "bad half literal", error.Syntax);
         return @floatCast(@as(f16, @bitCast(bits)));
@@ -4445,6 +4458,28 @@ test "D1 retry: a select derived from the phi selected against the table" {
         \\}
         \\
     );
+}
+
+test "float literals in LLVM 22's f0x bit-pattern form are parsed by width" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const gpa = arena.allocator();
+    // -2147483648.0 as a float, 1.0 as a half, FLT_MIN as a float: the
+    // Builder prints them back in LLVM's legacy spellings.
+    const text = try testRoundTrip(gpa, test_header ++
+        \\define float @fragmentShader(float %__0, half %__1) {
+        \\  %__3 = fadd float %__0, f0xCF000000
+        \\  %__4 = fadd half %__1, f0x3C00
+        \\  %__5 = fpext half %__4 to float
+        \\  %__6 = fadd float %__3, %__5
+        \\  %__7 = fmul float %__6, f0x00800000
+        \\  ret float %__7
+        \\}
+        \\
+    );
+    try std.testing.expect(has(text, "fadd float %") and has(text, "0xC1E0000000000000"));
+    try std.testing.expect(has(text, "0xH3C00"));
+    try std.testing.expect(has(text, "0x3810000000000000"));
 }
 
 test "D1 phi over getelementptr constant expressions into relocated tables" {

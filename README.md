@@ -65,7 +65,7 @@ are read back and compared.
 | `zig build test` | rewriter, assembler, metadata, packer, uniformity analysis, target profiles | 91 tests pass |
 | `zig build` | Zig → IR → container, end to end | builds |
 | `zig build check -- …` | Metal loads it, compiles every pipeline, and the GPU computes the right answers | **42 ok, 0 fail** |
-| `tools/crosscheck/sweep.sh` | randomly generated integer kernels compute the same on the GPU as on the CPU ([docs/crosscheck.md](docs/crosscheck.md)) | 100 seeds, all match; 3 operations excluded as [findings](docs/crosscheck.md#findings) |
+| `tools/crosscheck/sweep.sh` | randomly generated integer kernels compute the same on the GPU as on the CPU ([docs/crosscheck.md](docs/crosscheck.md)) | 100 seeds, all match; 5 Metal compiler [findings](docs/crosscheck.md#findings) recorded with reproducers |
 | `xcrun metal-objdump -d` | our container is readable by Apple's own tooling | passes |
 | `xcrun metal` on `shader.air.ll` | Apple's assembler accepts our printed IR; the library *it* builds also passes `zig build check` | **42 ok, 0 fail** |
 
