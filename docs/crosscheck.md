@@ -160,6 +160,9 @@ the relocated constant space 2 and refused. No generated program contains pointe
 (bodies are pure integer code), and the sample shader is unaffected; a proper fix is an
 order-independent pointer-type inference pass in the assembler.
 
+The review harness is saved as `.claude/workflows/crosscheck-review.js`; from Claude Code,
+`/crosscheck-review` runs it again after changes to the bench or the splice.
+
 ## What has been verified
 
 On an Apple M3 (macOS 26.3, Zig 0.18.0-dev.253):
