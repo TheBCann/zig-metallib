@@ -3,3 +3,5 @@ zig-out
 *.bak
 # Local reference books (copyrighted; never commit)
 llvm-books/
+# Finder metadata
+.DS_Store
