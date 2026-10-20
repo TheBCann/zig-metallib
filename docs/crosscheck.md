@@ -14,6 +14,7 @@ shader. Random programs reach IR shapes nobody wrote by hand.
 zig build crosscheck -Dseed=7              # one generated kernel, GPU vs CPU
 tools/crosscheck/sweep.sh 1 200            # a range of seeds, each outcome sorted
 zig build crosscheck -Dcrosscheck-body=path/to/body.zig   # a hand-written body
+zig build crosscheck-apple -Dcrosscheck-body=path/to/body.zig   # same kernel, library built by Apple's assembler
 ```
 
 `sweep.sh` runs under macOS's stock `/bin/bash` (3.2). Every seed lands in one bucket:
@@ -35,6 +36,12 @@ or ERROR.
 `-Dcrosscheck-body=<file>` runs a hand-written or reduced body through the same pipeline
 instead of a generated one. The file must define `pub const seed: u64` and
 `pub fn body(a: i32, b: i32) i32`.
+
+`zig build crosscheck-apple` answers whose bug a finding is. It runs the same kernel, but
+the library is built from our printed IR by Apple's own assembler (`xcrun metal -Xclang
+-opaque-pointers`, as CI does for `shader.air.ll`) instead of `tools/air/assembler.zig`. A
+finding that persists is in Metal's GPU compiler; one that disappears is in our assembler
+or container. It needs the Metal toolchain (`xcrun metal --version`).
 
 ## How it works
 
@@ -97,6 +104,12 @@ in `tools/crosscheck/known/`:
 | `@addWithOverflow(a, b)[1]` | overflow bit of `llvm.sadd.with.overflow.i32` | GPU and CPU disagree on 1,990 of 4,096 inputs | `zig build crosscheck -Dcrosscheck-body=tools/crosscheck/known/add_overflow_bit.zig` |
 | `@subWithOverflow(a, b)[1]` | overflow bit of `llvm.ssub.with.overflow.i32` | GPU and CPU disagree on 2,103 of 4,096 inputs | `zig build crosscheck -Dcrosscheck-body=tools/crosscheck/known/sub_overflow_bit.zig` |
 
+**Attribution: all three are faults in Metal's GPU compiler.** Each reproducer was also
+run through `zig build crosscheck-apple`, where Apple's own assembler builds the library
+from our printed IR, and failed identically: the same crash, and the same mismatch counts
+(1,990 and 2,103). That rules out this project's bitcode encoder and container. Our text
+rewrite is ruled out too: the intrinsic declarations and calls in the rewritten IR are the
+ones Zig emitted, apart from the attribute group our cleanup drops from every `declare`.
 This project's assembler passes all three intrinsics to Metal unchanged
 (`tools/air/intrinsics.zig`). The overflow bit of `@mulWithOverflow` matches.
 
@@ -122,6 +135,9 @@ On an Apple M3 (macOS 26.3, Zig 0.18.0-dev.253):
 - **Integer widths added**: 200 generated bodies clean under Debug safety, a 100-seed
   sweep with all 100 matching, and each of the 10 new operations matching in a
   one-operator kernel. No new findings.
+- **Attribution of the findings**: a passing seed (3) also passes through
+  `crosscheck-apple`, so that path tests something; each of the three findings fails the
+  same way through it. See "Findings".
 - The default build is untouched: `default.metallib` is byte-identical with and without
   the bench.
 

@@ -207,6 +207,8 @@ pub fn build(b: *std.Build) void {
     const run_crosscheck_splice = b.addRunArtifact(crosscheck_splice);
     run_crosscheck_splice.addFileArg(crosscheck_shader_obj.getEmittedLlvmIr());
     const crosscheck_metallib = run_crosscheck_splice.addOutputFileArg2("crosscheck.metallib", .{});
+    // The rewritten IR as text, for the Apple-assembler cross-check below.
+    const crosscheck_air_ll = run_crosscheck_splice.addOutputFileArg2("crosscheck.air.ll", .{});
 
     // Host side: the driver runs `body` on the CPU and the kernel on the GPU.
     const crosscheck_driver = b.addExecutable(.{
@@ -231,4 +233,19 @@ pub fn build(b: *std.Build) void {
     if (crosscheck_body_file) |path| run_crosscheck.addArg(b.fmt("--body={s}", .{path}));
     run_crosscheck.addFileArg(crosscheck_metallib);
     b.step("crosscheck", "Differential test: one generated kernel on the GPU vs the CPU (-Dseed=N)").dependOn(&run_crosscheck.step);
+
+    // Attribution: the same kernel, but the library is built from our printed
+    // IR by Apple's own assembler (`xcrun metal`, as CI does for shader.air.ll)
+    // instead of tools/air/assembler.zig. A finding that persists here is in
+    // Metal's GPU compiler; one that disappears is in our assembler or
+    // container. Needs the Metal toolchain (`xcrun metal --version`).
+    const apple_assemble = b.addSystemCommand(&.{ "xcrun", "metal", "-Xclang", "-opaque-pointers" });
+    apple_assemble.addFileArg(crosscheck_air_ll);
+    apple_assemble.addArg("-o");
+    const crosscheck_apple_metallib = apple_assemble.addOutputFileArg2("crosscheck.apple.metallib", .{});
+    const run_crosscheck_apple = b.addRunArtifact(crosscheck_driver);
+    run_crosscheck_apple.addArg(b.fmt("--seed={d}", .{crosscheck_seed}));
+    if (crosscheck_body_file) |path| run_crosscheck_apple.addArg(b.fmt("--body={s}", .{path}));
+    run_crosscheck_apple.addFileArg(crosscheck_apple_metallib);
+    b.step("crosscheck-apple", "The crosscheck kernel with the library built by Apple's assembler from our IR (attribution)").dependOn(&run_crosscheck_apple.step);
 }
