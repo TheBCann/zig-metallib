@@ -74,13 +74,23 @@ bits of the exact 64-bit signed and unsigned products, a 64-bit average, and the
 of a 64-bit shift. The 64-bit operations cannot overflow: the product of two 32-bit values
 always fits in 64 bits.
 
-Every generated expression is defined for all 2^64 input pairs, so a GPU/CPU difference
-can never be undefined behaviour diverging between targets:
+Control flow. A body is a small program rather than one expression: up to four local
+variables, assignments, `if`/`else`, `switch` on a masked value, bounded `for` loops over
+a range of at most 8 iterations, `break` and `continue` under a condition, and a final
+expression. The generator builds a syntax tree first and prints it afterwards, so its
+post-passes can check that every local is assigned and read, and so a reducer can shrink
+a failing program structurally.
+
+Every generated program is defined, and terminates, for all 2^64 input pairs, so a
+GPU/CPU difference can never be undefined behaviour diverging between targets:
 
 - arithmetic either wraps or saturates; ordinary `+` would overflow into undefined
   behaviour, which LLVM may legally compile differently for nvptx and aarch64;
 - shift amounts are masked to 5 bits, and Zig's `<<` wraps (LLVM `shl` without
   `nsw`/`nuw`);
+- every loop is a `for` over a range of at most 8 iterations, so it ends; `break` and
+  `continue` conditions are runtime values, never comptime-known, or the statements after
+  them would be unreachable code, which Zig rejects;
 - division and remainder go through helpers that return the dividend for a zero divisor
   and for `minInt / -1`. `@rem` and `@mod` need the `minInt` guard too: Zig's Debug build
   defines `@rem(minInt, -1)` as 0, but its release lowering is a plain LLVM `srem`, which
@@ -113,6 +123,18 @@ ones Zig emitted, apart from the attribute group our cleanup drops from every `d
 This project's assembler passes all three intrinsics to Metal unchanged
 (`tools/air/intrinsics.zig`). The overflow bit of `@mulWithOverflow` matches.
 
+**In this project.** The first sweep with control flow produced the bench's first
+`REFUSED` results: `air-splice: use of undefined value` on seeds 5 and 21. LLVM had laid a
+loop's latch block out before its header, so the latch's `add` read a value whose defining
+`phi` only appeared later in the text. That is legal IR, because the header still
+dominates the latch, but the assembler resolved operands in text order. The splice now
+emits blocks in a reverse postorder from the entry, which puts every definition before
+its non-phi uses (`reorderBlocks` in `tools/air_splice.zig`, with a regression test of the
+exact shape). Eight of the fifteen functions in the sample shader had blocks out of that
+order, so `default.metallib` changed bytes with this fix; the printed IR is the same
+multiset of unchanged blocks, and all 42 checks and Apple's assembler cross-check still
+pass.
+
 ## What has been verified
 
 On an Apple M3 (macOS 26.3, Zig 0.18.0-dev.253):
@@ -138,13 +160,18 @@ On an Apple M3 (macOS 26.3, Zig 0.18.0-dev.253):
 - **Attribution of the findings**: a passing seed (3) also passes through
   `crosscheck-apple`, so that path tests something; each of the three findings fails the
   same way through it. See "Findings".
+- **Control flow added**: 200 generated programs valid, free of undefined behaviour and
+  terminating under Debug safety; the first GPU sweep refused seeds 5 and 21 (the
+  assembler bug described under "Findings"); after the fix those two match, four
+  one-construct kernels (a plain bounded `for`, `break`, `continue`, nested loops with a
+  `switch`) match, and a fresh 100-seed sweep is 100 match.
 - The default build is untouched: `default.metallib` is byte-identical with and without
   the bench.
 
 ## Next
 
-- Control flow (statements, bounded loops), vectors and floats. Floats need explicit
-  tolerance rules (contraction, denormals, transcendental precision).
+- Vectors and floats. Floats need explicit tolerance rules (contraction, denormals,
+  transcendental precision).
 - A reducer that shrinks a failing seed to a minimal program before it is reported.
 - Later, the same generated shaders on Asahi Linux's Mesa stack once its M3 GPU driver
   works, so the two compilers can be compared on the same hardware.

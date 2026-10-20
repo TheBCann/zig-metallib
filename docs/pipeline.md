@@ -93,6 +93,12 @@ AIR-shaped. The rewrite is pure text and does:
 - **address spaces**: 4 and 101 → 2 (nvptx `.param`: 4 on Zig 0.17.0, 101 on the 0.18
   nightlies) and `ptr addrspace(5)` → `ptr` in the text, so the debug `.ll` matches what
   the assembler lowers.
+- **block order**: basic blocks are emitted in a reverse postorder from the entry. LLVM
+  may lay a block out before one that dominates it (a rotated loop's latch before its
+  header), so an instruction can read a value whose defining `phi` only appears later
+  in the text. That is legal IR, but the assembler resolves operands in text order, so
+  the splice puts every definition before its non-phi uses first. Phi inputs name their
+  predecessor by label and are unaffected.
 - **texture intrinsics**: the `declare` is replaced by Apple's canonical signature and
   each call becomes a call returning `{ <colour>, i8 }` plus `extractvalue 0`; sampler
   operands are retyped to `ptr addrspace(2)` and sampler words are printed in address

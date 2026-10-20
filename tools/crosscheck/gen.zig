@@ -1,7 +1,9 @@
 //! Generator for the differential test bench.
 //!
 //! Given `--seed=<N>`, writes a `crosscheck_body.zig` whose `body(a, b)` is a
-//! random i32 expression. The SAME file is compiled two ways by build.zig: into
+//! random i32 program: locals, assignments, `if`, bounded `for` loops, `switch`,
+//! guarded `break`/`continue` and a final expression. The SAME file is compiled
+//! two ways by build.zig: into
 //! the GPU kernel (`src/engine/crosscheck_harness.zig` -> air-splice ->
 //! .metallib, run on the Metal device) and into the host driver
 //! (`tools/crosscheck/driver.zig`, run on the CPU). The driver feeds both
@@ -12,6 +14,9 @@
 //! GPU/CPU mismatch is never undefined behaviour diverging between targets:
 //!   * arithmetic wraps (`+% -% *%`) or saturates (`+| -| *|`);
 //!   * shift amounts are masked to 5 bits, and `<<` wraps (no nsw/nuw);
+//!   * every loop is `for` over a range of at most 8 iterations, so it ends;
+//!   * `break`/`continue` conditions are runtime values, never comptime-known,
+//!     or the statements after them would be unreachable code (an error);
 //!   * division and remainder go through helpers that return the dividend
 //!     for a zero divisor and for minInt / -1. `@rem`/`@mod` need the minInt
 //!     guard too: Zig's Debug build defines @rem(minInt, -1) as 0, but its
@@ -192,142 +197,567 @@ const helpers =
     \\
 ;
 
-/// Which inputs the expression referenced, so the caller can discard the
-/// others (`_ = a;`): an unused parameter is a compile error.
-const Used = struct { a: bool = false, b: bool = false };
+// ── Syntax tree ──────────────────────────────────────────────────────────────
+// The generator builds a tree first and prints it afterwards, so the post-passes
+// (every local assigned and read; which inputs were used) can walk it, and so a
+// reducer can shrink a failing program structurally.
+
+const max_vars = 4;
+/// Block nesting depth: a construct inside a construct inside a construct.
+const max_depth = 3;
+
+const Cmp = enum { eq, ne, lt, le, gt, ge };
+const cmps = [_]Cmp{ .eq, .ne, .lt, .le, .gt, .ge };
+
+const Expr = union(enum) {
+    a,
+    b,
+    v: u8,
+    constant: i32,
+    un: struct { op: Op, x: *Expr },
+    bin: struct { op: Op, x: *Expr, y: *Expr },
+    select: struct { c: *Cond, x: *Expr, y: *Expr },
+};
+
+const Cond = struct {
+    cmp: Cmp,
+    /// Compare the operands as u32 (through the `u` helper).
+    unsigned: bool,
+    x: *Expr,
+    y: *Expr,
+    /// An optional second comparison joined by `and` / `or`.
+    rest: ?struct { is_and: bool, c: *Cond } = null,
+};
+
+const Bound = union(enum) {
+    constant: u8,
+    /// `u(expr) & 7`, evaluated once when the loop starts.
+    runtime: *Expr,
+};
+
+const Stmt = union(enum) {
+    assign: struct { v: u8, e: *Expr },
+    if_: struct { c: *Cond, then: []Stmt, els: ?[]Stmt },
+    /// `for (0..bound) |iN|`. With `idx`, the body starts with
+    /// `v = v +% @as(i32, @intCast(kN))` so the capture is used (Zig rejects an
+    /// unused capture); without it the capture is `_`.
+    for_: struct { bound: Bound, idx: ?u8, body: []Stmt },
+    /// `switch (u(sel) & 3)` with arms 0, 1, 2 and else.
+    switch_: struct { sel: *Expr, arms: [4][]Stmt },
+    /// `if (c) break;`, only inside a loop. `c` is runtime-known (see `expr`).
+    brk: *Cond,
+    cont: *Cond,
+};
+
+const Program = struct {
+    nvars: u8,
+    inits: []*Expr,
+    stmts: []Stmt,
+    ret: *Expr,
+};
+
+/// What a tree references: which inputs, and which locals are assigned / read.
+const Usage = struct {
+    a: bool = false,
+    b: bool = false,
+    assigned: [max_vars]bool = @splat(false),
+    read: [max_vars]bool = @splat(false),
+
+    fn expr(u: *Usage, e: *const Expr) void {
+        switch (e.*) {
+            .a => u.a = true,
+            .b => u.b = true,
+            .v => |i| u.read[i] = true,
+            .constant => {},
+            .un => |n| u.expr(n.x),
+            .bin => |n| {
+                u.expr(n.x);
+                u.expr(n.y);
+            },
+            .select => |n| {
+                u.cond(n.c);
+                u.expr(n.x);
+                u.expr(n.y);
+            },
+        }
+    }
+
+    fn cond(u: *Usage, c: *const Cond) void {
+        u.expr(c.x);
+        u.expr(c.y);
+        if (c.rest) |r| u.cond(r.c);
+    }
+
+    fn stmts(u: *Usage, list: []const Stmt) void {
+        for (list) |*s| switch (s.*) {
+            .assign => |n| {
+                u.assigned[n.v] = true;
+                u.expr(n.e);
+            },
+            .if_ => |n| {
+                u.cond(n.c);
+                u.stmts(n.then);
+                if (n.els) |e| u.stmts(e);
+            },
+            .for_ => |n| {
+                switch (n.bound) {
+                    .constant => {},
+                    .runtime => |e| u.expr(e),
+                }
+                if (n.idx) |v| {
+                    u.assigned[v] = true;
+                    u.read[v] = true;
+                }
+                u.stmts(n.body);
+            },
+            .switch_ => |n| {
+                u.expr(n.sel);
+                for (n.arms) |arm| u.stmts(arm);
+            },
+            .brk, .cont => |c| u.cond(c),
+        };
+    }
+
+    fn program(u: *Usage, p: *const Program) void {
+        for (p.inits) |e| u.expr(e);
+        u.stmts(p.stmts);
+        u.expr(p.ret);
+    }
+};
 
 const Gen = struct {
-    w: *std.Io.Writer,
+    gpa: std.mem.Allocator,
     r: std.Random,
-    used: Used = .{},
-    /// Nodes left before only leaves may be emitted; keeps programs small even
-    /// though a select has four subtrees.
-    budget: u32,
+    nvars: u8,
+    /// Locals a leaf may name: grows while the initialisers are generated, so
+    /// `v2`'s initialiser can use `v0` and `v1` but not itself or `v3`.
+    nvars_visible: u8 = 0,
+    /// Expression nodes left before only leaves are emitted.
+    expr_budget: u32,
+    /// Statements left before blocks come out empty.
+    stmt_budget: u32,
 
     fn pick(g: *Gen, comptime set: []const Op) Op {
         return set[g.r.uintLessThan(usize, set.len)];
     }
 
-    fn expr(g: *Gen, depth: u32) std.Io.Writer.Error!void {
-        const op: Op = if (depth == 0 or g.budget == 0) g.pick(&leaves) else blk: {
-            g.budget -= 1;
-            break :blk switch (g.r.uintLessThan(u8, 20)) {
-                0...4 => g.pick(&leaves),
-                5...8 => g.pick(&unary),
-                9...12 => g.pick(&binary_inline),
-                13...17 => g.pick(&binary_helper),
-                else => .select,
-            };
+    fn new(g: *Gen, e: Expr) !*Expr {
+        const p = try g.gpa.create(Expr);
+        p.* = e;
+        return p;
+    }
+
+    /// `rt`: the leaf must be a runtime value (an input or a local), never a
+    /// constant. An expression whose leaves are all runtime values is never
+    /// comptime-known, which `break`/`continue` conditions require.
+    fn leaf(g: *Gen, rt: bool) !*Expr {
+        const n_choices: u32 = 2 + @as(u32, g.nvars_visible) + @as(u32, if (rt) 0 else 1);
+        const k = g.r.uintLessThan(u32, n_choices);
+        if (k == 0) return g.new(.a);
+        if (k == 1) return g.new(.b);
+        if (k < 2 + @as(u32, g.nvars_visible)) return g.new(.{ .v = @intCast(k - 2) });
+        return g.new(.{ .constant = constants[g.r.uintLessThan(usize, constants.len)] });
+    }
+
+    fn expr(g: *Gen, depth: u32, rt: bool) anyerror!*Expr {
+        if (depth == 0 or g.expr_budget == 0) return g.leaf(rt);
+        g.expr_budget -= 1;
+        const d = depth - 1;
+        // Operands are generated into locals first: the order of the random
+        // draws must not depend on how a struct literal is evaluated.
+        switch (g.r.uintLessThan(u8, 20)) {
+            0...4 => return g.leaf(rt),
+            5...8 => {
+                const x = try g.expr(d, rt);
+                return g.new(.{ .un = .{ .op = g.pick(&unary), .x = x } });
+            },
+            9...12 => {
+                const op = g.pick(&binary_inline);
+                const x = try g.expr(d, rt);
+                const y = try g.expr(d, rt);
+                return g.new(.{ .bin = .{ .op = op, .x = x, .y = y } });
+            },
+            13...17 => {
+                const op = g.pick(&binary_helper);
+                const x = try g.expr(d, rt);
+                const y = try g.expr(d, rt);
+                return g.new(.{ .bin = .{ .op = op, .x = x, .y = y } });
+            },
+            else => {
+                const c = try g.cond(d -| 1, true);
+                const x = try g.expr(d, rt);
+                const y = try g.expr(d, rt);
+                return g.new(.{ .select = .{ .c = c, .x = x, .y = y } });
+            },
+        }
+    }
+
+    /// One comparison, signed or unsigned, both operands runtime-known;
+    /// `allow_rest` may add a second one joined by `and` / `or`.
+    fn cond(g: *Gen, depth: u32, allow_rest: bool) anyerror!*Cond {
+        const x = try g.expr(depth, true);
+        const y = try g.expr(depth, true);
+        const c = try g.gpa.create(Cond);
+        c.* = .{
+            .cmp = cmps[g.r.uintLessThan(usize, cmps.len)],
+            .unsigned = g.r.boolean(),
+            .x = x,
+            .y = y,
         };
-        const w = g.w;
-        const d = depth -| 1;
-        switch (op) {
-            .a => {
-                g.used.a = true;
-                try w.writeAll("a");
-            },
-            .b => {
-                g.used.b = true;
-                try w.writeAll("b");
-            },
-            .constant => try w.print("@as(i32, {d})", .{constants[g.r.uintLessThan(usize, constants.len)]}),
-            .bnot => try g.wrap1("~(", d, ")"),
-            .neg => try g.wrap1("(0 -% (", d, "))"),
-            .popcount => try g.wrap1("@as(i32, @popCount(", d, "))"),
-            .clz => try g.wrap1("@as(i32, @clz(", d, "))"),
-            .ctz => try g.wrap1("@as(i32, @ctz(", d, "))"),
-            .bswap => try g.wrap1("@byteSwap(", d, ")"),
-            .bitrev => try g.wrap1("@bitReverse(", d, ")"),
-            .abs => try g.wrap1("s(@abs(", d, "))"),
-            .add, .sub, .mul, .band, .bor, .bxor, .add_sat, .sub_sat, .mul_sat => {
-                const sym = switch (op) {
-                    .add => "+%",
-                    .sub => "-%",
-                    .mul => "*%",
-                    .band => "&",
-                    .bor => "|",
-                    .bxor => "^",
-                    .add_sat => "+|",
-                    .sub_sat => "-|",
-                    .mul_sat => "*|",
+        if (allow_rest and g.r.uintLessThan(u8, 10) < 3) {
+            const is_and = g.r.boolean();
+            c.rest = .{ .is_and = is_and, .c = try g.cond(depth, false) };
+        }
+        return c;
+    }
+
+    fn assign(g: *Gen) anyerror!Stmt {
+        const v = g.r.uintLessThan(u8, g.nvars);
+        const e = try g.expr(g.r.intRangeAtMost(u32, 1, 3), false);
+        return .{ .assign = .{ .v = v, .e = e } };
+    }
+
+    fn block(g: *Gen, depth: u32, in_loop: bool, min: u32, max: u32) anyerror![]Stmt {
+        var list: std.ArrayList(Stmt) = .empty;
+        const n = g.r.intRangeAtMost(u32, min, max);
+        var i: u32 = 0;
+        while (i < n and g.stmt_budget > 0) : (i += 1) {
+            g.stmt_budget -= 1;
+            try list.append(g.gpa, try g.stmt(depth, in_loop));
+        }
+        return list.toOwnedSlice(g.gpa);
+    }
+
+    fn stmt(g: *Gen, depth: u32, in_loop: bool) anyerror!Stmt {
+        const roll = g.r.uintLessThan(u8, 20);
+        if (depth == 0 or roll < 9) return g.assign();
+        if (roll < 13) {
+            const c = try g.cond(2, true);
+            const then = try g.block(depth - 1, in_loop, 1, 3);
+            const els: ?[]Stmt = if (g.r.boolean()) try g.block(depth - 1, in_loop, 1, 2) else null;
+            return .{ .if_ = .{ .c = c, .then = then, .els = els } };
+        }
+        if (roll < 16) {
+            const bound: Bound = if (g.r.boolean())
+                .{ .constant = g.r.intRangeAtMost(u8, 1, 6) }
+            else
+                .{ .runtime = try g.expr(2, true) };
+            const idx: ?u8 = if (g.r.boolean()) g.r.uintLessThan(u8, g.nvars) else null;
+            const body = try g.block(depth - 1, true, 1, 3);
+            return .{ .for_ = .{ .bound = bound, .idx = idx, .body = body } };
+        }
+        if (roll < 18) {
+            const sel = try g.expr(2, true);
+            var arms: [4][]Stmt = undefined;
+            for (&arms) |*arm| arm.* = try g.block(depth - 1, in_loop, 0, 2);
+            return .{ .switch_ = .{ .sel = sel, .arms = arms } };
+        }
+        if (in_loop) {
+            const c = try g.cond(1, true);
+            return if (g.r.boolean()) .{ .brk = c } else .{ .cont = c };
+        }
+        return g.assign();
+    }
+
+    fn program(g: *Gen) anyerror!Program {
+        var inits: std.ArrayList(*Expr) = .empty;
+        g.nvars_visible = 0;
+        for (0..g.nvars) |_| {
+            try inits.append(g.gpa, try g.expr(g.r.intRangeAtMost(u32, 0, 2), false));
+            g.nvars_visible += 1;
+        }
+        const stmts = try g.block(max_depth, false, 3, 7);
+        const ret = try g.expr(g.r.intRangeAtMost(u32, 2, 4), false);
+        var p = Program{ .nvars = g.nvars, .inits = try inits.toOwnedSlice(g.gpa), .stmts = stmts, .ret = ret };
+        try g.fixups(&p);
+        return p;
+    }
+
+    /// Zig rejects a `var` that is never assigned ("never mutated") and a local
+    /// that is never read ("unused"). Give every local one assignment and fold
+    /// every unread one into the result.
+    fn fixups(g: *Gen, p: *Program) anyerror!void {
+        var u: Usage = .{};
+        u.program(p);
+        var list: std.ArrayList(Stmt) = .empty;
+        try list.appendSlice(g.gpa, p.stmts);
+        for (0..p.nvars) |i| if (!u.assigned[i]) {
+            const e = try g.expr(1, false);
+            try list.append(g.gpa, .{ .assign = .{ .v = @intCast(i), .e = e } });
+        };
+        p.stmts = try list.toOwnedSlice(g.gpa);
+        var after: Usage = .{};
+        after.program(p);
+        for (0..p.nvars) |i| if (!after.read[i]) {
+            const v = try g.new(.{ .v = @intCast(i) });
+            p.ret = try g.new(.{ .bin = .{ .op = .bxor, .x = p.ret, .y = v } });
+        };
+    }
+};
+
+// ── Printer ──────────────────────────────────────────────────────────────────
+
+const Printer = struct {
+    w: *std.Io.Writer,
+    indent: u32 = 1,
+    /// Names the loop capture `k1`, `k2`, ... so nested loops never shadow
+    /// each other (`i1`, `i2` would be Zig primitive types).
+    loop_depth: u32 = 0,
+
+    fn pad(p: *Printer) !void {
+        for (0..p.indent) |_| try p.w.writeAll("    ");
+    }
+
+    fn expr(p: *Printer, e: *const Expr) anyerror!void {
+        const w = p.w;
+        switch (e.*) {
+            .a => try w.writeAll("a"),
+            .b => try w.writeAll("b"),
+            .v => |i| try w.print("v{d}", .{i}),
+            .constant => |c| try w.print("@as(i32, {d})", .{c}),
+            .un => |n| {
+                const open: []const u8 = switch (n.op) {
+                    .bnot => "~(",
+                    .neg => "(0 -% (",
+                    .popcount => "@as(i32, @popCount(",
+                    .clz => "@as(i32, @clz(",
+                    .ctz => "@as(i32, @ctz(",
+                    .bswap => "@byteSwap(",
+                    .bitrev => "@bitReverse(",
+                    .abs => "s(@abs(",
+                    .t8s => "t8s(",
+                    .t8u => "t8u(",
+                    .t16s => "t16s(",
+                    .t16u => "t16u(",
                     else => unreachable,
                 };
-                try w.writeAll("(");
-                try g.expr(d);
-                try w.print(" {s} ", .{sym});
-                try g.expr(d);
-                try w.writeAll(")");
+                const close: []const u8 = switch (n.op) {
+                    .neg, .popcount, .clz, .ctz, .abs => "))",
+                    else => ")",
+                };
+                try w.writeAll(open);
+                try p.expr(n.x);
+                try w.writeAll(close);
             },
-            .min_s => try g.call2("@min", d),
-            .max_s => try g.call2("@max", d),
-            .shl => try g.call2("shl", d),
-            .ashr => try g.call2("ashr", d),
-            .lshr => try g.call2("lshr", d),
-            .div_trunc => try g.call2("divTrunc", d),
-            .div_floor => try g.call2("divFloor", d),
-            .rem_s => try g.call2("remS", d),
-            .mod_s => try g.call2("modS", d),
-            .div_u => try g.call2("divU", d),
-            .rem_u => try g.call2("remU", d),
-            .min_u => try g.call2("minU", d),
-            .max_u => try g.call2("maxU", d),
-            .ov_add => try g.call2("ovAdd", d),
-            .ov_sub => try g.call2("ovSub", d),
-            .ov_mul => try g.call2("ovMul", d),
-            .t8s => try g.wrap1("t8s(", d, ")"),
-            .t8u => try g.wrap1("t8u(", d, ")"),
-            .t16s => try g.wrap1("t16s(", d, ")"),
-            .t16u => try g.wrap1("t16u(", d, ")"),
-            .add8 => try g.call2("add8", d),
-            .mul16 => try g.call2("mul16", d),
-            .mulhi_s => try g.call2("mulhiS", d),
-            .mulhi_u => try g.call2("mulhiU", d),
-            .avg64 => try g.call2("avg64", d),
-            .shl64hi => try g.call2("shl64hi", d),
-            .select => {
-                // The comparison operands are kept shallower than the arms.
-                try w.writeAll("(if (");
-                try g.cond(d -| 1);
-                if (g.r.uintLessThan(u8, 10) < 3) {
-                    try w.writeAll(if (g.r.boolean()) " and " else " or ");
-                    try g.cond(d -| 1);
-                }
-                try w.writeAll(") ");
-                try g.expr(d);
+            .bin => |n| switch (n.op) {
+                .add, .sub, .mul, .band, .bor, .bxor, .add_sat, .sub_sat, .mul_sat => {
+                    const sym: []const u8 = switch (n.op) {
+                        .add => "+%",
+                        .sub => "-%",
+                        .mul => "*%",
+                        .band => "&",
+                        .bor => "|",
+                        .bxor => "^",
+                        .add_sat => "+|",
+                        .sub_sat => "-|",
+                        .mul_sat => "*|",
+                        else => unreachable,
+                    };
+                    try w.writeAll("(");
+                    try p.expr(n.x);
+                    try w.print(" {s} ", .{sym});
+                    try p.expr(n.y);
+                    try w.writeAll(")");
+                },
+                else => {
+                    const name: []const u8 = switch (n.op) {
+                        .min_s => "@min",
+                        .max_s => "@max",
+                        .shl => "shl",
+                        .ashr => "ashr",
+                        .lshr => "lshr",
+                        .div_trunc => "divTrunc",
+                        .div_floor => "divFloor",
+                        .rem_s => "remS",
+                        .mod_s => "modS",
+                        .div_u => "divU",
+                        .rem_u => "remU",
+                        .min_u => "minU",
+                        .max_u => "maxU",
+                        .ov_add => "ovAdd",
+                        .ov_sub => "ovSub",
+                        .ov_mul => "ovMul",
+                        .add8 => "add8",
+                        .mul16 => "mul16",
+                        .mulhi_s => "mulhiS",
+                        .mulhi_u => "mulhiU",
+                        .avg64 => "avg64",
+                        .shl64hi => "shl64hi",
+                        else => unreachable,
+                    };
+                    try w.print("{s}(", .{name});
+                    try p.expr(n.x);
+                    try w.writeAll(", ");
+                    try p.expr(n.y);
+                    try w.writeAll(")");
+                },
+            },
+            .select => |n| {
+                try w.writeAll("(if ");
+                try p.cond(n.c);
+                try w.writeAll(" ");
+                try p.expr(n.x);
                 try w.writeAll(" else ");
-                try g.expr(d);
+                try p.expr(n.y);
                 try w.writeAll(")");
             },
         }
     }
 
-    fn wrap1(g: *Gen, open: []const u8, d: u32, close: []const u8) std.Io.Writer.Error!void {
-        try g.w.writeAll(open);
-        try g.expr(d);
-        try g.w.writeAll(close);
+    fn cmp(p: *Printer, c: *const Cond) anyerror!void {
+        const sym: []const u8 = switch (c.cmp) {
+            .eq => "==",
+            .ne => "!=",
+            .lt => "<",
+            .le => "<=",
+            .gt => ">",
+            .ge => ">=",
+        };
+        try p.w.writeAll("(");
+        if (c.unsigned) try p.w.writeAll("u(");
+        try p.expr(c.x);
+        if (c.unsigned) try p.w.writeAll(")");
+        try p.w.print(" {s} ", .{sym});
+        if (c.unsigned) try p.w.writeAll("u(");
+        try p.expr(c.y);
+        if (c.unsigned) try p.w.writeAll(")");
+        try p.w.writeAll(")");
     }
 
-    fn call2(g: *Gen, name: []const u8, d: u32) std.Io.Writer.Error!void {
-        try g.w.print("{s}(", .{name});
-        try g.expr(d);
-        try g.w.writeAll(", ");
-        try g.expr(d);
-        try g.w.writeAll(")");
+    /// Always parenthesised, so it reads as `if (...)` / `(if (...) x else y)`.
+    fn cond(p: *Printer, c: *const Cond) anyerror!void {
+        try p.w.writeAll("(");
+        try p.cmp(c);
+        if (c.rest) |r| {
+            try p.w.writeAll(if (r.is_and) " and " else " or ");
+            try p.cmp(r.c);
+        }
+        try p.w.writeAll(")");
     }
 
-    /// One comparison, signed or unsigned (operands bit-cast to u32).
-    fn cond(g: *Gen, d: u32) std.Io.Writer.Error!void {
-        const ops = [_][]const u8{ "==", "!=", "<", "<=", ">", ">=" };
-        const cmp = ops[g.r.uintLessThan(usize, ops.len)];
-        const unsigned = g.r.boolean();
-        try g.w.writeAll(if (unsigned) "(u(" else "(");
-        try g.expr(d);
-        try g.w.print("{s} {s} ", .{ if (unsigned) ")" else "", cmp });
-        try g.w.writeAll(if (unsigned) "u(" else "");
-        try g.expr(d);
-        try g.w.writeAll(if (unsigned) "))" else ")");
+    fn block(p: *Printer, list: []const Stmt) anyerror!void {
+        p.indent += 1;
+        for (list) |*s| try p.stmt(s);
+        p.indent -= 1;
+    }
+
+    fn stmt(p: *Printer, s: *const Stmt) anyerror!void {
+        const w = p.w;
+        switch (s.*) {
+            .assign => |n| {
+                try p.pad();
+                try w.print("v{d} = ", .{n.v});
+                try p.expr(n.e);
+                try w.writeAll(";\n");
+            },
+            .if_ => |n| {
+                try p.pad();
+                try w.writeAll("if ");
+                try p.cond(n.c);
+                try w.writeAll(" {\n");
+                try p.block(n.then);
+                if (n.els) |e| {
+                    try p.pad();
+                    try w.writeAll("} else {\n");
+                    try p.block(e);
+                }
+                try p.pad();
+                try w.writeAll("}\n");
+            },
+            .for_ => |n| {
+                try p.pad();
+                try w.writeAll("for (0..");
+                switch (n.bound) {
+                    .constant => |k| try w.print("{d}", .{k}),
+                    .runtime => |e| {
+                        try w.writeAll("@as(usize, u(");
+                        try p.expr(e);
+                        try w.writeAll(") & 7)");
+                    },
+                }
+                p.loop_depth += 1;
+                if (n.idx != null) try w.print(") |k{d}| {{\n", .{p.loop_depth}) else try w.writeAll(") |_| {\n");
+                p.indent += 1;
+                if (n.idx) |v| {
+                    try p.pad();
+                    try w.print("v{d} = v{d} +% @as(i32, @intCast(k{d}));\n", .{ v, v, p.loop_depth });
+                }
+                for (n.body) |*b| try p.stmt(b);
+                p.indent -= 1;
+                p.loop_depth -= 1;
+                try p.pad();
+                try w.writeAll("}\n");
+            },
+            .switch_ => |n| {
+                try p.pad();
+                try w.writeAll("switch (u(");
+                try p.expr(n.sel);
+                try w.writeAll(") & 3) {\n");
+                p.indent += 1;
+                for (n.arms, 0..) |arm, k| {
+                    try p.pad();
+                    if (k < 3) try w.print("{d} => {{\n", .{k}) else try w.writeAll("else => {\n");
+                    try p.block(arm);
+                    try p.pad();
+                    try w.writeAll("},\n");
+                }
+                p.indent -= 1;
+                try p.pad();
+                try w.writeAll("}\n");
+            },
+            .brk => |c| {
+                try p.pad();
+                try w.writeAll("if ");
+                try p.cond(c);
+                try w.writeAll(" break;\n");
+            },
+            .cont => |c| {
+                try p.pad();
+                try w.writeAll("if ");
+                try p.cond(c);
+                try w.writeAll(" continue;\n");
+            },
+        }
+    }
+
+    fn program(p: *Printer, prog: *const Program, usage: Usage) anyerror!void {
+        try p.w.writeAll("pub fn body(a: i32, b: i32) i32 {\n");
+        // A parameter the program never referenced must be discarded, or Zig
+        // rejects it as unused.
+        if (!usage.a) try p.w.writeAll("    _ = a;\n");
+        if (!usage.b) try p.w.writeAll("    _ = b;\n");
+        for (prog.inits, 0..) |e, i| {
+            try p.pad();
+            try p.w.print("var v{d}: i32 = ", .{i});
+            try p.expr(e);
+            try p.w.writeAll(";\n");
+        }
+        for (prog.stmts) |*s| try p.stmt(s);
+        try p.pad();
+        try p.w.writeAll("return ");
+        try p.expr(prog.ret);
+        try p.w.writeAll(";\n}\n");
     }
 };
+
+fn countStmts(list: []const Stmt) u32 {
+    var n: u32 = 0;
+    for (list) |*s| {
+        n += 1;
+        switch (s.*) {
+            .if_ => |x| {
+                n += countStmts(x.then);
+                if (x.els) |e| n += countStmts(e);
+            },
+            .for_ => |x| n += countStmts(x.body),
+            .switch_ => |x| for (x.arms) |arm| {
+                n += countStmts(arm);
+            },
+            else => {},
+        }
+    }
+    return n;
+}
 
 pub fn main(init: std.process.Init) !void {
     const arena = init.arena.allocator();
@@ -352,46 +782,47 @@ pub fn main(init: std.process.Init) !void {
             std.process.exit(2);
         }
     }
-    const usage = "usage: crosscheck-gen --seed=<u64> <out.zig>\n";
+    const usage_text = "usage: crosscheck-gen --seed=<u64> <out.zig>\n";
     const sd = seed orelse {
-        std.debug.print(usage, .{});
+        std.debug.print(usage_text, .{});
         std.process.exit(2);
     };
     const path = out_path orelse {
-        std.debug.print(usage, .{});
+        std.debug.print(usage_text, .{});
         std.process.exit(2);
     };
 
     var prng: std.Random.DefaultPrng = .init(sd);
     const r = prng.random();
-    // Depth 3..6 and at most 40 interior nodes: several operators nest, and
-    // the generated source stays readable when a seed has to be reduced.
-    const depth = r.intRangeAtMost(u32, 3, 6);
-
-    var expr: std.Io.Writer.Allocating = .init(arena);
-    var g: Gen = .{ .w = &expr.writer, .r = r, .budget = 40 };
-    try g.expr(depth);
+    var g: Gen = .{
+        .gpa = arena,
+        .r = r,
+        .nvars = r.intRangeAtMost(u8, 2, max_vars),
+        // Bounded so a program stays readable when a seed has to be reduced.
+        .expr_budget = 80,
+        .stmt_budget = 40,
+    };
+    const prog = try g.program();
+    var usage: Usage = .{};
+    usage.program(&prog);
 
     var w: std.Io.Writer.Allocating = .init(arena);
     try w.writer.print(
         \\// Generated by tools/crosscheck/gen.zig — do not edit.
-        \\// seed={d} depth={d}
+        \\// seed={d} locals={d} statements={d}
         \\//
-        \\// body(a, b) is a random total i32 expression. Compiled for the GPU
+        \\// body(a, b) is a random total i32 program. Compiled for the GPU
         \\// (src/engine/crosscheck_harness.zig) and the CPU
         \\// (tools/crosscheck/driver.zig); the driver feeds both the same inputs
         \\// and compares.
         \\pub const seed: u64 = {d};
         \\
         \\
-    , .{ sd, depth, sd });
+    , .{ sd, prog.nvars, countStmts(prog.stmts), sd });
     try w.writer.writeAll(helpers);
-    try w.writer.writeAll("\npub fn body(a: i32, b: i32) i32 {\n");
-    // A parameter the expression never referenced must be discarded, or Zig
-    // rejects it as unused.
-    if (!g.used.a) try w.writer.writeAll("    _ = a;\n");
-    if (!g.used.b) try w.writer.writeAll("    _ = b;\n");
-    try w.writer.print("    return {s};\n}}\n", .{expr.written()});
+    try w.writer.writeAll("\n");
+    var printer: Printer = .{ .w = &w.writer };
+    try printer.program(&prog, usage);
 
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = w.written() });
 }

@@ -577,7 +577,93 @@ fn matchesEntry(full: []const u8, name: []const u8) bool {
 /// A non-entry function an entry point reaches: header rebuilt without
 /// attributes (`private` and `fastcc` kept, `sret` becomes a plain `ptr`
 /// parameter), body sanitised exactly like an entry's.
-fn emitHelper(gpa: Allocator, out: *List, d: Define, body: []const []const u8) Error!void {
+/// `name:` at the start of a body line; null for anything else.
+fn blockLabel(line: []const u8) ?[]const u8 {
+    var i: usize = 0;
+    while (i < line.len and isIdentChar(line[i])) i += 1;
+    if (i == 0 or i >= line.len or line[i] != ':') return null;
+    return line[0..i];
+}
+
+/// LLVM may lay a block out before one that dominates it: a rotated loop's
+/// latch comes before its header, so the latch's `add` reads a value whose
+/// defining `phi` only appears later in the text (the crosscheck bench's
+/// seed 5, `%.088120.i`). That is legal IR, but the assembler resolves
+/// operands in text order (`FunctionState.lookup`) and reports "use of
+/// undefined value". So emit the blocks in a reverse postorder from the
+/// entry: a definition dominates its non-phi uses, and a dominator precedes
+/// everything it dominates in that order, so every operand is defined before
+/// it is read. Phi incoming values name their predecessor by label and are
+/// resolved by the assembler at the end, so block order does not affect them.
+/// The entry block (the lines before the first label, usually unlabelled)
+/// stays first; blocks unreachable from it keep their order at the end.
+fn reorderBlocks(gpa: Allocator, body: []const []const u8) Error![]const []const u8 {
+    // Block k spans body[starts[k] .. starts[k+1]).
+    var starts: std.ArrayList(usize) = .empty;
+    try starts.append(gpa, 0);
+    for (body, 0..) |raw, i| {
+        if (i > 0 and blockLabel(std.mem.trim(u8, raw, " \t\r")) != null) try starts.append(gpa, i);
+    }
+    const n = starts.items.len;
+    if (n < 3) return body;
+    const ends = try gpa.alloc(usize, n);
+    for (0..n) |k| ends[k] = if (k + 1 < n) starts.items[k + 1] else body.len;
+    const names = try gpa.alloc([]const u8, n);
+    for (0..n) |k| names[k] = blockLabel(std.mem.trim(u8, body[starts.items[k]], " \t\r")) orelse "";
+
+    // Successors: every `label %x` in the block (phis spell theirs
+    // `[ %v, %bb ]`, so only terminators match; the assembler's predecessor
+    // count uses the same rule).
+    const succs = try gpa.alloc(std.ArrayList(usize), n);
+    for (succs) |*list| list.* = .empty;
+    for (0..n) |k| {
+        for (body[starts.items[k]..ends[k]]) |raw| {
+            const line = std.mem.trim(u8, raw, " \t\r");
+            if (line.len == 0 or line[0] == ';' or blockLabel(line) != null) continue;
+            var pos: usize = 0;
+            while (findPos(line, pos, "label %")) |p| {
+                var j = p + "label %".len;
+                while (j < line.len and isIdentChar(line[j])) j += 1;
+                const dest = line[p + "label %".len .. j];
+                pos = j;
+                for (names, 0..) |nm, t| if (nm.len > 0 and std.mem.eql(u8, nm, dest)) try succs[k].append(gpa, t);
+            }
+        }
+    }
+
+    // Iterative depth-first search from the entry; postorder reversed.
+    const visited = try gpa.alloc(bool, n);
+    @memset(visited, false);
+    var post: std.ArrayList(usize) = .empty;
+    var stack: std.ArrayList(struct { block: usize, next: usize }) = .empty;
+    try stack.append(gpa, .{ .block = 0, .next = 0 });
+    visited[0] = true;
+    while (stack.items.len > 0) {
+        const top = &stack.items[stack.items.len - 1];
+        if (top.next < succs[top.block].items.len) {
+            const t = succs[top.block].items[top.next];
+            top.next += 1;
+            if (!visited[t]) {
+                visited[t] = true;
+                try stack.append(gpa, .{ .block = t, .next = 0 });
+            }
+        } else {
+            try post.append(gpa, top.block);
+            stack.items.len -= 1;
+        }
+    }
+    var order: std.ArrayList(usize) = .empty;
+    var i = post.items.len;
+    while (i > 0) : (i -= 1) try order.append(gpa, post.items[i - 1]);
+    for (0..n) |k| if (!visited[k]) try order.append(gpa, k);
+
+    var out: std.ArrayList([]const u8) = .empty;
+    for (order.items) |k| try out.appendSlice(gpa, body[starts.items[k]..ends[k]]);
+    return out.items;
+}
+
+fn emitHelper(gpa: Allocator, out: *List, d: Define, raw_body: []const []const u8) Error!void {
+    const body = try reorderBlocks(gpa, raw_body);
     const params = try parseParams(gpa, d.params);
     try out.appendSlice(gpa, "define ");
     if (d.linkage.len > 0) try out.print(gpa, "{s} ", .{d.linkage});
@@ -644,8 +730,9 @@ fn emitShader(
     out: *List,
     comptime info: FnInfo,
     d: Define,
-    body: []const []const u8,
+    raw_body: []const []const u8,
 ) Error!void {
+    const body = try reorderBlocks(gpa, raw_body);
     var params = try parseParams(gpa, d.params);
     const all_params = params;
     var sret: ?Param = null;
@@ -1370,6 +1457,47 @@ test "D4 helpers: reachable non-entry defines are kept, lifetime dropped, ptx_ke
     // The result assembles for the fragment entry with the helpers inside.
     inline for (metadata.function_metadata) |fm| {
         if (comptime std.mem.eql(u8, fm.name, "fragmentShader")) {
+            const bc = try assembler.assemble(gpa, out, .{ .entry = fm.name, .fm = fm }, target.default);
+            try std.testing.expectEqualStrings("BC\xC0\xDE", bc[0..4]);
+        }
+    }
+}
+
+test "D4 block order: a loop latch laid out before its header is moved after it and assembles" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const gpa = arena.allocator();
+    // The crosscheck bench's seed 5 shape: the latch (`%next = add ... %i`)
+    // comes before the header that defines `%i` with a phi. The entry block
+    // is numbered (%3) and unlabelled, as LLVM prints it.
+    const input =
+        \\define ptx_kernel void @countKernel(ptr addrspace(1) %0, ptr addrspace(1) %1, i32 %2) {
+        \\  br label %header
+        \\latch:
+        \\  %next = add nuw nsw i32 %i, 1
+        \\  store i32 %i, ptr addrspace(1) %0, align 4
+        \\  br label %header
+        \\header:
+        \\  %i = phi i32 [ 0, %3 ], [ %next, %latch ]
+        \\  %done = icmp eq i32 %i, %2
+        \\  br i1 %done, label %exit, label %latch
+        \\exit:
+        \\  ret void
+        \\}
+        \\
+    ;
+    const out = try convertWith(gpa, input, .{ .require_all_entries = false });
+    const header = find(out, "\nheader:").?;
+    const latch = find(out, "\nlatch:").?;
+    const exit = find(out, "\nexit:").?;
+    try std.testing.expect(header < latch);
+    try std.testing.expect(header < exit);
+    // The implicit entry label still comes first.
+    try std.testing.expect(find(out, "\n__3:").? < header);
+    // Before the reordering the assembler stopped at `%i` with
+    // "use of undefined value"; now the kernel assembles.
+    inline for (metadata.function_metadata) |fm| {
+        if (comptime std.mem.eql(u8, fm.name, "countKernel")) {
             const bc = try assembler.assemble(gpa, out, .{ .entry = fm.name, .fm = fm }, target.default);
             try std.testing.expectEqualStrings("BC\xC0\xDE", bc[0..4]);
         }

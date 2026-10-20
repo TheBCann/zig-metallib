@@ -48,7 +48,7 @@ deletes old nightlies within days; once this one is gone, CI fails at its setup 
 the pin moves to a current nightly. For a toolchain that stays downloadable, check out the
 **`zig-0.17.0`** tag, which pins the Zig 0.17.0 release. Zig 0.17.0 also builds this
 commit. Zig 0.18 changed the IR the shader compiles to, so `default.metallib` differs
-between the two (`1969ef4d…` on 0.17.0, `97bd644c…` on the 0.18 nightlies), and both
+between the two (`1969ef4d…` on 0.17.0, `108736c1…` on the 0.18 nightlies), and both
 pass all 42 checks.
 
 ## What is verified, and how
