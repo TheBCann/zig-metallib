@@ -1,5 +1,10 @@
 //! Known finding: `@rem` on f32 is not the exact remainder.
 //!
+//! Worked around in this project since 2026-10-20: the assembler lowers `frem`
+//! to a call to Apple's exact `air.fmod.f32` (tools/air/intrinsics.zig), so
+//! `zig build crosscheck` on this file matches; `zig build crosscheck-apple`
+//! (Apple's assembler, no workaround) still fails as described.
+//!
 //! fmod is exact by definition (IEEE 754 remainder, C fmod): for finite x and
 //! y the result is representable and uniquely determined. Zig lowers `@rem`
 //! to LLVM `frem`; the GPU returns results such as 0 where the answer is

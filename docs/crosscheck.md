@@ -121,7 +121,7 @@ The kernel's shape is fixed (two inputs, one output, a count, the thread id), so
 
 ## What the generator emits
 
-All on i32: wrapping `+% -% *%`, saturating `+| -|`, bitwise `& | ^ ~`, wrapping
+All on i32: wrapping `+% -% *%`, saturating `+| -| *|`, bitwise `& | ^ ~`, wrapping
 negation, `@min`/`@max` (signed, and unsigned through a bit-cast), shifts (`<<`,
 arithmetic and logical `>>`), signed and unsigned division and remainder (`@divTrunc`,
 `@divFloor`, `@rem`, `@mod`, `/`, `%`), `@popCount`, `@clz`, `@ctz`, `@byteSwap`,
@@ -164,8 +164,10 @@ whatever `-Doptimize` says, so their safety checks double as an undefined-behavi
 detector for the generator: a slip would panic on the CPU (bucket `ERROR`) instead of
 silently diverging. The driver's `info` line shows `cpu-build debug` to prove it.
 
-Operations with a known finding (below) are left out of the generator so new sweeps
-surface new problems. `tools/crosscheck/gen.zig` says where to add them back.
+The two overflow bits with a known finding (below) are left out of the generator so new
+sweeps surface new problems; `tools/crosscheck/program.zig` says where to add them back.
+`*|`, `@round` and `@rem` are in the menus: the assembler works around their findings
+(below).
 
 **Float mode** (`-Dcrosscheck-floats=true`) adds f32 subtrees to the programs, following
 [docs/crosscheck-float-policy.md](crosscheck-float-policy.md): inputs and locals carry
@@ -188,17 +190,18 @@ in `tools/crosscheck/known/`:
 | `@round(x)` on f32 | `llvm.round.f32` | returns `+0.0` where the result is `-0.0` (949 of 4,096 inputs; `floor`, `ceil`, `trunc` are exact) | `zig build crosscheck -Dcrosscheck-body=tools/crosscheck/known/round_negative_zero.zig` |
 | `@rem(x, y)` on f32 | `frem` | not the exact remainder: 0 for 1.02e-10, 8 for 6.91, `-inf` for finite operands (1,067 of 4,096) | `zig build crosscheck -Dcrosscheck-body=tools/crosscheck/known/rem_inexact.zig` |
 | `@mulAdd(f32, C1, C2, x)` with a denormal constant product | `llvm.fma.f32` with two constant multiplicands | the compiler folds the product and flushes it, so the fma degenerates to `x`; the hardware fma keeps the exact intermediate (223 of 4,096; 266 with the float-mode inputs) | `zig build crosscheck -Dcrosscheck-body=tools/crosscheck/known/fma_constant_product_flush.zig` |
+| `@rem(x, y)` on f16 | `frem half`; the finding is in Apple's own `air.fmod.f16`, what MSL's `fmod(half, half)` compiles to | `+0.0` where the remainder is an exact `-0.0`, for every negative x (9 of 4,096 through Apple's front end; single precision keeps the sign; `frem half` through Apple's assembler differs on 672) | `zig build crosscheck-msl -Dcrosscheck-body=tools/crosscheck/known/fmod_half_negative_zero.zig -Dcrosscheck-metal=tools/crosscheck/known/fmod_half_negative_zero.metal` |
 
-**Attribution: all six are faults in Metal's GPU compiler.** Each reproducer was also
-run through `zig build crosscheck-apple`, where Apple's own assembler builds the library
+**Attribution: all seven are faults in Metal's compiler.** Each of the first six
+reproducers was also run through `zig build crosscheck-apple`, where Apple's own assembler builds the library
 from our printed IR, and failed identically: the same crash, and the same mismatch counts
 (1,990, 2,103, 949, 1,067 and 223), with the library's fast-math declaration on and off
 (`-Dmetal-fast-math`; see [the float policy](crosscheck-float-policy.md#the-fast-math-declaration)).
 That rules out this project's bitcode encoder and container. Our text
 rewrite is ruled out too: the intrinsic declarations and calls in the rewritten IR are the
 ones Zig emitted, apart from the attribute group our cleanup drops from every `declare`.
-This project's assembler passes all six intrinsics to Metal unchanged
-(`tools/air/intrinsics.zig`). The overflow bit of `@mulWithOverflow` matches. The two float
+This project's assembler passed all six intrinsics to Metal unchanged when the findings
+were made; three of them are now worked around (below, and `tools/air/intrinsics.zig`). The overflow bit of `@mulWithOverflow` matches. The two float
 findings came out of the probes behind [docs/crosscheck-float-policy.md](crosscheck-float-policy.md),
 which also records the GPU behaviours that are normalised rather than reported.
 
@@ -217,6 +220,21 @@ spelling for `llvm.smul.fix.sat`; its `madsat(a, b, 0)` (`air.mad_sat.s.i32`) co
 4,096 inputs where LLVM's `frem` is not, so that finding is in the lowering of `frem`. Bug
 reports with standalone reproducers (the `.metal` twins, two `.ll` files Apple's assembler
 accepts, and a Swift runner) are drafted in [`docs/apple-reports/`](apple-reports/README.md).
+
+**Worked around in this project (2026-10-20).** Three of the seven no longer reach Zig
+shaders built here, because Apple's own intrinsic for the operation is right where the LLVM
+form is not (`tools/air/intrinsics.zig`): `llvm.smul.fix.sat` / `llvm.umul.fix.sat` with a
+zero scale, Zig's `*|`, become `air.mad_sat.s.<T>` / `air.mad_sat.u.<T>` (MSL's
+`madsat(a, b, 0)`); the `frem` instruction becomes a call to `air.fmod.<T>`
+(`air.fast_fmod.<T>` under fast math), plus a `copysign` for half precision, because
+probing that workaround found the seventh finding, Apple's own `air.fmod.f16` losing the
+sign of an exact zero remainder; and `llvm.round` is expanded to
+`trunc(x + copysign(0.5 - ulp, x))`, which is round-half-away-from-zero for every finite x
+and keeps the sign of a zero result (`copysign(round(x), x)` would not do: Apple's optimizer
+folds it back to `round(x)`). The three reproducers now match through `zig build
+crosscheck` and still fail through `crosscheck-apple`, which assembles the un-worked-around
+IR with Apple's tool, so the findings stay measurable. The generator emits `*|`, `@round`
+and `@rem` again, so the integer programs changed with the menu.
 
 **In this project.** The first sweep with control flow produced the bench's first
 `REFUSED` results: `air-splice: use of undefined value` on seeds 5 and 21. LLVM had laid a
@@ -333,15 +351,19 @@ On an Apple M3 (macOS 26.3, Zig 0.18.0-dev.253):
   both overflow bits, `round` and the constant fma fail with the same counts as the Zig
   bodies, `madsat` and `fmod` match on all 4,096 inputs, and so do the unsigned overflow
   bits and the fma with a run-time multiplicand.
+- **Workarounds** (2026-10-20): with `*|` lowered to `air.mad_sat`, `frem` to `air.fmod`
+  and `llvm.round` expanded, the three reproducers match through `crosscheck` and still
+  fail through `crosscheck-apple` (the crash, 949, 1,067); `*|` on vectors and on u32, and
+  `@rem`/`@round` on `@Vector(4, f32)` match; `@rem`/`@round` on f16 matched after the
+  `copysign` for half, whose probe found the seventh finding (9 of 4,096 through Apple's
+  front end, 672 for `frem half` through Apple's assembler). With `*|`, `@round` and `@rem`
+  back in the menus, 100 integer seeds and 100 float seeds all match; 126 unit tests; the
+  default library is byte-identical (the sample shader uses none of the three).
 - The default build is untouched: `default.metallib` is byte-identical with and without
   the bench.
 
 ## Next
 
-- Workarounds in the assembler for the findings Apple's own intrinsics get right:
-  `llvm.smul.fix.sat.i32` with a zero scale as `air.mad_sat.s.i32`, `frem` as
-  `air.fmod.f32`, and a sign-preserving lowering of `llvm.round.f32`; then `*|`, `@rem` and
-  `@round` can join the exact set and the generator.
 - File the drafted reports in `docs/apple-reports/` with Apple, and record the feedback
   numbers in the findings table.
 - f16 as a generated type, then vectors; the precision survey for the transcendentals.

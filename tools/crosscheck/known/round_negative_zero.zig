@@ -1,5 +1,10 @@
 //! Known finding: `@round` loses the sign of a negative zero result.
 //!
+//! Worked around in this project since 2026-10-20: the assembler expands
+//! `llvm.round` to `trunc(x + copysign(0.5 - ulp, x))` (tools/air/intrinsics.zig),
+//! so `zig build crosscheck` on this file matches; `zig build crosscheck-apple`
+//! (Apple's assembler, no workaround) still fails as described.
+//!
 //! IEEE 754 and C define round(-1.3e-17) as -0.0; Zig lowers `@round` to
 //! `llvm.round.f32` and the GPU returns +0.0 for every input whose rounded
 //! value is a negative zero (949 of the driver's 4096 inputs). `@floor`,

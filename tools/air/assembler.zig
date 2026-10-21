@@ -1559,7 +1559,19 @@ const FunctionState = struct {
             try c.expect(",");
             const rhs = try f.operandOfType(c, lhs.typeOfWip(wip));
             if (lhs.typeOfWip(wip) != rhs.typeOfWip(wip)) return fail(c.line, c.s, "arithmetic operands have different types", error.Syntax);
-            try f.define(result orelse return fail(c.line, c.s, "arithmetic without result", error.Syntax), try wip.bin(tag, lhs, rhs, ""));
+            const res = result orelse return fail(c.line, c.s, "arithmetic without result", error.Syntax);
+            if (tag == .frem or tag == .@"frem fast") {
+                // Metal lowers frem as the fast fmod (docs/crosscheck.md,
+                // finding 5); Apple's own air.fmod is exact (intrinsics.zig).
+                var declarer = ModuleState.Declarer{ .m = f.m };
+                const value = intrinsics.lowerFrem(b, wip, &declarer, lhs, rhs, tag == .@"frem fast") catch |err| switch (err) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    error.Unsupported => return fail(c.line, c.s, "frem on a type without a float scalar (or air.fmod is declared with another type)", error.Unsupported),
+                };
+                try f.define(res, value);
+                return;
+            }
+            try f.define(res, try wip.bin(tag, lhs, rhs, ""));
             return;
         }
         if (std.mem.eql(u8, op, "fneg")) {
@@ -1969,7 +1981,24 @@ const FunctionState = struct {
                 if (result) |r| try f.define(r, value);
                 return;
             },
+            .round_keep_sign => {
+                if (args.items.len != 1) return fail(c.line, c.s, "llvm.round takes one operand", error.Syntax);
+                var declarer = ModuleState.Declarer{ .m = m };
+                const value = intrinsics.lowerRoundKeepSign(b, wip, &declarer, args.items[0]) catch |err| switch (err) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    error.Unsupported => return fail(c.line, c.s, "llvm.round on a type without a float scalar (or its copysign/trunc helper is declared with another type)", error.Unsupported),
+                };
+                if (result) |r| try f.define(r, value);
+                return;
+            },
             .rename => |rename| {
+                if (rename.zero_scale) {
+                    // `llvm.*mul.fix.sat(a, b, scale)`: madsat is the saturating
+                    // product with a zero addend, so only a zero scale maps to it.
+                    if (args.items.len != 3) return fail(c.line, c.s, "fixed-point saturating multiply takes three operands", error.Syntax);
+                    const scale = args.items[2];
+                    if (scale != try b.intValue(scale.typeOfWip(wip), 0)) return fail(c.line, c.s, "llvm.*mul.fix.sat with a non-zero scale has no Metal form (air.mad_sat is a plain saturating multiply)", error.Unsupported);
+                }
                 const new_ty = intrinsics.renamedFnType(b, rename, fn_ty) catch |err| switch (err) {
                     error.OutOfMemory => return error.OutOfMemory,
                     error.Unsupported => return fail(c.line, c.s, "intrinsic declaration has an unexpected shape", error.Unsupported),
@@ -4863,4 +4892,92 @@ test "fast math declared off: the compile options say fast_math_disable and noth
     try std.testing.expect(!has(texts[1], "fast_math_enable"));
     const normalised = try std.mem.replaceOwned(u8, gpa, texts[0], "fast_math_enable", "fast_math_disable");
     try std.testing.expectEqualStrings(texts[1], normalised);
+}
+
+test "workarounds: *mul.fix.sat with a zero scale becomes air.mad_sat, a non-zero scale is refused" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const gpa = arena.allocator();
+    const text = try testRoundTrip(gpa, test_header ++
+        \\declare i32 @llvm.smul.fix.sat.i32(i32, i32, i32)
+        \\declare i32 @llvm.umul.fix.sat.i32(i32, i32, i32)
+        \\
+        \\define float @fragmentShader(i32 %__0, i32 %__1) {
+        \\  %__3 = call i32 @llvm.smul.fix.sat.i32(i32 %__0, i32 %__1, i32 0)
+        \\  %__4 = call i32 @llvm.umul.fix.sat.i32(i32 %__0, i32 %__1, i32 0)
+        \\  %__5 = add i32 %__3, %__4
+        \\  %__6 = bitcast i32 %__5 to float
+        \\  ret float %__6
+        \\}
+        \\
+    );
+    try std.testing.expect(has(text, "@air.mad_sat.s.i32(i32 %0, i32 %1, i32 0)"));
+    try std.testing.expect(has(text, "@air.mad_sat.u.i32(i32 %0, i32 %1, i32 0)"));
+    try std.testing.expect(has(text, "declare i32 @air.mad_sat.s.i32(i32 %0, i32 %1, i32 %2)"));
+    // The unused llvm.* declarations are dropped with the calls.
+    try std.testing.expect(!has(text, "fix.sat"));
+    try testFailsAs(gpa, test_header ++
+        \\declare i32 @llvm.smul.fix.sat.i32(i32, i32, i32)
+        \\
+        \\define float @fragmentShader(i32 %__0, i32 %__1) {
+        \\  %__3 = call i32 @llvm.smul.fix.sat.i32(i32 %__0, i32 %__1, i32 4)
+        \\  %__4 = bitcast i32 %__3 to float
+        \\  ret float %__4
+        \\}
+        \\
+    , "fragmentShader", fragment_fm);
+}
+
+test "workarounds: frem calls air.fmod (air.fast_fmod under fast math) for scalars, half and vectors" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const gpa = arena.allocator();
+    const text = try testRoundTrip(gpa, test_header ++
+        \\define <4 x float> @fragmentShader(<4 x float> %__0, float %__1, half %__2) {
+        \\  %__4 = frem <4 x float> %__0, %__0
+        \\  %__5 = frem float %__1, %__1
+        \\  %__6 = frem fast float %__5, %__1
+        \\  %__7 = frem half %__2, %__2
+        \\  %__8 = fpext half %__7 to float
+        \\  %__9 = fadd float %__6, %__8
+        \\  %__10 = insertelement <4 x float> %__4, float %__9, i64 0
+        \\  ret <4 x float> %__10
+        \\}
+        \\
+    );
+    try std.testing.expect(has(text, "@air.fmod.v4f32(<4 x float> %0, <4 x float> %0)"));
+    try std.testing.expect(has(text, "@air.fmod.f32(float %1, float %1)"));
+    try std.testing.expect(has(text, "@air.fast_fmod.f32(float %"));
+    try std.testing.expect(has(text, "@air.fmod.f16(half %2, half %2)"));
+    // Half precision gets x's sign back (air.fmod.f16 loses the sign of a zero).
+    try std.testing.expect(has(text, "@llvm.copysign.f16(half %7, half %2)"));
+    try std.testing.expect(!has(text, "@llvm.copysign.f32"));
+    try std.testing.expect(has(text, "declare float @air.fmod.f32(float %0, float %1)"));
+    try std.testing.expect(!has(text, "frem"));
+}
+
+test "workarounds: llvm.round becomes trunc(x + copysign(0.5 - ulp, x)), scalar and vector" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const gpa = arena.allocator();
+    const text = try testRoundTrip(gpa, test_header ++
+        \\declare float @llvm.round.f32(float)
+        \\declare <4 x half> @llvm.round.v4f16(<4 x half>)
+        \\
+        \\define <4 x half> @fragmentShader(<4 x half> %__0, float %__1) {
+        \\  %__3 = call <4 x half> @llvm.round.v4f16(<4 x half> %__0)
+        \\  %__4 = call float @llvm.round.f32(float %__1)
+        \\  %__5 = fptrunc float %__4 to half
+        \\  %__6 = insertelement <4 x half> %__3, half %__5, i64 1
+        \\  ret <4 x half> %__6
+        \\}
+        \\
+    );
+    try std.testing.expect(has(text, "@llvm.copysign.v4f16(<4 x half> <half 0xH37FF, half 0xH37FF, half 0xH37FF, half 0xH37FF>, <4 x half> %0)"));
+    try std.testing.expect(has(text, "@llvm.copysign.f32(float 0x3FDFFFFFE0000000, float %1)"));
+    try std.testing.expect(has(text, "@llvm.trunc.v4f16(<4 x half> %"));
+    try std.testing.expect(has(text, "@llvm.trunc.f32(float %"));
+    try std.testing.expect(has(text, "fadd float %1, %"));
+    // Nothing names llvm.round any more: the unused declarations are dropped too.
+    try std.testing.expect(!has(text, "llvm.round"));
 }

@@ -31,9 +31,22 @@
 //!     it becomes splat + `lshr` by the lane index + `and 1` + `icmp ne 0`
 //!     on `<N x i32>`, all of which pass.
 //!   * Accepted unchanged: sqrt exp exp2 log log2 fabs floor ceil trunc
-//!     round rint fma fmuladd minnum maxnum copysign ctlz cttz ctpop bswap
-//!     bitreverse umin umax smin smax abs *.sat *.with.overflow assume trap
-//!     memcpy memset memmove (r11 finding 14).
+//!     rint fma fmuladd minnum maxnum copysign ctlz cttz ctpop bswap
+//!     bitreverse umin umax smin smax abs sadd/ssub/uadd/usub.sat
+//!     *.with.overflow assume trap memcpy memset memmove (r11 finding 14).
+//!   * Three GPU-compiler findings of the crosscheck bench (docs/crosscheck.md
+//!     "Findings") are worked around here, because Apple's own intrinsic for
+//!     the operation is right where the LLVM form is not. `llvm.smul.fix.sat`
+//!     / `llvm.umul.fix.sat` (Zig's `*|`) abort MTLCompilerService; with a
+//!     zero scale they are MSL's `madsat(a, b, 0)`, `air.mad_sat.s.<T>` /
+//!     `air.mad_sat.u.<T>` (a non-zero scale is refused). `llvm.round` returns
+//!     +0.0 for a -0.0 result (so does `air.round`), so it is expanded to
+//!     `trunc(x + copysign(0.5 - ulp, x))`, exact for every finite x
+//!     (lowerRoundKeepSign). The `frem` instruction is lowered by Metal as
+//!     the fast fmod (inexact, -inf for finite operands), so the assembler
+//!     calls `air.fmod.<T>` instead, which is exact (`air.fast_fmod.<T>` for
+//!     `frem fast`; lowerFrem), plus a copysign for half precision, where
+//!     `air.fmod.f16` itself returns +0.0 for an exact -0.0 remainder.
 //!   * `llvm.memcpy/memmove/memset.pX.pY` carry the operand address spaces
 //!     in their name; after constant relocation the suffix must be rewritten
 //!     to match (DESIGN.md D1).
@@ -55,6 +68,7 @@ const Allocator = std.mem.Allocator;
 const Builder = std.zig.llvm.Builder;
 const Type = Builder.Type;
 const Value = Builder.Value;
+const Constant = Builder.Constant;
 const WipFunction = Builder.WipFunction;
 
 pub const Error = error{ OutOfMemory, Unsupported };
@@ -67,6 +81,10 @@ pub const Rename = struct {
     name: []const u8,
     /// `llvm.powi`: the i32 exponent becomes the float type of the base.
     exponent_to_float: bool = false,
+    /// `llvm.*mul.fix.sat`: the third operand, the scale, must be the
+    /// constant 0 (madsat is the plain saturating product); the assembler
+    /// checks and refuses anything else.
+    zero_scale: bool = false,
 };
 
 pub const Lowering = union(enum) {
@@ -76,6 +94,9 @@ pub const Lowering = union(enum) {
     rename: Rename,
     /// Expand into a scalar chain.
     reduce: ReduceOp,
+    /// `llvm.round`: expand into the sign-keeping sequence of
+    /// `lowerRoundKeepSign`.
+    round_keep_sign,
     /// No accepted form exists: the assembler reports the line with this
     /// hint (error.Unsupported).
     refuse: []const u8,
@@ -124,8 +145,15 @@ pub fn classify(gpa: Allocator, name: []const u8) Allocator.Error!Lowering {
         if (std.meta.stringToEnum(ReduceOp, after[0..op_end])) |op| return .{ .reduce = op };
         return .{ .refuse = "this llvm.vector.reduce.* op has no scalar expansion here and every llvm.vector.reduce.* crashes Metal's compiler; reduce the lanes with extractelement + scalar ops" };
     }
+    inline for (.{ .{ "smul.fix.sat.", "air.mad_sat.s." }, .{ "umul.fix.sat.", "air.mad_sat.u." } }) |pair| {
+        if (std.mem.startsWith(u8, rest, pair[0])) {
+            const new_name = try std.mem.concat(gpa, u8, &.{ pair[1], rest[pair[0].len..] });
+            return .{ .rename = .{ .name = new_name, .zero_scale = true } };
+        }
+    }
     const op_end = std.mem.findScalar(u8, rest, '.') orelse return .pass;
     const op = rest[0..op_end];
+    if (std.mem.eql(u8, op, "round")) return .round_keep_sign;
     var suffix = rest[op_end + 1 ..];
     for (rename_rules) |rule| {
         if (!std.mem.eql(u8, rule.op, op)) continue;
@@ -186,6 +214,81 @@ fn allDigits(s: []const u8) bool {
     if (s.len == 0) return false;
     for (s) |ch| if (!std.ascii.isDigit(ch)) return false;
     return true;
+}
+
+/// Apple's type suffix for a scalar or vector type: `f32`, `v4f32`, `i32`.
+pub fn typeSuffix(b: *const Builder, ty: Type, buf: []u8) Error![]const u8 {
+    const scalar = ty.scalarType(b);
+    const base: []const u8 = switch (scalar) {
+        .half => "f16",
+        .float => "f32",
+        .double => "f64",
+        .i8 => "i8",
+        .i16 => "i16",
+        .i32 => "i32",
+        .i64 => "i64",
+        else => return error.Unsupported,
+    };
+    if (ty == scalar) return base;
+    if (!ty.isVector(b)) return error.Unsupported;
+    return std.mem.print(buf, "v{d}{s}", .{ ty.vectorLen(b), base }) catch return error.Unsupported;
+}
+
+/// `frem x, y` as a call to Apple's `air.fmod.<T>` (`air.fast_fmod.<T>` under
+/// fast math). Metal lowers the instruction itself as the fast fmod, which is
+/// inexact and returns -inf for finite operands (docs/crosscheck.md, finding
+/// 5), while MSL's own `fmod` is the exact remainder on every input in single
+/// precision. In half precision `air.fmod.f16` returns +0.0 where the
+/// remainder is an exact -0.0 (finding 7), so the result gets x's sign back
+/// through copysign: a remainder always has the sign of x.
+pub fn lowerFrem(b: *Builder, wip: *WipFunction, declarer: anytype, lhs: Value, rhs: Value, fast: bool) Error!Value {
+    const ty = lhs.typeOfWip(wip);
+    const scalar = ty.scalarType(b);
+    if (!scalar.isFloatingPoint()) return error.Unsupported;
+    var suffix_buf: [16]u8 = undefined;
+    const suffix = try typeSuffix(b, ty, &suffix_buf);
+    var name_buf: [32]u8 = undefined;
+    const name = std.mem.print(&name_buf, "air.{s}fmod.{s}", .{ if (fast) "fast_" else "", suffix }) catch unreachable;
+    const fn_ty = try b.fnType(ty, &.{ ty, ty }, .normal);
+    const callee = try declarer.declare(name, fn_ty);
+    const rem = try wip.call(.normal, .ccc, .none, fn_ty, callee, &.{ lhs, rhs }, "");
+    if (scalar != .half) return rem;
+    var copysign_buf: [32]u8 = undefined;
+    const copysign_name = std.mem.print(&copysign_buf, "llvm.copysign.{s}", .{suffix}) catch unreachable;
+    const copysign = try declarer.declare(copysign_name, fn_ty);
+    return wip.call(.normal, .ccc, .none, fn_ty, copysign, &.{ rem, lhs }, "");
+}
+
+/// `llvm.round(x)` as `trunc(x + copysign(c, x))` with c the largest float
+/// below 0.5 (0x3EFFFFFF for f32, 0xH37FF for f16, 0x3FDFFFFFFFFFFFFF for
+/// f64). With a correctly rounded addition this is round-half-away-from-zero
+/// for every finite x, and a zero result keeps x's sign, which Metal's
+/// `llvm.round` and `air.round` lose (docs/crosscheck.md, finding 4).
+/// `copysign(round(x), x)` would not do: Apple's optimizer folds it back to
+/// `round(x)`.
+pub fn lowerRoundKeepSign(b: *Builder, wip: *WipFunction, declarer: anytype, x: Value) Error!Value {
+    const ty = x.typeOfWip(wip);
+    const scalar = ty.scalarType(b);
+    const below_half: Constant = switch (scalar) {
+        .half => try b.halfConst(@bitCast(@as(u16, 0x37FF))),
+        .float => try b.floatConst(@bitCast(@as(u32, 0x3EFFFFFF))),
+        .double => try b.doubleConst(@bitCast(@as(u64, 0x3FDFFFFFFFFFFFFF))),
+        else => return error.Unsupported,
+    };
+    const c: Value = if (ty == scalar) below_half.toValue() else try b.splatValue(ty, below_half);
+    var suffix_buf: [16]u8 = undefined;
+    const suffix = try typeSuffix(b, ty, &suffix_buf);
+    var copysign_buf: [32]u8 = undefined;
+    const copysign_name = std.mem.print(&copysign_buf, "llvm.copysign.{s}", .{suffix}) catch unreachable;
+    var trunc_buf: [32]u8 = undefined;
+    const trunc_name = std.mem.print(&trunc_buf, "llvm.trunc.{s}", .{suffix}) catch unreachable;
+    const binary_ty = try b.fnType(ty, &.{ ty, ty }, .normal);
+    const unary_ty = try b.fnType(ty, &.{ty}, .normal);
+    const copysign = try declarer.declare(copysign_name, binary_ty);
+    const trunc = try declarer.declare(trunc_name, unary_ty);
+    const signed_half = try wip.call(.normal, .ccc, .none, binary_ty, copysign, &.{ c, x }, "");
+    const shifted = try wip.bin(.fadd, x, signed_half, "");
+    return wip.call(.normal, .ccc, .none, unary_ty, trunc, &.{shifted}, "");
 }
 
 /// Function type for a renamed intrinsic: identical to the `llvm.*`
@@ -454,7 +557,7 @@ test "rename table: every suffix, powi/ldexp suffix handling, pass-through" {
     }
     const untouched = [_][]const u8{
         "llvm.sqrt.f32",         "llvm.exp.f32",       "llvm.exp2.v4f32",             "llvm.log.f16",     "llvm.log2.f32",
-        "llvm.fabs.v3f32",       "llvm.floor.f32",     "llvm.ceil.f32",               "llvm.trunc.f32",   "llvm.round.f32",
+        "llvm.fabs.v3f32",       "llvm.floor.f32",     "llvm.ceil.f32",               "llvm.trunc.f32",   "llvm.rint.v4f32",
         "llvm.rint.f32",         "llvm.fma.v4f32",     "llvm.fmuladd.f32",            "llvm.minnum.f32",  "llvm.maxnum.v4f16",
         "llvm.copysign.f32",     "llvm.ctlz.i32",      "llvm.cttz.i32",               "llvm.ctpop.i32",   "llvm.bswap.i32",
         "llvm.bitreverse.i32",   "llvm.umin.i32",      "llvm.umax.i64",               "llvm.smin.i32",    "llvm.smax.i32",
@@ -690,4 +793,27 @@ test "int-to-bool-vector bitcast becomes splat + lshr + and + icmp on <N x i32>"
     // Wrong shapes are refused: float source, more than 32 lanes.
     try std.testing.expectError(error.Unsupported, testLower(gpa, intToBoolBody, @as(u32, 4), .{ .len = 4, .elem = .i1 }, &.{.{ .elem = .float }}));
     try std.testing.expectError(error.Unsupported, testLower(gpa, intToBoolBody, @as(u32, 64), .{ .len = 64, .elem = .i1 }, &.{.{ .elem = .i64 }}));
+}
+
+test "workarounds: *mul.fix.sat renames to air.mad_sat with the zero-scale requirement, round expands" {
+    const gpa = std.testing.allocator;
+    const s = try classify(gpa, "llvm.smul.fix.sat.i32");
+    defer s.deinit(gpa);
+    try std.testing.expectEqualStrings("air.mad_sat.s.i32", s.rename.name);
+    try std.testing.expect(s.rename.zero_scale);
+    const u = try classify(gpa, "llvm.umul.fix.sat.v4i32");
+    defer u.deinit(gpa);
+    try std.testing.expectEqualStrings("air.mad_sat.u.v4i32", u.rename.name);
+    try std.testing.expect(u.rename.zero_scale);
+    const r = try classify(gpa, "llvm.round.v4f16");
+    defer r.deinit(gpa);
+    try std.testing.expect(r == .round_keep_sign);
+    // Other renames carry no scale requirement; the non-saturating fixed-point
+    // multiply is not touched.
+    const p = try classify(gpa, "llvm.pow.f32");
+    defer p.deinit(gpa);
+    try std.testing.expect(!p.rename.zero_scale);
+    const plain = try classify(gpa, "llvm.smul.fix.i32");
+    defer plain.deinit(gpa);
+    try std.testing.expect(plain == .pass);
 }

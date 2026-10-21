@@ -1,4 +1,4 @@
-# Bug reports for Apple: six Metal compiler findings
+# Bug reports for Apple: seven Metal compiler findings
 
 Drafts for Feedback Assistant, one per finding of the crosscheck bench
 ([../crosscheck.md](../crosscheck.md#findings)). Each report is self-contained: the
@@ -15,6 +15,7 @@ the two `.ll` files, for the findings Metal Shading Language cannot express, are
 | 4 | [`round()` returns `+0.0` for `-0.0` results](04-round-negative-zero.md) | MSL `round`, `-fno-fast-math` | drafted |
 | 5 | [`frem` is compiled as the fast `fmod`](05-frem-inexact.md) | LLVM IR (`air.fmod.f32` from MSL is exact) | drafted |
 | 6 | [`fma` with two constant multiplicands is folded and flushed](06-fma-constant-product.md) | MSL `fma`, `-fno-fast-math` | drafted |
+| 7 | [`fmod` on `half` returns `+0.0` for a `-0.0` remainder](07-fmod-half-negative-zero.md) | MSL `fmod(half, half)`, `-fno-fast-math` | drafted |
 
 Fill in the feedback number (`FB…`) in the Status column once filed, and copy it to the
 findings table in `docs/crosscheck.md`.
@@ -46,11 +47,14 @@ against the GPU over 4,096 inputs by the bench; the counts "n of 4,096" refer to
 
 ## What the bench established beyond each report
 
-- All six persist when the library is assembled by Apple's `metal` from the same IR, and
+- The first six persist when the library is assembled by Apple's `metal` from the same IR, and
   with the library's `air.compile_options` declaring `fast_math_enable` or
   `fast_math_disable`; the compile-options flag changes nothing measured.
 - The unsigned `__builtin_uadd_overflow` / `__builtin_usub_overflow` are correct on all
   4,096 inputs; `llvm.smul.with.overflow.i32` is correct; `floor`, `ceil`, `trunc` keep the
   sign of zero.
 - MSL's `madsat(a, b, 0)` computes the saturating multiply correctly, and MSL's `fmod`
-  under `-fno-fast-math` is the exact remainder.
+  under `-fno-fast-math` is the exact remainder in single precision.
+- This project works around 1, 4, 5 and 7 in its own assembler (Apple's `madsat` and
+  `fmod` intrinsics, a sign-keeping expansion of `round`, a `copysign` after `fmod` on
+  half); the reports describe the compiler's behaviour, not the workarounds.

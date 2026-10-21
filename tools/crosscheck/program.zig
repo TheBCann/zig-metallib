@@ -92,10 +92,11 @@ pub const leaves = [_]Op{ .a, .b, .constant };
 pub const unary = [_]Op{ .bnot, .neg, .popcount, .clz, .ctz, .bswap, .bitrev, .abs, .t8s, .t8u, .t16s, .t16u };
 // Known findings are left out of the menus so new sweeps surface new problems
 // rather than rediscovering these (docs/crosscheck.md "Findings"; reproducers
-// in tools/crosscheck/known/): `.mul_sat` (`*|`) crashes Metal's compiler,
-// `.ov_add` / `.ov_sub` overflow bits come back wrong. Add them back here to
-// re-test, e.g. on a newer macOS.
-pub const binary_inline = [_]Op{ .add, .sub, .mul, .band, .bor, .bxor, .add_sat, .sub_sat, .min_s, .max_s };
+// in tools/crosscheck/known/): the `.ov_add` / `.ov_sub` overflow bits come
+// back wrong. `.mul_sat` (`*|`) crashed Metal's compiler until the assembler
+// learnt to call Apple's madsat for it (2026-10-20); it is in the menu again.
+// Add the others back here to re-test, e.g. on a newer macOS.
+pub const binary_inline = [_]Op{ .add, .sub, .mul, .band, .bor, .bxor, .add_sat, .sub_sat, .mul_sat, .min_s, .max_s };
 pub const binary_helper = [_]Op{ .shl, .ashr, .lshr, .div_trunc, .div_floor, .rem_s, .mod_s, .div_u, .rem_u, .min_u, .max_u, .ov_mul, .add8, .mul16, .mulhi_s, .mulhi_u, .avg64, .shl64hi };
 
 /// Constants that tend to expose codegen edge cases: identities, sign
@@ -277,6 +278,12 @@ pub const float_helpers =
     \\inline fn ftrunc(x: f32) f32 {
     \\    return @trunc(x);
     \\}
+    \\inline fn fround(x: f32) f32 {
+    \\    return @round(x);
+    \\}
+    \\inline fn frem(x: f32, y: f32) f32 {
+    \\    return ftz(@rem(x, y));
+    \\}
     \\
 ;
 
@@ -293,9 +300,9 @@ pub const Cmp = enum { eq, ne, lt, le, gt, ge };
 
 /// Float operators (docs/crosscheck-float-policy.md). Every one goes through
 /// a helper that flushes denormals, as the GPU does between operations.
-pub const FOp = enum { neg, abs, sqrt, floor, ceil, trunc, add, sub, mul, div, min, max };
-const funary = [_]FOp{ .neg, .abs, .sqrt, .floor, .ceil, .trunc };
-const fbinary = [_]FOp{ .add, .sub, .mul, .div, .min, .max };
+pub const FOp = enum { neg, abs, sqrt, floor, ceil, trunc, round, add, sub, mul, div, rem, min, max };
+const funary = [_]FOp{ .neg, .abs, .sqrt, .floor, .ceil, .trunc, .round };
+const fbinary = [_]FOp{ .add, .sub, .mul, .div, .rem, .min, .max };
 
 /// The static type of an expression node.
 pub const Ty = enum { int, float };
@@ -520,7 +527,7 @@ pub const Gen = struct {
         return set[g.r.uintLessThan(usize, set.len)];
     }
 
-    const binary_inline_known = binary_inline ++ [_]Op{.mul_sat};
+    const binary_inline_known = binary_inline;
     const binary_helper_known = binary_helper ++ [_]Op{ .ov_add, .ov_sub };
 
     pub fn pickInline(g: *Gen) Op {
@@ -866,6 +873,7 @@ pub const Printer = struct {
                     .floor => "ffloor",
                     .ceil => "fceil",
                     .trunc => "ftrunc",
+                    .round => "fround",
                     else => unreachable,
                 }});
                 try p.expr(n.x);
@@ -877,6 +885,7 @@ pub const Printer = struct {
                     .sub => "fsub",
                     .mul => "fmul",
                     .div => "fdiv",
+                    .rem => "frem",
                     .min => "fmin",
                     .max => "fmax",
                     else => unreachable,

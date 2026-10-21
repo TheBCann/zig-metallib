@@ -23,13 +23,14 @@ applies the rules of the next section inside the program.
 | `x * y + x` written separately | 1,429 differ | 6 differ | the GPU flushes the denormal intermediate product that the CPU keeps; a flush between the two operations models it, then all match. Not contraction: `x * (1 + 2^-23) - x`, which a fused multiply-add computes differently for nearly every x, matches on all 4,096 inputs |
 | `@sqrt` | 1,024 differ | **all match** | denormal inputs flushed (`sqrt(-denormal)` is NaN on the CPU, `-0.0` on the GPU) |
 | f16 `*`, `+`, `/`, `@sqrt` | 986 differ | **all match** | NaN payloads only: **f16 denormals are kept** |
+| f16 `@rem` | | 9 differ through Apple's front end | **finding:** `air.fmod.f16` (MSL `fmod` on half) returns `+0.0` for an exact `-0.0` remainder; the assembler's `frem` lowering adds a `copysign` for half, then all match |
 | `@floor`, `@ceil`, `@trunc` | | **all match** | |
-| `@round` | | 949 differ | **finding:** the GPU returns `+0.0` where the result is `-0.0` |
+| `@round` | | 949 differ | **finding:** the GPU returns `+0.0` where the result is `-0.0`; worked around in the assembler since 2026-10-20, now all match |
 | `@min`, `@max` | 369 differ | 58 differ, then **all match** | which zero is returned is unspecified by IEEE; canonicalising the zero sign after them fixes it |
 | comparisons and `if`/`else` | | **all match** | |
 | `i32 → f32`, `i16 → f32` | | **all match** | |
 | `f32 → i32` (clamped, NaN guarded) | | **all match** | |
-| `@rem` on f32 | | 1,067 differ | **finding:** not the exact remainder (0 for 1.02e-10, 8 for 6.91, `-inf` for finite operands) |
+| `@rem` on f32 | | 1,067 differ | **finding:** not the exact remainder (0 for 1.02e-10, 8 for 6.91, `-inf` for finite operands); worked around in the assembler since 2026-10-20, now all match |
 | `@exp` | 718 differ | | besides NaN/denormals, a 5-ulp difference in one sample |
 | `@sin` | 1,754 differ | | the GPU returns 0 for huge arguments (`sin(1.7e22)`) |
 | 4-lane vectors, lane-wise | | **all match** | with the flush between dependent operations |
@@ -75,11 +76,12 @@ of a hundred seeds mismatched, every one through a signalling NaN reaching `fmin
    would also stop a contraction, but Metal does not contract separate operations (above),
    so the fused multiply-add is covered only where the program asks for it, by `@mulAdd`.
 4. **Exact mode** (a difference is a finding): `+`, `-`, `*`, `/`, negation, `@abs`,
-   `@sqrt`, `@mulAdd`, `@floor`, `@ceil`, `@trunc`, `@min`, `@max`, comparisons feeding
+   `@sqrt`, `@mulAdd`, `@floor`, `@ceil`, `@trunc`, `@round` and `@rem` (through the
+   assembler's workarounds), `@min`, `@max`, comparisons feeding
    `if`/`else`, `i32 → f32`, guarded `f32 → i32`, `f32 ↔ f16` and f16 arithmetic, 2- and
    4-lane vectors lane-wise, and reductions written as explicit lane sums in a fixed order.
-5. **Not in exact mode:** `@round` and `@rem`/`@mod`, which are findings and would be
-   rediscovered on every seed; `exp`, `log`, `sin`, `cos`, `pow`, which are measured by a
+5. **Not in exact mode:** `@mod` on floats (Zig lowers it to `frem` plus sign fix-ups, not
+   yet probed); `exp`, `log`, `sin`, `cos`, `pow`, which are measured by a
    separate **precision survey** that reports the ulp distribution per operation over a
    bounded domain rather than passing or failing; `@setFloatMode(.optimized)`, which the
    generator never emits; f64, which Metal does not have.
@@ -110,7 +112,11 @@ of a hundred seeds mismatched, every one through a signalling NaN reaching `fmin
   multiplicands whose exact product is a denormal is folded and flushed, where the hardware
   fma keeps the intermediate (found by the review of the float-mode generator, which now
   always gives an fma an input-dependent multiplicand, since LLVM folds even a local that
-  only ever held constants). All persist through Apple's assembler.
+  only ever held constants). All persist through Apple's assembler. `@round` and `@rem`
+  are worked around in the assembler since 2026-10-20 (`trunc(x + copysign(0.5 - ulp, x))`
+  and a call to Apple's exact `air.fmod.f32`), and the generator emits them again. Probing
+  the `frem` workaround in half precision found a seventh finding: `air.fmod.f16` returns
+  `+0.0` for an exact `-0.0` remainder (the assembler adds a `copysign` for half).
 - **Through Apple's front end** (`zig build crosscheck-msl`, 2026-10-20): the Metal Shading
   Language twins of the reproducers, compiled with `xcrun metal -fno-fast-math`, reproduce
   the `@round` sign loss (`air.round.f32`, 949) and the fma fold (`air.fma.f32`, 223)
