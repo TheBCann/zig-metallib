@@ -39,6 +39,7 @@ xcrun metal-objdump -d zig-out/bin/default.metallib     # read our container bac
 zig build crosscheck -Dseed=7                          # random kernel: GPU vs CPU
 tools/crosscheck/sweep.sh 1 200                        # many seeds, each outcome sorted
 zig build reduce -Dseed=8                              # shrink a failing seed to a minimal program
+zig build crosscheck -Dseed=7 -Dcrosscheck-floats=true # the same with f32 arithmetic in the program
 ```
 
 Requires the Zig nightly **0.18.0-dev.253+16d31ceed** (pinned in `build.zig.zon`,

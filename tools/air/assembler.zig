@@ -815,6 +815,34 @@ const ModuleState = struct {
 
     // ── constants ───────────────────────────────────────────────────────
 
+    /// LLVM 22's special float values: `inf`, `nan`/`qnan`, `snan`, optionally
+    /// signed and, for NaNs, with a payload `(0x...)`, the mantissa without the
+    /// quiet bit (`-nan(0x3FFFFE)` is the f32 bit pattern 0xFFFFFFFE, `+qnan`
+    /// is 0x7FC00000). Null when `w` is an ordinary literal.
+    fn specialFloat(m: *ModuleState, c: *Cursor, w: []const u8, ty: Type) Error!?Constant {
+        const b = m.b;
+        var word = w;
+        var neg = false;
+        if (word.len > 0 and (word[0] == '-' or word[0] == '+')) {
+            neg = word[0] == '-';
+            word = word[1..];
+        }
+        const kind: enum { inf, nan, snan } = if (std.mem.eql(u8, word, "inf")) .inf else if (std.mem.eql(u8, word, "nan") or std.mem.eql(u8, word, "qnan")) .nan else if (std.mem.eql(u8, word, "snan")) .snan else return null;
+        var payload: u64 = 0;
+        if (kind != .inf and c.eat("(")) {
+            const h = c.word();
+            if (!std.mem.startsWith(u8, h, "0x")) return fail(c.line, c.s, "bad NaN payload", error.Syntax);
+            payload = std.fmt.parseInt(u64, h[2..], 16) catch return fail(c.line, c.s, "bad NaN payload", error.Syntax);
+            try c.expect(")");
+        }
+        const bits = specialFloatBits(ty, neg, kind == .inf, kind == .snan, payload) orelse return fail(c.line, c.s, "bad NaN payload for the type", error.Syntax);
+        return switch (ty) {
+            .float => try b.floatConst(@bitCast(@as(u32, @intCast(bits)))),
+            .half => try b.halfConst(@bitCast(@as(u16, @intCast(bits)))),
+            else => try b.doubleConst(@bitCast(bits)),
+        };
+    }
+
     fn parseConst(m: *ModuleState, c: *Cursor, ty: Type) Error!Constant {
         const b = m.b;
         c.skipWs();
@@ -885,6 +913,7 @@ const ModuleState = struct {
         if (w.len == 0) return fail(c.line, c.s, "expected a constant", error.Syntax);
 
         if (ty == .float or ty == .half or ty == .double) {
+            if (try m.specialFloat(c, w, ty)) |k| return k;
             const value = try parseFloatLiteral(w, c);
             return switch (ty) {
                 .float => b.floatConst(@floatCast(value)),
@@ -1025,6 +1054,22 @@ fn parseFloatLiteral(w: []const u8, c: *Cursor) Error!f64 {
         return @bitCast(bits);
     }
     return std.fmt.parseFloat(f64, w) catch fail(c.line, c.s, "bad float literal", error.Syntax);
+}
+
+/// The bit pattern of ±inf, a quiet NaN (`quiet` bit plus `payload`) or a
+/// signalling NaN (`payload` alone, at least 1) of the given float type.
+pub fn specialFloatBits(ty: Type, neg: bool, inf: bool, signalling: bool, payload: u64) ?u64 {
+    const exp: u64, const quiet: u64, const mant_bits: u6, const sign: u64 = switch (ty) {
+        .float => .{ 0x7f800000, 0x00400000, 23, 0x80000000 },
+        .half => .{ 0x7c00, 0x0200, 10, 0x8000 },
+        .double => .{ 0x7ff0000000000000, 0x0008000000000000, 52, 0x8000000000000000 },
+        else => return null,
+    };
+    if (payload >= quiet) return null;
+    var mant: u64 = 0;
+    if (!inf) mant = if (signalling) (if (payload == 0) 1 else payload) else quiet | payload;
+    _ = mant_bits;
+    return (if (neg) sign else 0) | exp | mant;
 }
 
 fn allDigits(s: []const u8) bool {
@@ -1722,6 +1767,63 @@ const FunctionState = struct {
     }
 
     /// `[tail|musttail|notail] call [fast-math] [cc] [ret attrs] RET [(fn type)] @callee(args) [bundle]`
+    /// `llvm.is.fpclass(x, mask)` as integer tests on x's bit pattern. Mask
+    /// bits (LLVM): 0 snan, 1 qnan, 2 -inf, 3 -normal, 4 -subnormal, 5 -zero,
+    /// 6 +zero, 7 +subnormal, 8 +normal, 9 +inf.
+    fn lowerIsFpClass(f: *FunctionState, x: Value, mask: u32, result: ?[]const u8, c: *Cursor) Error!void {
+        const b = f.m.b;
+        const wip = &f.wip;
+        const fty = x.typeOfWip(wip);
+        const int_ty: Type, const exp_mask: u64, const mant_mask: u64, const quiet: u64 = switch (fty) {
+            .float => .{ .i32, 0x7f800000, 0x007fffff, 0x00400000 },
+            .half => .{ .i16, 0x7c00, 0x03ff, 0x0200 },
+            else => return fail(c.line, c.s, "llvm.is.fpclass is lowered for float and half only", error.Unsupported),
+        };
+        const bits = try wip.cast(.bitcast, x, int_ty, "");
+        const zero = try b.intValue(int_ty, 0);
+        const exp = try wip.bin(.@"and", bits, try b.intValue(int_ty, exp_mask), "");
+        const mant = try wip.bin(.@"and", bits, try b.intValue(int_ty, mant_mask), "");
+        const neg = try wip.icmp(.slt, bits, zero, "");
+        const pos = try wip.icmp(.sge, bits, zero, "");
+        const exp_zero = try wip.icmp(.eq, exp, zero, "");
+        const exp_max = try wip.icmp(.eq, exp, try b.intValue(int_ty, exp_mask), "");
+        const exp_mid = try wip.bin(.@"and", try wip.icmp(.ne, exp, zero, ""), try wip.icmp(.ne, exp, try b.intValue(int_ty, exp_mask), ""), "");
+        const mant_zero = try wip.icmp(.eq, mant, zero, "");
+        const mant_nonzero = try wip.icmp(.ne, mant, zero, "");
+        const quiet_set = try wip.icmp(.ne, try wip.bin(.@"and", bits, try b.intValue(int_ty, quiet), ""), zero, "");
+        const quiet_clear = try wip.icmp(.eq, try wip.bin(.@"and", bits, try b.intValue(int_ty, quiet), ""), zero, "");
+        const is_nan = try wip.bin(.@"and", exp_max, mant_nonzero, "");
+        // Sign-less class tests, then the signed pairs.
+        const snan = try wip.bin(.@"and", is_nan, quiet_clear, "");
+        const qnan = try wip.bin(.@"and", exp_max, quiet_set, "");
+        const inf = try wip.bin(.@"and", exp_max, mant_zero, "");
+        const normal = exp_mid;
+        const subnormal = try wip.bin(.@"and", exp_zero, mant_nonzero, "");
+        const zero_v = try wip.bin(.@"and", exp_zero, mant_zero, "");
+        var acc = try b.intValue(.i1, 0);
+        const Pair = struct { lo: u5, hi: u5, pred: Value };
+        const pairs = [_]Pair{
+            .{ .lo = 2, .hi = 9, .pred = inf },
+            .{ .lo = 3, .hi = 8, .pred = normal },
+            .{ .lo = 4, .hi = 7, .pred = subnormal },
+            .{ .lo = 5, .hi = 6, .pred = zero_v },
+        };
+        if (mask & 1 != 0) acc = try wip.bin(.@"or", acc, snan, "");
+        if (mask & 2 != 0) acc = try wip.bin(.@"or", acc, qnan, "");
+        for (pairs) |p| {
+            const has_neg = mask & (@as(u32, 1) << p.lo) != 0;
+            const has_pos = mask & (@as(u32, 1) << p.hi) != 0;
+            if (has_neg and has_pos) {
+                acc = try wip.bin(.@"or", acc, p.pred, "");
+            } else if (has_neg) {
+                acc = try wip.bin(.@"or", acc, try wip.bin(.@"and", p.pred, neg, ""), "");
+            } else if (has_pos) {
+                acc = try wip.bin(.@"or", acc, try wip.bin(.@"and", p.pred, pos, ""), "");
+            }
+        }
+        try f.define(result orelse return fail(c.line, c.s, "is.fpclass without result", error.Syntax), acc);
+    }
+
     fn lowerCall(f: *FunctionState, c: *Cursor, op: []const u8, result: ?[]const u8) Error!void {
         const m = f.m;
         const b = m.b;
@@ -1771,6 +1873,19 @@ const FunctionState = struct {
         }
         if (std.mem.eql(u8, callee_name, "llvm.ctpop.i4")) {
             return fail(c.line, c.s, "llvm.ctpop.i4 crashes Metal's compiler; zext the bool vector to <N x i32> and add the lanes instead", error.Unsupported);
+        }
+        // `llvm.is.fpclass.<ty>(x, mask)`: no AIR form; exact integer tests on
+        // the bit pattern instead (LLVM 22 emits it for `fabs(x) < FLT_MIN`).
+        if (std.mem.startsWith(u8, callee_name, "llvm.is.fpclass.")) {
+            try c.expect("(");
+            const x = try f.operand(c);
+            try c.expect(",");
+            c.skipWs();
+            _ = c.word(); // i32
+            const mask = try c.int(u32);
+            c.skipWs();
+            try c.expect(")");
+            return f.lowerIsFpClass(x, mask, result, c);
         }
         const info = try m.calleeInfo(callee_name, c);
         var fn_ty = info.fn_ty;
@@ -2237,8 +2352,17 @@ const Cursor = struct {
     i: usize = 0,
     line: usize,
 
+    /// Spaces, tabs, and `/* ... */` comments (LLVM 22 annotates an
+    /// `llvm.is.fpclass` mask with one: `/* (nan inf norm) */ i32 783`).
     fn skipWs(c: *Cursor) void {
-        while (c.i < c.s.len and (c.s[c.i] == ' ' or c.s[c.i] == '\t')) c.i += 1;
+        while (c.i < c.s.len) {
+            if (c.s[c.i] == ' ' or c.s[c.i] == '\t') {
+                c.i += 1;
+            } else if (std.mem.startsWith(u8, c.s[c.i..], "/*")) {
+                const close = std.mem.indexOfPos(u8, c.s, c.i + 2, "*/") orelse c.s.len - 2;
+                c.i = close + 2;
+            } else break;
+        }
     }
 
     fn rest(c: *Cursor) []const u8 {
@@ -4458,6 +4582,59 @@ test "D1 retry: a select derived from the phi selected against the table" {
         \\}
         \\
     );
+}
+
+test "llvm.is.fpclass is lowered to bit tests; its inline mask comment is skipped" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const gpa = arena.allocator();
+    // 783 = nan|inf|normal (both signs): "not zero and not subnormal", what
+    // LLVM 22 makes of `fabs(x) < FLT_MIN`. 0x60 = both zeros; 0x4 = -inf only.
+    const text = try testRoundTrip(gpa, test_header ++
+        \\define float @fragmentShader(float %__0) {
+        \\  %__2 = tail call i1 @llvm.is.fpclass.f32(float %__0, /* (nan inf norm) */ i32 783)
+        \\  %__3 = tail call i1 @llvm.is.fpclass.f32(float %__0, i32 96)
+        \\  %__4 = call i1 @llvm.is.fpclass.f32(float %__0, i32 4)
+        \\  %__5 = or i1 %__2, %__3
+        \\  %__6 = or i1 %__5, %__4
+        \\  %__7 = select i1 %__6, float %__0, float 0.000000e+00
+        \\  ret float %__7
+        \\}
+        \\
+        \\declare i1 @llvm.is.fpclass.f32(float, i32 immarg)
+        \\
+    );
+    try std.testing.expect(!has(text, "is.fpclass"));
+    try std.testing.expect(has(text, "bitcast float %") and has(text, "icmp eq i32 %") and has(text, "icmp slt i32 %"));
+}
+
+test "special float values: inf, nan, snan with payloads, as LLVM 22 prints them" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const gpa = arena.allocator();
+    try std.testing.expectEqual(@as(?u64, 0xFFFFFFFE), specialFloatBits(.float, true, false, false, 0x3FFFFE));
+    try std.testing.expectEqual(@as(?u64, 0x7F800000), specialFloatBits(.float, false, true, false, 0));
+    try std.testing.expectEqual(@as(?u64, 0x7F800001), specialFloatBits(.float, false, false, true, 0));
+    try std.testing.expectEqual(@as(?u64, 0x7FC00000), specialFloatBits(.float, false, false, false, 0));
+    try std.testing.expectEqual(@as(?u64, 0xFE00), specialFloatBits(.half, true, false, false, 0));
+    try std.testing.expectEqual(@as(?u64, null), specialFloatBits(.float, false, false, false, 0x400000));
+    // The constants are built with the exact bit pattern; the Builder prints
+    // them as doubles with the whole mantissa shifted, quiet bit included:
+    // -nan(0x3FFFFE) is 0xFFFFFFFFC0000000, +qnan 0x7FF8000000000000.
+    const text = try testRoundTrip(gpa, test_header ++
+        \\define float @fragmentShader(float %__0, i1 %__1) {
+        \\  %__3 = select i1 %__1, float -nan(0x3FFFFE), float %__0
+        \\  %__4 = fadd float %__3, inf
+        \\  %__5 = fadd float %__4, -inf
+        \\  %__6 = select i1 %__1, float snan, float +qnan
+        \\  %__7 = fadd float %__5, %__6
+        \\  ret float %__7
+        \\}
+        \\
+    );
+    try std.testing.expect(has(text, "0xFFFFFFFFC0000000"));
+    try std.testing.expect(has(text, "0x7FF0000000000000") and has(text, "0xFFF0000000000000"));
+    try std.testing.expect(has(text, "0x7FF8000000000000") and has(text, "0x7FF0000020000000"));
 }
 
 test "float literals in LLVM 22's f0x bit-pattern form are parsed by width" {

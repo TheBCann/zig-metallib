@@ -1319,8 +1319,28 @@ fn replaceToken(gpa: Allocator, s: []const u8, from: []const u8, to: []const u8)
 fn rewriteFloatLiterals(gpa: Allocator, src: []const u8) Error![]u8 {
     var out: List = .empty;
     var i: usize = 0;
+    var line_start: usize = 0;
     while (i < src.len) {
         const at_boundary = i == 0 or !isIdentChar(src[i - 1]);
+        // `/* ... */`: LLVM 22 annotates an is.fpclass mask with one; Apple's
+        // reader knows only `;` comments.
+        if (std.mem.startsWith(u8, src[i..], "/*")) {
+            const close = std.mem.indexOfPos(u8, src, i + 2, "*/") orelse src.len - 2;
+            i = close + 2;
+            if (i < src.len and src[i] == ' ') i += 1;
+            continue;
+        }
+        // `float -nan(0x3FFFFE)`, `fadd half %x, +qnan`, `double snan`: LLVM
+        // 22's special values, to the legacy hex spelling for their type: the
+        // type word just before them, or else the operand type earlier on the
+        // line (`fadd half %8, -nan`).
+        if (at_boundary) {
+            if (try rewriteSpecialFloat(gpa, &out, src, i, line_start)) |next| {
+                i = next;
+                continue;
+            }
+        }
+        if (src[i] == '\n') line_start = i + 1;
         if (at_boundary and std.mem.startsWith(u8, src[i..], "f0x")) {
             var j = i + 3;
             while (j < src.len and std.ascii.isHex(src[j])) j += 1;
@@ -1333,8 +1353,7 @@ fn rewriteFloatLiterals(gpa: Allocator, src: []const u8) Error![]u8 {
                 },
                 8 => blk: {
                     const bits = std.fmt.parseInt(u32, hex, 16) catch break :blk false;
-                    const wide: f64 = @floatCast(@as(f32, @bitCast(bits)));
-                    try out.print(gpa, "0x{X:0>16}", .{@as(u64, @bitCast(wide))});
+                    try out.print(gpa, "0x{X:0>16}", .{widenF32Bits(bits)});
                     break :blk true;
                 },
                 16 => blk: {
@@ -1353,6 +1372,91 @@ fn rewriteFloatLiterals(gpa: Allocator, src: []const u8) Error![]u8 {
         i += 1;
     }
     return out.toOwnedSlice(gpa);
+}
+
+/// An f32 bit pattern as the f64 bit pattern of the same value, exactly: the
+/// hardware conversion would quiet a signalling NaN, so NaNs are widened by
+/// shifting the mantissa (the legacy float spelling is a double that converts
+/// back without loss, which this does).
+fn widenF32Bits(bits: u32) u64 {
+    const sign: u64 = @as(u64, bits >> 31) << 63;
+    const exp: u64 = (bits >> 23) & 0xff;
+    const mant: u64 = bits & 0x7fffff;
+    if (exp == 0xff) return sign | 0x7ff0000000000000 | (mant << 29);
+    const wide: f64 = @floatCast(@as(f32, @bitCast(bits)));
+    return @bitCast(wide);
+}
+
+/// At `i`, a special float value, LLVM 22 style, with its type either written
+/// just before it (`float -nan(0x3FFFFE)`) or earlier on the line as the
+/// instruction's operand type (`fadd half %8, -nan`): writes it (and the type
+/// word when it was adjacent) to `out` in the legacy hex spelling and returns
+/// the index after the literal; null when the text there is something else.
+fn rewriteSpecialFloat(gpa: Allocator, out: *List, src: []const u8, i: usize, line_start: usize) Error!?usize {
+    const types = [_][]const u8{ "float", "half", "double" };
+    var ty: []const u8 = "";
+    var j = i;
+    for (types) |t| if (std.mem.startsWith(u8, src[i..], t) and i + t.len < src.len and src[i + t.len] == ' ') {
+        ty = t;
+        j = i + t.len + 1;
+    };
+    // A value name (`%inf`, `@nan`) or a metadata string is not a literal.
+    if (ty.len == 0 and i > 0 and (src[i - 1] == '%' or src[i - 1] == '@' or src[i - 1] == '!' or src[i - 1] == '"' or src[i - 1] == '.')) return null;
+    var neg = false;
+    if (j < src.len and (src[j] == '-' or src[j] == '+')) {
+        neg = src[j] == '-';
+        j += 1;
+    }
+    const kinds = [_][]const u8{ "snan", "qnan", "nan", "inf" };
+    var kind: []const u8 = "";
+    for (kinds) |k| if (std.mem.startsWith(u8, src[j..], k) and (j + k.len == src.len or !isIdentChar(src[j + k.len]))) {
+        kind = k;
+        break;
+    };
+    if (kind.len == 0) return null;
+    j += kind.len;
+    var payload: u64 = 0;
+    if (j < src.len and src[j] == '(') {
+        const close = std.mem.indexOfScalarPos(u8, src, j, ')') orelse return null;
+        const inner = src[j + 1 .. close];
+        if (!std.mem.startsWith(u8, inner, "0x")) return null;
+        payload = std.fmt.parseInt(u64, inner[2..], 16) catch return null;
+        j = close + 1;
+    }
+    if (ty.len == 0) {
+        // The operand type: the last float type word earlier on this line.
+        const line = src[line_start..i];
+        var best: usize = 0;
+        for (types) |t| {
+            var pos: usize = 0;
+            while (std.mem.indexOfPos(u8, line, pos, t)) |p| {
+                pos = p + 1;
+                const before_ok = p == 0 or !isIdentChar(line[p - 1]);
+                const after_ok = p + t.len == line.len or !isIdentChar(line[p + t.len]);
+                if (before_ok and after_ok and p + 1 > best) {
+                    best = p + 1;
+                    ty = t;
+                }
+            }
+        }
+        if (ty.len == 0) return null;
+    } else {
+        try out.appendSlice(gpa, ty);
+        try out.append(gpa, ' ');
+    }
+    const is_inf = std.mem.eql(u8, kind, "inf");
+    const signalling = std.mem.eql(u8, kind, "snan");
+    if (std.mem.eql(u8, ty, "half")) {
+        const bits = assembler.specialFloatBits(.half, neg, is_inf, signalling, payload) orelse return null;
+        try out.print(gpa, "0xH{X:0>4}", .{bits});
+    } else if (std.mem.eql(u8, ty, "float")) {
+        const bits = assembler.specialFloatBits(.float, neg, is_inf, signalling, payload) orelse return null;
+        try out.print(gpa, "0x{X:0>16}", .{widenF32Bits(@intCast(bits))});
+    } else {
+        const bits = assembler.specialFloatBits(.double, neg, is_inf, signalling, payload) orelse return null;
+        try out.print(gpa, "0x{X:0>16}", .{bits});
+    }
+    return j;
 }
 
 fn replaceAll(gpa: Allocator, s: []const u8, from: []const u8, to: []const u8) Error![]u8 {
@@ -1760,6 +1864,45 @@ test "D4 float literals: LLVM 22's f0x spellings become the legacy forms Apple's
     try std.testing.expect(find(out, "fadd float %__4, 0xC1E0000000000000") != null);
     try std.testing.expect(find(out, "fadd half %__6, 0xH3C00") != null);
     try std.testing.expect(find(out, "[float 0x3810000000000000, float 1.000000e+00]") != null);
+    inline for (metadata.function_metadata) |fm| {
+        if (comptime std.mem.eql(u8, fm.name, "countKernel")) {
+            const bc = try assembler.assemble(gpa, out, .{ .entry = fm.name, .fm = fm }, target.default);
+            try std.testing.expectEqualStrings("BC\xC0\xDE", bc[0..4]);
+        }
+    }
+}
+
+test "D4 float literals: LLVM 22's special values and mask comments become legacy spellings" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const gpa = arena.allocator();
+    const input =
+        \\define ptx_kernel void @countKernel(ptr addrspace(1) %0, ptr addrspace(1) %1, i32 %2) {
+        \\  %4 = load float, ptr addrspace(1) %0, align 4
+        \\  %5 = icmp eq i32 %2, 0
+        \\  %6 = select i1 %5, float -nan(0x3FFFFE), float %4
+        \\  %13 = select i1 %5, float +qnan, float %6
+        \\  %7 = fadd float %13, inf
+        \\  %8 = fptrunc float %7 to half
+        \\  %9 = fadd half %8, -nan
+        \\  %10 = fpext half %9 to float
+        \\  %11 = tail call i1 @llvm.is.fpclass.f32(float %10, /* (nan inf norm) */ i32 783)
+        \\  %12 = select i1 %11, float %10, float snan(0x1)
+        \\  store float %12, ptr addrspace(1) %1, align 4
+        \\  ret void
+        \\}
+        \\
+        \\declare i1 @llvm.is.fpclass.f32(float, i32 immarg)
+        \\
+    ;
+    const out = try convertWith(gpa, input, .{ .require_all_entries = false });
+    try std.testing.expect(find(out, "nan") == null and find(out, " inf") == null and find(out, "/*") == null);
+    try std.testing.expect(find(out, "float 0xFFFFFFFFC0000000, float %__4") != null);
+    try std.testing.expect(find(out, "fadd float %__13, 0x7FF0000000000000") != null);
+    try std.testing.expect(find(out, "float 0x7FF8000000000000, float %__6") != null);
+    try std.testing.expect(find(out, "fadd half %__8, 0xHFE00") != null);
+    try std.testing.expect(find(out, "float 0x7FF0000020000000") != null); // snan(0x1): mantissa 1 << 29
+    try std.testing.expect(find(out, "@llvm.is.fpclass.f32(float %__10, i32 783)") != null);
     inline for (metadata.function_metadata) |fm| {
         if (comptime std.mem.eql(u8, fm.name, "countKernel")) {
             const bc = try assembler.assemble(gpa, out, .{ .entry = fm.name, .fm = fm }, target.default);

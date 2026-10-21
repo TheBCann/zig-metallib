@@ -160,6 +160,9 @@ pub fn build(b: *std.Build) void {
     const crosscheck_body_file = b.option([]const u8, "crosscheck-body", "Use this body file instead of generating one from -Dseed");
     // Re-test the recorded findings, or give the reducer something to shrink.
     const crosscheck_known = b.option(bool, "crosscheck-known", "Generator also emits the operations recorded as findings (docs/crosscheck.md)") orelse false;
+    // Float mode (docs/crosscheck-float-policy.md): float subtrees in the
+    // generated programs and float edge values in the driver's inputs.
+    const crosscheck_floats = b.option(bool, "crosscheck-floats", "Generator also emits f32 subtrees; the driver adds float edge inputs") orelse false;
 
     const crosscheck_gen = b.addExecutable(.{
         .name = "crosscheck-gen",
@@ -173,6 +176,7 @@ pub fn build(b: *std.Build) void {
         const run_crosscheck_gen = b.addRunArtifact(crosscheck_gen);
         run_crosscheck_gen.addArg(b.fmt("--seed={d}", .{crosscheck_seed}));
         if (crosscheck_known) run_crosscheck_gen.addArg("--include-known-findings");
+        if (crosscheck_floats) run_crosscheck_gen.addArg("--floats");
         break :blk run_crosscheck_gen.addOutputFileArg2("crosscheck_body.zig", .{});
     };
 
@@ -239,8 +243,10 @@ pub fn build(b: *std.Build) void {
     // the body is hand-written, and the Apple step below must name itself.
     const crosscheck_body_opt: []const u8 = if (crosscheck_body_file) |path| b.fmt(" -Dcrosscheck-body={s}", .{path}) else "";
     const crosscheck_known_opt: []const u8 = if (crosscheck_known) " -Dcrosscheck-known=true" else "";
+    const crosscheck_floats_opt: []const u8 = if (crosscheck_floats) " -Dcrosscheck-floats=true" else "";
+    if (crosscheck_floats) run_crosscheck.addArg("--floats");
     if (crosscheck_body_file) |path| run_crosscheck.addArg(b.fmt("--body={s}", .{path}));
-    run_crosscheck.addArg(b.fmt("--reproduce=zig build crosscheck -Dseed={d}{s}{s}", .{ crosscheck_seed, crosscheck_known_opt, crosscheck_body_opt }));
+    run_crosscheck.addArg(b.fmt("--reproduce=zig build crosscheck -Dseed={d}{s}{s}{s}", .{ crosscheck_seed, crosscheck_known_opt, crosscheck_floats_opt, crosscheck_body_opt }));
     run_crosscheck.addFileArg(crosscheck_metallib);
     b.step("crosscheck", "Differential test: one generated kernel on the GPU vs the CPU (-Dseed=N)").dependOn(&run_crosscheck.step);
 
@@ -260,7 +266,8 @@ pub fn build(b: *std.Build) void {
     const run_crosscheck_apple = b.addRunArtifact(crosscheck_driver);
     run_crosscheck_apple.addArg(b.fmt("--seed={d}", .{crosscheck_seed}));
     if (crosscheck_body_file) |path| run_crosscheck_apple.addArg(b.fmt("--body={s}", .{path}));
-    run_crosscheck_apple.addArg(b.fmt("--reproduce=zig build crosscheck-apple -Dseed={d}{s}{s}", .{ crosscheck_seed, crosscheck_known_opt, crosscheck_body_opt }));
+    if (crosscheck_floats) run_crosscheck_apple.addArg("--floats");
+    run_crosscheck_apple.addArg(b.fmt("--reproduce=zig build crosscheck-apple -Dseed={d}{s}{s}{s}", .{ crosscheck_seed, crosscheck_known_opt, crosscheck_floats_opt, crosscheck_body_opt }));
     run_crosscheck_apple.addFileArg(crosscheck_apple_metallib);
     b.step("crosscheck-apple", "The crosscheck kernel with the library built by Apple's assembler from our IR (attribution)").dependOn(&run_crosscheck_apple.step);
 
@@ -278,6 +285,7 @@ pub fn build(b: *std.Build) void {
     const run_reduce = b.addRunArtifact(crosscheck_reduce);
     run_reduce.addArg(b.fmt("--seed={d}", .{crosscheck_seed}));
     if (crosscheck_known) run_reduce.addArg("--include-known-findings");
+    if (crosscheck_floats) run_reduce.addArg("--floats");
     run_reduce.addPrefixedDirectoryArg("--repo=", b.path("."));
     run_reduce.addArg(b.fmt("--zig={s}", .{b.graph.zig_exe}));
     run_reduce.addArg("--out=zig-out/crosscheck/reduce");

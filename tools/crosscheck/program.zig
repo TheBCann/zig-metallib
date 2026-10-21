@@ -205,6 +205,81 @@ pub const helpers =
     \\
 ;
 
+/// Appended only when the program has float nodes, so integer programs keep
+/// their exact text.
+pub const float_helpers =
+    \\// Floats (docs/crosscheck-float-policy.md): the GPU flushes single-precision
+    \\// denormals on input and output and canonicalises NaNs, so every float
+    \\// value is flushed here too (a no-op on the GPU), which also keeps a
+    \\// multiply and an add from being contracted, and NaNs leave as one bit
+    \\// pattern. The flush tests the exponent bits rather than comparing, so
+    \\// LLVM does not turn it into llvm.is.fpclass. Inputs are quieted: Metal's
+    \\// min/max treat a signalling NaN as quiet (return the other operand),
+    \\// the CPU returns NaN. IEEE leaves the zero returned by min/max
+    \\// unspecified: + 0.0 turns -0.0 into +0.0 and changes nothing else.
+    \\inline fn ftz(x: f32) f32 {
+    \\    const b: u32 = @bitCast(x);
+    \\    return if ((b & 0x7f800000) == 0) @bitCast(b & 0x80000000) else x;
+    \\}
+    \\inline fn fc(b: u32) f32 {
+    \\    return @bitCast(b);
+    \\}
+    \\inline fn fin(x: i32) f32 {
+    \\    const v: f32 = @bitCast(x);
+    \\    return if (v != v) fc(0x7fc00000) else ftz(v);
+    \\}
+    \\inline fn bits(x: f32) i32 {
+    \\    return if (x != x) 0x7fc00000 else @bitCast(x);
+    \\}
+    \\inline fn toInt(x: f32) i32 {
+    \\    if (x != x) return 0;
+    \\    return @intFromFloat(@min(@max(x, -2147483648.0), 2147483520.0));
+    \\}
+    \\inline fn fromInt(x: i32) f32 {
+    \\    return ftz(@floatFromInt(x));
+    \\}
+    \\inline fn fadd(x: f32, y: f32) f32 {
+    \\    return ftz(x + y);
+    \\}
+    \\inline fn fsub(x: f32, y: f32) f32 {
+    \\    return ftz(x - y);
+    \\}
+    \\inline fn fmul(x: f32, y: f32) f32 {
+    \\    return ftz(x * y);
+    \\}
+    \\inline fn fdiv(x: f32, y: f32) f32 {
+    \\    return ftz(x / y);
+    \\}
+    \\inline fn fmin(x: f32, y: f32) f32 {
+    \\    return @min(x, y) + 0.0;
+    \\}
+    \\inline fn fmax(x: f32, y: f32) f32 {
+    \\    return @max(x, y) + 0.0;
+    \\}
+    \\inline fn ffma(x: f32, y: f32, z: f32) f32 {
+    \\    return ftz(@mulAdd(f32, x, y, z));
+    \\}
+    \\inline fn fneg(x: f32) f32 {
+    \\    return -x;
+    \\}
+    \\inline fn fabs(x: f32) f32 {
+    \\    return @abs(x);
+    \\}
+    \\inline fn fsqrt(x: f32) f32 {
+    \\    return ftz(@sqrt(x));
+    \\}
+    \\inline fn ffloor(x: f32) f32 {
+    \\    return @floor(x);
+    \\}
+    \\inline fn fceil(x: f32) f32 {
+    \\    return @ceil(x);
+    \\}
+    \\inline fn ftrunc(x: f32) f32 {
+    \\    return @trunc(x);
+    \\}
+    \\
+;
+
 // ── Syntax tree ──────────────────────────────────────────────────────────────
 // The generator builds a tree first and prints it afterwards, so the post-passes
 // (every local assigned and read; which inputs were used) can walk it, and so a
@@ -215,6 +290,24 @@ pub const max_vars = 4;
 pub const max_depth = 3;
 
 pub const Cmp = enum { eq, ne, lt, le, gt, ge };
+
+/// Float operators (docs/crosscheck-float-policy.md). Every one goes through
+/// a helper that flushes denormals, which is also the contraction barrier.
+pub const FOp = enum { neg, abs, sqrt, floor, ceil, trunc, add, sub, mul, div, min, max };
+const funary = [_]FOp{ .neg, .abs, .sqrt, .floor, .ceil, .trunc };
+const fbinary = [_]FOp{ .add, .sub, .mul, .div, .min, .max };
+
+/// The static type of an expression node.
+pub const Ty = enum { int, float };
+
+/// Float constants as bit patterns, printed exactly: zeros of both signs,
+/// small integers, 0.5, 0.1, 1/3, FLT_MIN, FLT_MAX, infinity, 2^24 (where
+/// integers stop being exact) and the conversion limits.
+const fconsts = [_]u32{
+    0x00000000, 0x80000000, 0x3f800000, 0xbf800000, 0x3f000000, 0x40000000,
+    0x40400000, 0x3dcccccd, 0x3eaaaaab, 0x00800000, 0x7f7fffff, 0x7f800000,
+    0x4b800000, 0x4f000000, 0xcf000000, 0x41200000,
+};
 pub const cmps = [_]Cmp{ .eq, .ne, .lt, .le, .gt, .ge };
 
 pub const Expr = union(enum) {
@@ -225,12 +318,35 @@ pub const Expr = union(enum) {
     un: struct { op: Op, x: *Expr },
     bin: struct { op: Op, x: *Expr, y: *Expr },
     select: struct { c: *Cond, x: *Expr, y: *Expr },
+    // Floats (docs/crosscheck-float-policy.md). Inputs and locals carry float
+    // values as i32 bit patterns: a float subtree starts from `fin` (bits ->
+    // flushed f32) or `fromint`, and ends in `fbits` (canonical bits) or
+    // `ftoi` (guarded conversion). `fconst` holds the bit pattern.
+    fin: *Expr,
+    fconst: u32,
+    fun: struct { op: FOp, x: *Expr },
+    fbin: struct { op: FOp, x: *Expr, y: *Expr },
+    ffma: struct { x: *Expr, y: *Expr, z: *Expr },
+    fsel: struct { c: *Cond, x: *Expr, y: *Expr },
+    fromint: *Expr,
+    fbits: *Expr,
+    ftoi: *Expr,
 };
+
+pub fn exprType(e: *const Expr) Ty {
+    return switch (e.*) {
+        .a, .b, .v, .constant, .un, .bin, .select, .fbits, .ftoi => .int,
+        .fin, .fconst, .fun, .fbin, .ffma, .fsel, .fromint => .float,
+    };
+}
 
 pub const Cond = struct {
     cmp: Cmp,
     /// Compare the operands as u32 (through the `u` helper).
     unsigned: bool,
+    /// The operands are float expressions, compared as f32 (IEEE: every
+    /// comparison with a NaN is false except `!=`).
+    float: bool = false,
     x: *Expr,
     y: *Expr,
     /// An optional second comparison joined by `and` / `or`.
@@ -270,6 +386,8 @@ pub const Usage = struct {
     b: bool = false,
     assigned: [max_vars]bool = @splat(false),
     read: [max_vars]bool = @splat(false),
+    /// Any float node: the printer then includes the float helpers.
+    floats: bool = false,
 
     pub fn expr(u: *Usage, e: *const Expr) void {
         switch (e.*) {
@@ -286,6 +404,31 @@ pub const Usage = struct {
                 u.cond(n.c);
                 u.expr(n.x);
                 u.expr(n.y);
+            },
+            .fsel => |n| {
+                u.cond(n.c);
+                u.expr(n.x);
+                u.expr(n.y);
+            },
+            .fin, .fromint, .fbits, .ftoi => |x| {
+                u.floats = true;
+                u.expr(x);
+            },
+            .fconst => u.floats = true,
+            .fun => |n| {
+                u.floats = true;
+                u.expr(n.x);
+            },
+            .fbin => |n| {
+                u.floats = true;
+                u.expr(n.x);
+                u.expr(n.y);
+            },
+            .ffma => |n| {
+                u.floats = true;
+                u.expr(n.x);
+                u.expr(n.y);
+                u.expr(n.z);
             },
         }
     }
@@ -347,6 +490,10 @@ pub const Gen = struct {
     /// Also emit the operations recorded as findings (docs/crosscheck.md), to
     /// re-test them or to give the reducer a failing program to shrink.
     include_known: bool = false,
+    /// Also emit float subtrees (docs/crosscheck-float-policy.md). Off, the
+    /// random draws are exactly those of the integer generator, so every
+    /// integer seed keeps its program.
+    floats: bool = false,
 
     pub fn pick(g: *Gen, comptime set: []const Op) Op {
         return set[g.r.uintLessThan(usize, set.len)];
@@ -361,6 +508,55 @@ pub const Gen = struct {
 
     pub fn pickHelper(g: *Gen) Op {
         return if (g.include_known) g.pick(&binary_helper_known) else g.pick(&binary_helper);
+    }
+
+    fn pickF(g: *Gen, comptime set: []const FOp) FOp {
+        return set[g.r.uintLessThan(usize, set.len)];
+    }
+
+    /// A float leaf: an input or local reinterpreted as a flushed f32, or (when
+    /// a comptime-known value is allowed) a constant.
+    fn fleaf(g: *Gen, rt: bool) anyerror!*Expr {
+        if (!rt and g.r.uintLessThan(u8, 3) == 0) return g.new(.{ .fconst = fconsts[g.r.uintLessThan(usize, fconsts.len)] });
+        const e = try g.leaf(true);
+        return g.new(.{ .fin = e });
+    }
+
+    /// A float expression. `rt` as for `expr`.
+    fn fexpr(g: *Gen, depth: u32, rt: bool) anyerror!*Expr {
+        if (depth == 0 or g.expr_budget == 0) return g.fleaf(rt);
+        g.expr_budget -= 1;
+        const d = depth - 1;
+        switch (g.r.uintLessThan(u8, 20)) {
+            0...3 => return g.fleaf(rt),
+            4...7 => {
+                const op = g.pickF(&funary);
+                const x = try g.fexpr(d, rt);
+                return g.new(.{ .fun = .{ .op = op, .x = x } });
+            },
+            8...13 => {
+                const op = g.pickF(&fbinary);
+                const x = try g.fexpr(d, rt);
+                const y = try g.fexpr(d, rt);
+                return g.new(.{ .fbin = .{ .op = op, .x = x, .y = y } });
+            },
+            14, 15 => {
+                const x = try g.fexpr(d, rt);
+                const y = try g.fexpr(d, rt);
+                const z = try g.fexpr(d, rt);
+                return g.new(.{ .ffma = .{ .x = x, .y = y, .z = z } });
+            },
+            16, 17 => {
+                const c = try g.cond(d -| 1, true);
+                const x = try g.fexpr(d, rt);
+                const y = try g.fexpr(d, rt);
+                return g.new(.{ .fsel = .{ .c = c, .x = x, .y = y } });
+            },
+            else => {
+                const e = try g.expr(d, rt);
+                return g.new(.{ .fromint = e });
+            },
+        }
     }
 
     pub fn new(g: *Gen, e: Expr) !*Expr {
@@ -385,6 +581,13 @@ pub const Gen = struct {
         if (depth == 0 or g.expr_budget == 0) return g.leaf(rt);
         g.expr_budget -= 1;
         const d = depth - 1;
+        // A float subtree, back to an integer as canonical bits or a guarded
+        // conversion. Only draws when floats are on, so integer seeds are
+        // unchanged.
+        if (g.floats and g.r.uintLessThan(u8, 10) < 3) {
+            const fe = try g.fexpr(d, rt);
+            return g.new(if (g.r.boolean()) .{ .fbits = fe } else .{ .ftoi = fe });
+        }
         // Operands are generated into locals first: the order of the random
         // draws must not depend on how a struct literal is evaluated.
         switch (g.r.uintLessThan(u8, 20)) {
@@ -417,12 +620,14 @@ pub const Gen = struct {
     /// One comparison, signed or unsigned, both operands runtime-known;
     /// `allow_rest` may add a second one joined by `and` / `or`.
     pub fn cond(g: *Gen, depth: u32, allow_rest: bool) anyerror!*Cond {
-        const x = try g.expr(depth, true);
-        const y = try g.expr(depth, true);
+        const float = g.floats and g.r.boolean();
+        const x = if (float) try g.fexpr(depth, true) else try g.expr(depth, true);
+        const y = if (float) try g.fexpr(depth, true) else try g.expr(depth, true);
         const c = try g.gpa.create(Cond);
         c.* = .{
             .cmp = cmps[g.r.uintLessThan(usize, cmps.len)],
-            .unsigned = g.r.boolean(),
+            .unsigned = if (float) false else g.r.boolean(),
+            .float = float,
             .x = x,
             .y = y,
         };
@@ -618,16 +823,77 @@ pub const Printer = struct {
                     try w.writeAll(")");
                 },
             },
-            .select => |n| {
-                try w.writeAll("(if ");
-                try p.cond(n.c);
-                try w.writeAll(" ");
+            .select => |n| try p.selectLike(n.c, n.x, n.y),
+            .fsel => |n| try p.selectLike(n.c, n.x, n.y),
+            .fin => |x| {
+                try w.writeAll("fin(");
+                try p.expr(x);
+                try w.writeAll(")");
+            },
+            .fconst => |bits| try w.print("fc(0x{X:0>8})", .{bits}),
+            .fun => |n| {
+                try w.print("{s}(", .{switch (n.op) {
+                    .neg => "fneg",
+                    .abs => "fabs",
+                    .sqrt => "fsqrt",
+                    .floor => "ffloor",
+                    .ceil => "fceil",
+                    .trunc => "ftrunc",
+                    else => unreachable,
+                }});
                 try p.expr(n.x);
-                try w.writeAll(" else ");
+                try w.writeAll(")");
+            },
+            .fbin => |n| {
+                try w.print("{s}(", .{switch (n.op) {
+                    .add => "fadd",
+                    .sub => "fsub",
+                    .mul => "fmul",
+                    .div => "fdiv",
+                    .min => "fmin",
+                    .max => "fmax",
+                    else => unreachable,
+                }});
+                try p.expr(n.x);
+                try w.writeAll(", ");
                 try p.expr(n.y);
                 try w.writeAll(")");
             },
+            .ffma => |n| {
+                try w.writeAll("ffma(");
+                try p.expr(n.x);
+                try w.writeAll(", ");
+                try p.expr(n.y);
+                try w.writeAll(", ");
+                try p.expr(n.z);
+                try w.writeAll(")");
+            },
+            .fromint => |x| {
+                try w.writeAll("fromInt(");
+                try p.expr(x);
+                try w.writeAll(")");
+            },
+            .fbits => |x| {
+                try w.writeAll("bits(");
+                try p.expr(x);
+                try w.writeAll(")");
+            },
+            .ftoi => |x| {
+                try w.writeAll("toInt(");
+                try p.expr(x);
+                try w.writeAll(")");
+            },
         }
+    }
+
+    fn selectLike(p: *Printer, c: *const Cond, x: *const Expr, y: *const Expr) anyerror!void {
+        try p.w.writeAll("(if ");
+        try p.cond(c);
+        try p.w.writeAll(" ");
+        try p.expr(x);
+        try p.w.writeAll(" else ");
+        try p.expr(y);
+        try p.w.writeAll(")");
     }
 
     pub fn cmp(p: *Printer, c: *const Cond) anyerror!void {
@@ -639,14 +905,17 @@ pub const Printer = struct {
             .gt => ">",
             .ge => ">=",
         };
+        // Float operands compare as f32 as they are; integer operands as i32
+        // or, through `u`, as u32.
+        const wrap = c.unsigned and !c.float;
         try p.w.writeAll("(");
-        if (c.unsigned) try p.w.writeAll("u(");
+        if (wrap) try p.w.writeAll("u(");
         try p.expr(c.x);
-        if (c.unsigned) try p.w.writeAll(")");
+        if (wrap) try p.w.writeAll(")");
         try p.w.print(" {s} ", .{sym});
-        if (c.unsigned) try p.w.writeAll("u(");
+        if (wrap) try p.w.writeAll("u(");
         try p.expr(c.y);
-        if (c.unsigned) try p.w.writeAll(")");
+        if (wrap) try p.w.writeAll(")");
         try p.w.writeAll(")");
     }
 
@@ -795,6 +1064,7 @@ pub fn countStmts(list: []const Stmt) u32 {
 
 pub const Options = struct {
     include_known: bool = false,
+    floats: bool = false,
 };
 
 /// The program a seed denotes. Everything about it, including the number of
@@ -811,6 +1081,7 @@ pub fn generate(gpa: std.mem.Allocator, seed: u64, opts: Options) !Program {
         .expr_budget = 80,
         .stmt_budget = 40,
         .include_known = opts.include_known,
+        .floats = opts.floats,
     };
     return g.program();
 }
@@ -823,6 +1094,7 @@ pub fn render(gpa: std.mem.Allocator, prog: *const Program, header: []const u8) 
     var w: std.Io.Writer.Allocating = .init(gpa);
     try w.writer.writeAll(header);
     try w.writer.writeAll(helpers);
+    if (usage.floats) try w.writer.writeAll(float_helpers);
     try w.writer.writeAll("\n");
     var printer: Printer = .{ .w = &w.writer };
     try printer.program(prog, usage);
@@ -831,10 +1103,15 @@ pub fn render(gpa: std.mem.Allocator, prog: *const Program, header: []const u8) 
 
 fn exprNodes(e: *const Expr) u32 {
     return switch (e.*) {
-        .a, .b, .v, .constant => 1,
+        .a, .b, .v, .constant, .fconst => 1,
         .un => |n| 1 + exprNodes(n.x),
+        .fun => |n| 1 + exprNodes(n.x),
         .bin => |n| 1 + exprNodes(n.x) + exprNodes(n.y),
+        .fbin => |n| 1 + exprNodes(n.x) + exprNodes(n.y),
+        .ffma => |n| 1 + exprNodes(n.x) + exprNodes(n.y) + exprNodes(n.z),
         .select => |n| 1 + condNodes(n.c) + exprNodes(n.x) + exprNodes(n.y),
+        .fsel => |n| 1 + condNodes(n.c) + exprNodes(n.x) + exprNodes(n.y),
+        .fin, .fromint, .fbits, .ftoi => |x| 1 + exprNodes(x),
     };
 }
 

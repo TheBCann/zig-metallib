@@ -20,7 +20,7 @@
 //! not fail at all, 2 on bad usage.
 //!
 //! Usage: crosscheck-reduce --seed=<u64> --repo=<dir> --zig=<zig exe> --out=<dir>
-//!        [--include-known-findings] [--max-candidates=<n>]
+//!        [--include-known-findings] [--floats] [--max-candidates=<n>]
 
 const std = @import("std");
 const program = @import("program.zig");
@@ -118,6 +118,9 @@ const PipelineJudge = struct {
     repo: []const u8,
     candidate_path: []const u8,
     cache_dir: []const u8,
+    /// Extra `zig build` options every candidate run needs, e.g. the float
+    /// mode's driver inputs (`-Dcrosscheck-floats=true`).
+    build_args: []const []const u8,
     target: Signature,
     runs: u32 = 0,
 
@@ -130,8 +133,11 @@ const PipelineJudge = struct {
     fn evaluate(j: *PipelineJudge, text: []const u8) !Signature {
         try Io.Dir.cwd().writeFile(j.io, .{ .sub_path = j.candidate_path, .data = text });
         const body_arg = try std.mem.concat(j.gpa, u8, &.{ "-Dcrosscheck-body=", j.candidate_path });
+        var argv: std.ArrayList([]const u8) = .empty;
+        try argv.appendSlice(j.gpa, &.{ j.zig_exe, "build", "--cache-dir", j.cache_dir, "crosscheck", body_arg });
+        try argv.appendSlice(j.gpa, j.build_args);
         const result = try std.process.run(j.gpa, j.io, .{
-            .argv = &.{ j.zig_exe, "build", "--cache-dir", j.cache_dir, "crosscheck", body_arg },
+            .argv = argv.items,
             .cwd = .{ .path = j.repo },
         });
         j.runs += 1;
@@ -458,25 +464,45 @@ pub const Engine = struct {
                 v.* = @intCast(@as(i16, v.*) + delta);
             },
             .un => |n| e.renumberExpr(n.x, at, delta),
+            .fun => |n| e.renumberExpr(n.x, at, delta),
             .bin => |n| {
                 e.renumberExpr(n.x, at, delta);
                 e.renumberExpr(n.y, at, delta);
+            },
+            .fbin => |n| {
+                e.renumberExpr(n.x, at, delta);
+                e.renumberExpr(n.y, at, delta);
+            },
+            .ffma => |n| {
+                e.renumberExpr(n.x, at, delta);
+                e.renumberExpr(n.y, at, delta);
+                e.renumberExpr(n.z, at, delta);
             },
             .select => |n| {
                 e.renumberCond(n.c, at, delta);
                 e.renumberExpr(n.x, at, delta);
                 e.renumberExpr(n.y, at, delta);
             },
+            .fsel => |n| {
+                e.renumberCond(n.c, at, delta);
+                e.renumberExpr(n.x, at, delta);
+                e.renumberExpr(n.y, at, delta);
+            },
+            .fin, .fromint, .fbits, .ftoi => |inner| e.renumberExpr(inner, at, delta),
             else => {},
         }
     }
 
+    /// Drop the second comparison, or keep only the second comparison.
     fn simplifyCond(e: *Engine, c: *Cond) !bool {
-        if (c.rest == null) return false;
-        const old = c.rest;
+        const rest = c.rest orelse return false;
         c.rest = null;
         if (try e.accept("dropped a second comparison")) return true;
-        c.rest = old;
+        c.rest = rest;
+        const saved = c.*;
+        c.* = rest.c.*;
+        if (try e.accept("kept only the second comparison")) return true;
+        c.* = saved;
         return false;
     }
 
@@ -510,6 +536,35 @@ pub const Engine = struct {
                 try e.collectChildren(n.x, rt, out);
                 try out.append(e.gpa, .{ .p = &n.y, .rt = rt });
                 try e.collectChildren(n.y, rt, out);
+            },
+            .fun => |*n| {
+                try out.append(e.gpa, .{ .p = &n.x, .rt = rt });
+                try e.collectChildren(n.x, rt, out);
+            },
+            .fbin => |*n| {
+                try out.append(e.gpa, .{ .p = &n.x, .rt = rt });
+                try e.collectChildren(n.x, rt, out);
+                try out.append(e.gpa, .{ .p = &n.y, .rt = rt });
+                try e.collectChildren(n.y, rt, out);
+            },
+            .ffma => |*n| {
+                try out.append(e.gpa, .{ .p = &n.x, .rt = rt });
+                try e.collectChildren(n.x, rt, out);
+                try out.append(e.gpa, .{ .p = &n.y, .rt = rt });
+                try e.collectChildren(n.y, rt, out);
+                try out.append(e.gpa, .{ .p = &n.z, .rt = rt });
+                try e.collectChildren(n.z, rt, out);
+            },
+            .fsel => |*n| {
+                try e.collectCond(n.c, out);
+                try out.append(e.gpa, .{ .p = &n.x, .rt = rt });
+                try e.collectChildren(n.x, rt, out);
+                try out.append(e.gpa, .{ .p = &n.y, .rt = rt });
+                try e.collectChildren(n.y, rt, out);
+            },
+            .fin, .fromint, .fbits, .ftoi => |*inner| {
+                try out.append(e.gpa, .{ .p = inner, .rt = rt });
+                try e.collectChildren(inner.*, rt, out);
             },
             else => {},
         }
@@ -571,16 +626,27 @@ pub const Engine = struct {
             if (k >= slots.items.len) break;
             const slot = slots.items[k];
             const old = slot.p.*;
+            const ty = program.exprType(old);
             // A leaf is as small as an expression gets. The only leaf-to-leaf
-            // change allowed is towards `a`, the smallest leaf: it frees locals
-            // for passLocals, and because it is one-way it cannot go on forever.
-            const is_leaf = switch (old.*) {
+            // change allowed is towards `a` (for floats, `fin(a)`), the
+            // smallest leaf: it frees locals for passLocals, and because it is
+            // one-way it cannot go on forever.
+            const int_leaf = switch (old.*) {
                 .a, .b, .v, .constant => true,
                 else => false,
             };
-            var candidates: [6]?*Expr = .{ null, null, null, null, null, null };
-            if (is_leaf) {
-                if (old.* != .a) candidates[0] = try e.leaf(.a);
+            const float_leaf = switch (old.*) {
+                .fconst => true,
+                .fin => |x| switch (x.*) {
+                    .a, .b, .v, .constant => true,
+                    else => false,
+                },
+                else => false,
+            };
+            var candidates: [7]?*Expr = .{ null, null, null, null, null, null, null };
+            if (int_leaf or float_leaf) {
+                if (int_leaf and old.* != .a) candidates[0] = try e.leaf(.a);
+                if (old.* == .fin and old.fin.* != .a) candidates[0] = try e.leaf(.{ .fin = try e.leaf(.a) });
                 for (candidates) |maybe| {
                     const cand = maybe orelse continue;
                     slot.p.* = cand;
@@ -593,6 +659,8 @@ pub const Engine = struct {
                 k += 1;
                 continue;
             }
+            // Children of the slot's own type first (a bridge like fbits or
+            // fin has a child of the other type, which cannot replace it).
             switch (old.*) {
                 .un => |n| candidates[0] = n.x,
                 .bin => |n| {
@@ -603,13 +671,39 @@ pub const Engine = struct {
                     candidates[0] = n.x;
                     candidates[1] = n.y;
                 },
+                .fun => |n| candidates[0] = n.x,
+                .fbin => |n| {
+                    candidates[0] = n.x;
+                    candidates[1] = n.y;
+                },
+                .ffma => |n| {
+                    candidates[0] = n.x;
+                    candidates[1] = n.y;
+                    candidates[2] = n.z;
+                },
+                .fsel => |n| {
+                    candidates[0] = n.x;
+                    candidates[1] = n.y;
+                },
                 else => {},
             }
-            candidates[2] = try e.leaf(.a);
-            candidates[3] = try e.leaf(.b);
-            if (!slot.rt) {
-                candidates[4] = try e.leaf(.{ .constant = 0 });
-                candidates[5] = try e.leaf(.{ .constant = 1 });
+            switch (ty) {
+                .int => {
+                    candidates[3] = try e.leaf(.a);
+                    candidates[4] = try e.leaf(.b);
+                    if (!slot.rt) {
+                        candidates[5] = try e.leaf(.{ .constant = 0 });
+                        candidates[6] = try e.leaf(.{ .constant = 1 });
+                    }
+                },
+                .float => {
+                    candidates[3] = try e.leaf(.{ .fin = try e.leaf(.a) });
+                    candidates[4] = try e.leaf(.{ .fin = try e.leaf(.b) });
+                    if (!slot.rt) {
+                        candidates[5] = try e.leaf(.{ .fconst = 0 });
+                        candidates[6] = try e.leaf(.{ .fconst = 0x3f800000 });
+                    }
+                },
             }
             for (candidates) |maybe| {
                 const cand = maybe orelse continue;
@@ -638,6 +732,7 @@ pub fn main(init: std.process.Init) !void {
     var zig_exe: []const u8 = "zig";
     var out_dir: ?[]const u8 = null;
     var include_known = false;
+    var floats = false;
     var max_candidates: u32 = 3000;
     for (args[1..]) |arg| {
         if (std.mem.startsWith(u8, arg, "--seed=")) {
@@ -652,6 +747,8 @@ pub fn main(init: std.process.Init) !void {
             max_candidates = std.fmt.parseInt(u32, arg["--max-candidates=".len..], 10) catch max_candidates;
         } else if (std.mem.eql(u8, arg, "--include-known-findings")) {
             include_known = true;
+        } else if (std.mem.eql(u8, arg, "--floats")) {
+            floats = true;
         } else {
             std.debug.print("crosscheck-reduce: unknown argument '{s}'\n", .{arg});
             std.process.exit(2);
@@ -668,8 +765,9 @@ pub fn main(init: std.process.Init) !void {
     const dir = try std.fmt.allocPrint(arena, "{s}/{d}", .{ out_root, sd });
     try Io.Dir.cwd().createDirPath(io, dir);
 
-    var prog = try program.generate(arena, sd, .{ .include_known = include_known });
-    const known_note: []const u8 = if (include_known) " -Dcrosscheck-known=true" else "";
+    var prog = try program.generate(arena, sd, .{ .include_known = include_known, .floats = floats });
+    const known_note: []const u8 = if (include_known and floats) " -Dcrosscheck-known=true -Dcrosscheck-floats=true" else if (include_known) " -Dcrosscheck-known=true" else if (floats) " -Dcrosscheck-floats=true" else "";
+    const build_args: []const []const u8 = if (floats) &.{"-Dcrosscheck-floats=true"} else &.{};
     const original_header = try std.fmt.allocPrint(arena,
         \\// The program of `zig build crosscheck -Dseed={d}{s}`, as crosscheck-reduce
         \\// started from it.
@@ -690,6 +788,7 @@ pub fn main(init: std.process.Init) !void {
         .repo = repo_path,
         .candidate_path = try std.fmt.allocPrint(arena, "{s}/candidate.zig", .{dir}),
         .cache_dir = try std.fmt.allocPrint(arena, "{s}/cache", .{dir}),
+        .build_args = build_args,
         .target = .{ .bucket = .match, .key = "" },
     };
     defer Io.Dir.cwd().deleteTree(io, judge.cache_dir) catch {};
@@ -810,6 +909,36 @@ test "the engine shrinks a program to a few nodes that keep a textual property" 
         const decl = try std.fmt.allocPrint(gpa, "const v{d}: i32 = ", .{i});
         try std.testing.expect(std.mem.indexOf(u8, reduced, decl) != null);
     };
+}
+
+test "the engine shrinks a float program, keeping types consistent" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const gpa = arena.allocator();
+    var seed: u64 = 1;
+    var prog: Program = undefined;
+    while (true) : (seed += 1) {
+        prog = try program.generate(gpa, seed, .{ .floats = true });
+        const text = try program.render(gpa, &prog, "pub const seed: u64 = 0;\n\n");
+        if (std.mem.indexOf(u8, bodyOf(text), "fsqrt(") != null) break;
+    }
+    var prop: TextProperty = .{ .needle = "fsqrt(" };
+    var engine: Engine = .{
+        .gpa = gpa,
+        .judge = .{ .ctx = @ptrCast(&prop), .func = TextProperty.judge },
+        .prog = &prog,
+        .seed = seed,
+        .max_candidates = 100_000,
+        .verbose = false,
+    };
+    try engine.run();
+    const reduced = try program.render(gpa, &prog, "pub const seed: u64 = 0;\n\n");
+    try std.testing.expect(std.mem.indexOf(u8, bodyOf(reduced), "fsqrt(") != null);
+    // Smallest under the engine's moves: one fsqrt(fin(a)) kept alive by a
+    // bits/toInt bridge or a single comparison, a leaf result, no locals.
+    try std.testing.expect(program.countStmts(prog.stmts) <= 1);
+    try std.testing.expect(program.countNodes(&prog) <= 6);
+    try std.testing.expectEqual(@as(u8, 0), prog.nvars);
 }
 
 test "hoisting a loop body out of its loop drops break and continue, nested loops keep theirs" {

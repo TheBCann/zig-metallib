@@ -15,6 +15,8 @@ zig build crosscheck -Dseed=7              # one generated kernel, GPU vs CPU
 tools/crosscheck/sweep.sh 1 200            # a range of seeds, each outcome sorted
 zig build crosscheck -Dcrosscheck-body=path/to/body.zig   # a hand-written body
 zig build crosscheck-apple -Dcrosscheck-body=path/to/body.zig   # same kernel, library built by Apple's assembler
+zig build crosscheck -Dseed=7 -Dcrosscheck-floats=true          # float mode (docs/crosscheck-float-policy.md)
+CROSSCHECK_ARGS="-Dcrosscheck-floats=true" tools/crosscheck/sweep.sh 1 200
 ```
 
 `sweep.sh` runs under macOS's stock `/bin/bash` (3.2). Every seed lands in one bucket:
@@ -150,6 +152,14 @@ silently diverging. The driver's `info` line shows `cpu-build debug` to prove it
 Operations with a known finding (below) are left out of the generator so new sweeps
 surface new problems. `tools/crosscheck/gen.zig` says where to add them back.
 
+**Float mode** (`-Dcrosscheck-floats=true`) adds f32 subtrees to the programs, following
+[docs/crosscheck-float-policy.md](crosscheck-float-policy.md): inputs and locals carry
+float values as bit patterns; a float subtree starts from a flushed bit-cast or an integer
+conversion and ends in canonical bits or a guarded conversion; every operation goes
+through a flushing helper, which is also the contraction barrier. The driver's edge inputs
+gain float bit patterns, and the reducer handles float programs. Float mode is opt-in so
+that every integer seed keeps its program.
+
 ## Findings
 
 Found on an Apple M3, macOS 26.3, with Zig 0.18.0-dev.253. Each has a one-line reproducer
@@ -221,13 +231,17 @@ zig build crosscheck -Dcrosscheck-body=tools/crosscheck/regress/pointer_phi_sele
 The review harness is saved as `.claude/workflows/crosscheck-review.js`; from Claude Code,
 `/crosscheck-review` runs it again after changes to the bench or the splice.
 
-**Float literals (fixed 2026-10-20).** LLVM 22 prints a float constant that does not
+**LLVM 22 spellings (fixed 2026-10-20).** LLVM 22 prints a float constant that does not
 round-trip through decimal as `f0x` plus the bit pattern of its own type (`float
-f0xCF000000`). Apple's LLVM-15-era reader rejects that spelling and so did this assembler,
-so any shader with such a constant was refused; the sample shader only escaped because its
-constants print in decimal. The assembler now parses the form, and the splice rewrites it
-to the legacy spelling (`0xC1E0000000000000`, `0xH3C00`) in the text it hands to Apple's
-assembler, which then accepts it (verified through `crosscheck-apple`).
+f0xCF000000`), prints NaN and infinity constants as special values (`+qnan`,
+`-nan(0x3FFFFE)`, `snan`, `inf`), and emits `llvm.is.fpclass` with an inline `/* ... */`
+comment for `fabs(x) < FLT_MIN`. Apple's LLVM-15-era reader knows none of these, and
+neither did this assembler, so shaders with such constants were refused; the sample shader
+only escaped because its constants print in decimal. The assembler now parses all of them
+and lowers `is.fpclass` to integer bit tests, and the splice rewrites the constants to the
+legacy spellings (`0xC1E0000000000000`, `0xH3C00`, `0xFFFFFFFFC0000000`) and drops the
+comments in the text it hands to Apple's assembler, which then accepts it (verified
+through `crosscheck-apple`, including a float-mode program).
 
 ## What has been verified
 
@@ -263,6 +277,12 @@ On an Apple M3 (macOS 26.3, Zig 0.18.0-dev.253):
   to fail to compile) are valid, free of undefined behaviour and terminating under Debug
   safety; the six run and match on the GPU; a fresh 100-seed sweep is 100 match; the
   default library is byte-identical; 96 unit tests.
+- **Float mode**: 200 float-mode programs valid, free of undefined behaviour and
+  terminating under Debug safety; integer seeds byte-identical over 300 seeds. The first
+  float sweep gave 90 match, 8 `MISMATCH` (all the signalling-NaN difference in
+  `fmin`/`fmax`, now normalised) and 2 `REFUSED` (LLVM 22 spellings, now parsed); after
+  those changes a fresh 100-seed float sweep is 100 match, a float program passes through
+  `crosscheck-apple`, the default library is byte-identical and 114 unit tests pass.
 - The default build is untouched: `default.metallib` is byte-identical with and without
   the bench.
 

@@ -9,7 +9,7 @@
 //! usage. The seed is reported so a finding can be reproduced with
 //! `zig build crosscheck -Dseed=<N>`.
 //!
-//! Usage: crosscheck-driver --seed=<u64> [--body=<file>] [--reproduce=<command>] <crosscheck.metallib>
+//! Usage: crosscheck-driver --seed=<u64> [--body=<file>] [--reproduce=<command>] [--floats] <crosscheck.metallib>
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -45,12 +45,22 @@ const edges = [_]i32{
     @bitCast(@as(u32, 0xffff0000)), 0x40000000,           -0x40000000,                    0x7f,
 };
 
-fn fillInputs(r: std.Random, buf: []i32) void {
+/// With `--floats`: the integer edges plus float bit patterns (both signs of
+/// zero, ±1, 0.5, 0.1, ±inf, quiet and signalling NaN, FLT_MIN, FLT_MAX, the
+/// largest denormal, 2^24 and the f32 -> i32 conversion limits).
+const float_edges = edges ++ [_]i32{
+    0x3f800000, @bitCast(@as(u32, 0xbf800000)), 0x3f000000,                     0x3dcccccd,
+    0x7f800000, @bitCast(@as(u32, 0xff800000)), 0x7fc00000,                     0x7f800001,
+    0x00800000, 0x7f7fffff,                     0x007fffff,                     0x4b800000,
+    0x4b7fffff, 0x4f000000,                     @bitCast(@as(u32, 0xcf000000)), 0x40400000,
+};
+
+fn fillInputs(r: std.Random, buf: []i32, edge_list: []const i32) void {
     for (buf) |*v| {
         // ~40% edge values, the rest uniform random, so edge/edge, edge/random
         // and random/random pairs all occur.
         v.* = if (r.uintLessThan(u8, 10) < 4)
-            edges[r.uintLessThan(usize, edges.len)]
+            edge_list[r.uintLessThan(usize, edge_list.len)]
         else
             r.int(i32);
     }
@@ -89,6 +99,8 @@ pub fn main(init: std.process.Init) !void {
     var body_file: ?[]const u8 = null;
     // The exact command that reproduces this run, composed by build.zig.
     var reproduce: ?[]const u8 = null;
+    // Float mode (docs/crosscheck-float-policy.md): more edge bit patterns.
+    var floats = false;
     for (args[1..]) |arg| {
         if (std.mem.startsWith(u8, arg, "--seed=")) {
             seed = std.fmt.parseInt(u64, arg["--seed=".len..], 10) catch {
@@ -99,6 +111,8 @@ pub fn main(init: std.process.Init) !void {
             body_file = arg["--body=".len..];
         } else if (std.mem.startsWith(u8, arg, "--reproduce=")) {
             reproduce = arg["--reproduce=".len..];
+        } else if (std.mem.eql(u8, arg, "--floats")) {
+            floats = true;
         } else if (std.mem.startsWith(u8, arg, "-")) {
             std.debug.print("crosscheck-driver: unknown option '{s}'\n", .{arg});
             std.process.exit(2);
@@ -110,11 +124,11 @@ pub fn main(init: std.process.Init) !void {
         }
     }
     const s = seed orelse {
-        std.debug.print("usage: crosscheck-driver --seed=<u64> [--body=<file>] [--reproduce=<command>] <crosscheck.metallib>\n", .{});
+        std.debug.print("usage: crosscheck-driver --seed=<u64> [--body=<file>] [--reproduce=<command>] [--floats] <crosscheck.metallib>\n", .{});
         std.process.exit(2);
     };
     const lib_path = path orelse {
-        std.debug.print("usage: crosscheck-driver --seed=<u64> [--body=<file>] [--reproduce=<command>] <crosscheck.metallib>\n", .{});
+        std.debug.print("usage: crosscheck-driver --seed=<u64> [--body=<file>] [--reproduce=<command>] [--floats] <crosscheck.metallib>\n", .{});
         std.process.exit(2);
     };
     // `cpu-build` must read `debug`: that build's safety checks are the
@@ -127,8 +141,9 @@ pub fn main(init: std.process.Init) !void {
     const r = prng.random();
     const in0_host = try arena.alloc(i32, n);
     const in1_host = try arena.alloc(i32, n);
-    fillInputs(r, in0_host);
-    fillInputs(r, in1_host);
+    const edge_list: []const i32 = if (floats) &float_edges else &edges;
+    fillInputs(r, in0_host, edge_list);
+    fillInputs(r, in1_host, edge_list);
 
     // CPU reference first: it needs no GPU, so a mismatch is attributable even
     // if the device later misbehaves.
