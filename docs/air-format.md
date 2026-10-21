@@ -331,9 +331,16 @@ Every constexpr sampler global **must** also be listed in `!air.sampler_states`
 !air.version = !{!{i32 2, i32 8, i32 0}}
 !air.language_version = !{!{!"Metal", i32 4, i32 0, i32 0}}
 !air.compile_options = !{!{!"air.compile.denorms_disable"},
-                         !{!"air.compile.fast_math_enable"},
+                         !{!"air.compile.fast_math_disable"},
                          !{!"air.compile.framebuffer_fetch_enable"}}
 ```
+
+`fast_math_disable` is what `xcrun metal -fno-fast-math` writes, and the default here
+(`-Dmetal-fast-math=true` writes `fast_math_enable`, Apple's default), because Zig compiles
+the shaders in strict float mode. The flag is informational: Apple's front end encodes fast
+math in the intrinsics it picks (`air.fast_round.f32` against `air.round.f32`), and no
+measured GPU behaviour changes with the flag
+([crosscheck-float-policy.md](crosscheck-float-policy.md#the-fast-math-declaration)).
 
 `llvm.module.flags` carries `wchar_size 4`, `frame-pointer 2`, and Metal's binding
 limits, copied from Apple's output: `air.max_device_buffers 31`,

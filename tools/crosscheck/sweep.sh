@@ -6,6 +6,10 @@
 #
 # CROSSCHECK_ARGS is appended to every `zig build crosscheck` (float mode,
 # `-Dcrosscheck-known=true`, ...) and mirrored into the reproducer's generation.
+# Every seed leaves about 50 MB of build products in .zig-cache (its GPU object,
+# library and Debug driver), so the cache is cleared every CROSSCHECK_CACHE_EVERY
+# seeds (default 25; 0 never); the seed after a clear rebuilds the tools, about a
+# minute. Do not run other `zig build`s in this tree during a sweep.
 #
 # For every seed, `zig build crosscheck -Dseed=N` generates a kernel, runs it on
 # the Metal device and on the CPU, and compares. Each seed lands in one bucket:
@@ -30,7 +34,11 @@ out_dir=zig-out/crosscheck
 
 # Plain counters, not an associative array: macOS's /bin/bash is 3.2.
 n_match=0 n_MISMATCH=0 n_REFUSED=0 n_METAL=0 n_SKIP=0 n_ERROR=0
+cache_every=${CROSSCHECK_CACHE_EVERY:-25}
+n_run=0
 for seed in $(seq "$from" "$to"); do
+  n_run=$((n_run + 1))
+  if [ "$cache_every" -gt 0 ] && [ $((n_run % cache_every)) -eq 1 ] && [ "$n_run" -gt 1 ]; then rm -rf .zig-cache; fi
   # shellcheck disable=SC2086
   log=$(zig build crosscheck -Dseed="$seed" ${CROSSCHECK_ARGS:-} 2>&1)
   if grep -q '^ok  crosscheck seed' <<<"$log"; then

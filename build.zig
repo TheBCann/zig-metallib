@@ -23,6 +23,14 @@ pub fn build(b: *std.Build) void {
     // (tools/air/target.zig). This builds one anyway, e.g. to run
     // `zig build check` on that macOS and learn whether it accepts it.
     const allow_unverified = b.option(bool, "allow-unverified-target", "Build a -Dmetal-target that is not verified to work") orelse false;
+    // What the library's `!air.compile_options` declares about fast math:
+    // `xcrun metal` writes `fast_math_enable` by default and `fast_math_disable`
+    // under -fno-fast-math. Zig compiles the shaders in strict float mode, so
+    // the default is off; on the M3 the declaration changes nothing observable
+    // (docs/crosscheck-float-policy.md). The MSL step below compiles under the
+    // matching -ffast-math / -fno-fast-math.
+    const metal_fast_math = b.option(bool, "metal-fast-math", "Declare fast math in the library's compile options, as xcrun metal does by default (default false: strict, like the Zig code)") orelse false;
+    const fast_math_arg = b.fmt("--fast-math={s}", .{if (metal_fast_math) "true" else "false"});
 
     // ── 1. Shaders: Zig source -> LLVM IR ──────────────────────────────────
     // Zig only allows GPU address spaces on GPU targets, so the shader module
@@ -70,6 +78,7 @@ pub fn build(b: *std.Build) void {
     const run_splice = b.addRunArtifact(splice);
     run_splice.addArg(b.fmt("--target={t}", .{metal_target}));
     if (allow_unverified) run_splice.addArg("--allow-unverified");
+    run_splice.addArg(fast_math_arg);
     run_splice.addFileArg(shader_ir);
     const metallib = run_splice.addOutputFileArg2("default.metallib", .{});
     // Debug text output: the rewritten IR plus metadata, also accepted by
@@ -163,6 +172,9 @@ pub fn build(b: *std.Build) void {
     // Float mode (docs/crosscheck-float-policy.md): float subtrees in the
     // generated programs and float edge values in the driver's inputs.
     const crosscheck_floats = b.option(bool, "crosscheck-floats", "Generator also emits f32 subtrees; the driver adds float edge inputs") orelse false;
+    // Apple's front end: a Metal Shading Language twin of the body for the
+    // `crosscheck-msl` step below (tools/crosscheck/known/*.metal).
+    const crosscheck_metal_file = b.option([]const u8, "crosscheck-metal", "Metal Shading Language twin of -Dcrosscheck-body, compiled by xcrun metal for `zig build crosscheck-msl`");
 
     const crosscheck_gen = b.addExecutable(.{
         .name = "crosscheck-gen",
@@ -214,6 +226,7 @@ pub fn build(b: *std.Build) void {
         }),
     });
     const run_crosscheck_splice = b.addRunArtifact(crosscheck_splice);
+    run_crosscheck_splice.addArg(fast_math_arg);
     run_crosscheck_splice.addFileArg(crosscheck_shader_obj.getEmittedLlvmIr());
     const crosscheck_metallib = run_crosscheck_splice.addOutputFileArg2("crosscheck.metallib", .{});
     // The rewritten IR as text, for the Apple-assembler cross-check below.
@@ -244,9 +257,10 @@ pub fn build(b: *std.Build) void {
     const crosscheck_body_opt: []const u8 = if (crosscheck_body_file) |path| b.fmt(" -Dcrosscheck-body={s}", .{path}) else "";
     const crosscheck_known_opt: []const u8 = if (crosscheck_known) " -Dcrosscheck-known=true" else "";
     const crosscheck_floats_opt: []const u8 = if (crosscheck_floats) " -Dcrosscheck-floats=true" else "";
+    const crosscheck_fast_math_opt: []const u8 = if (metal_fast_math) " -Dmetal-fast-math=true" else "";
     if (crosscheck_floats) run_crosscheck.addArg("--floats");
     if (crosscheck_body_file) |path| run_crosscheck.addArg(b.fmt("--body={s}", .{path}));
-    run_crosscheck.addArg(b.fmt("--reproduce=zig build crosscheck -Dseed={d}{s}{s}{s}", .{ crosscheck_seed, crosscheck_known_opt, crosscheck_floats_opt, crosscheck_body_opt }));
+    run_crosscheck.addArg(b.fmt("--reproduce=zig build crosscheck -Dseed={d}{s}{s}{s}{s}", .{ crosscheck_seed, crosscheck_known_opt, crosscheck_floats_opt, crosscheck_fast_math_opt, crosscheck_body_opt }));
     run_crosscheck.addFileArg(crosscheck_metallib);
     b.step("crosscheck", "Differential test: one generated kernel on the GPU vs the CPU (-Dseed=N)").dependOn(&run_crosscheck.step);
 
@@ -267,9 +281,32 @@ pub fn build(b: *std.Build) void {
     run_crosscheck_apple.addArg(b.fmt("--seed={d}", .{crosscheck_seed}));
     if (crosscheck_body_file) |path| run_crosscheck_apple.addArg(b.fmt("--body={s}", .{path}));
     if (crosscheck_floats) run_crosscheck_apple.addArg("--floats");
-    run_crosscheck_apple.addArg(b.fmt("--reproduce=zig build crosscheck-apple -Dseed={d}{s}{s}{s}", .{ crosscheck_seed, crosscheck_known_opt, crosscheck_floats_opt, crosscheck_body_opt }));
+    run_crosscheck_apple.addArg(b.fmt("--reproduce=zig build crosscheck-apple -Dseed={d}{s}{s}{s}{s}", .{ crosscheck_seed, crosscheck_known_opt, crosscheck_floats_opt, crosscheck_fast_math_opt, crosscheck_body_opt }));
     run_crosscheck_apple.addFileArg(crosscheck_apple_metallib);
     b.step("crosscheck-apple", "The crosscheck kernel with the library built by Apple's assembler from our IR (attribution)").dependOn(&run_crosscheck_apple.step);
+
+    // Apple's front end: the same comparison, but the kernel is compiled by
+    // `xcrun metal` from a Metal Shading Language twin of the body, under
+    // -fno-fast-math or -ffast-math as -Dmetal-fast-math says. It answers whether
+    // a finding reproduces from MSL source, which a bug report to Apple needs,
+    // and shows the intrinsic Apple's own compiler picks for the operation.
+    const msl_step = b.step("crosscheck-msl", "The crosscheck comparison with the kernel compiled by xcrun metal from -Dcrosscheck-metal=<file.metal> (Apple's front end)");
+    if (crosscheck_metal_file) |metal_path| {
+        const msl_compile = b.addSystemCommand(&.{ "xcrun", "metal", if (metal_fast_math) "-ffast-math" else "-fno-fast-math" });
+        msl_compile.addFileArg(.{ .cwd_relative = metal_path });
+        msl_compile.addArg("-o");
+        const crosscheck_msl_metallib = msl_compile.addOutputFileArg2("crosscheck.msl.metallib", .{});
+        msl_compile.has_side_effects = true; // the Metal toolchain is not a hashed input, as above
+        const run_crosscheck_msl = b.addRunArtifact(crosscheck_driver);
+        run_crosscheck_msl.addArg(b.fmt("--seed={d}", .{crosscheck_seed}));
+        if (crosscheck_body_file) |path| run_crosscheck_msl.addArg(b.fmt("--body={s}", .{path}));
+        if (crosscheck_floats) run_crosscheck_msl.addArg("--floats");
+        run_crosscheck_msl.addArg(b.fmt("--reproduce=zig build crosscheck-msl -Dseed={d}{s}{s}{s}{s} -Dcrosscheck-metal={s}", .{ crosscheck_seed, crosscheck_known_opt, crosscheck_floats_opt, crosscheck_fast_math_opt, crosscheck_body_opt, metal_path }));
+        run_crosscheck_msl.addFileArg(crosscheck_msl_metallib);
+        msl_step.dependOn(&run_crosscheck_msl.step);
+    } else {
+        msl_step.dependOn(&b.addFail("zig build crosscheck-msl needs -Dcrosscheck-metal=<file.metal>, and -Dcrosscheck-body=<its Zig twin> for the CPU side").step);
+    }
 
     // Reduction: `zig build reduce -Dseed=N` shrinks a failing seed's program to
     // a minimal one that fails the same way, judging each candidate with

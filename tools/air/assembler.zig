@@ -127,19 +127,20 @@ pub const numbered_prefix = "__";
 const constant_space: Builder.AddrSpace = @fromBackingInt(@intCast(2));
 
 /// Assemble one entry point into a bitcode module for the deployment target
-/// `profile` (triple and `!air.version` / `!air.language_version`). Returns
-/// the raw bitcode bytes (no darwin wrapper).
-pub fn assemble(gpa: Allocator, ir: []const u8, comptime opts: Options, profile: air_target.Profile) Error![]u8 {
+/// `profile` (triple and `!air.version` / `!air.language_version`) with the
+/// module-level `compile` options (`!air.compile_options`). Returns the raw
+/// bitcode bytes (no darwin wrapper).
+pub fn assemble(gpa: Allocator, ir: []const u8, comptime opts: Options, profile: air_target.Profile, compile: metadata.CompileOptions) Error![]u8 {
     var b = try Builder.init(.{ .allocator = gpa, .strip = true, .name = "air-splice" });
     defer b.deinit();
-    try build(&b, gpa, ir, opts, profile);
+    try build(&b, gpa, ir, opts, profile, compile);
     const words = try b.toBitcode(gpa, .{ .name = "zig air-splice", .version = .{ .major = 0, .minor = 1, .patch = 0 } });
     defer gpa.free(words);
     return gpa.dupe(u8, std.mem.sliceAsBytes(words));
 }
 
 /// Populate `b` with the module for `opts.entry`.
-fn build(b: *Builder, gpa: Allocator, ir: []const u8, comptime opts: Options, profile: air_target.Profile) Error!void {
+fn build(b: *Builder, gpa: Allocator, ir: []const u8, comptime opts: Options, profile: air_target.Profile, compile: metadata.CompileOptions) Error!void {
     b.source_filename = try b.string(opts.entry);
     b.target_triple = try b.string(profile.triple);
     b.data_layout.deinit(gpa);
@@ -198,7 +199,7 @@ fn build(b: *Builder, gpa: Allocator, ir: []const u8, comptime opts: Options, pr
     try mod.queue(entry);
     var i: usize = 0;
     while (i < mod.worklist.items.len) : (i += 1) try mod.lowerDefine(mod.worklist.items[i]);
-    try metadata.lowerModule(b, opts.fm, mod.defines.items[entry].func.?, mod.samplers.items, profile);
+    try metadata.lowerModule(b, opts.fm, mod.defines.items[entry].func.?, mod.samplers.items, profile, compile);
 }
 
 fn fail(line_no: usize, line: []const u8, msg: []const u8, err: Error) Error {
@@ -2581,7 +2582,7 @@ fn testRoundTrip(gpa: Allocator, module: []const u8) ![]u8 {
 fn testRoundTripAs(gpa: Allocator, module: []const u8, comptime entry: []const u8, comptime fm: metadata.FunctionMetadata) ![]u8 {
     var b = try Builder.init(.{ .allocator = gpa, .strip = true, .name = "air-splice" });
     defer b.deinit();
-    try build(&b, gpa, module, .{ .entry = entry, .fm = fm }, air_target.default);
+    try build(&b, gpa, module, .{ .entry = entry, .fm = fm }, air_target.default, metadata.default_compile_options);
     const words = try b.toBitcode(gpa, .{ .name = "zig air-splice", .version = .{ .major = 0, .minor = 1, .patch = 0 } });
     defer gpa.free(words);
     const bytes = std.mem.sliceAsBytes(words);
@@ -2600,7 +2601,7 @@ fn testFails(gpa: Allocator, module: []const u8) !void {
 fn testFailsAs(gpa: Allocator, module: []const u8, comptime entry: []const u8, comptime fm: metadata.FunctionMetadata) !void {
     var b = try Builder.init(.{ .allocator = gpa, .strip = true, .name = "air-splice" });
     defer b.deinit();
-    try std.testing.expectError(error.Unsupported, build(&b, gpa, module, .{ .entry = entry, .fm = fm }, air_target.default));
+    try std.testing.expectError(error.Unsupported, build(&b, gpa, module, .{ .entry = entry, .fm = fm }, air_target.default, metadata.default_compile_options));
 }
 
 test "assembles the converted vertex/fragment pair into bitcode" {
@@ -2651,7 +2652,7 @@ test "assembles the converted vertex/fragment pair into bitcode" {
         const bc = try assemble(gpa, ir, .{
             .entry = fm.name,
             .fm = fm,
-        }, air_target.default);
+        }, air_target.default, metadata.default_compile_options);
         try std.testing.expect(bc.len > 64);
         try std.testing.expectEqualStrings("BC\xC0\xDE", bc[0..4]);
     }
@@ -2976,7 +2977,7 @@ test "D5.8 quoted named types: `%\"q.Pair(f32)\"` definitions and references res
         \\  ret <4 x float> %__0
         \\}
         \\
-    , .{ .entry = "fragmentShader", .fm = fragment_fm }, air_target.default));
+    , .{ .entry = "fragmentShader", .fm = fragment_fm }, air_target.default, metadata.default_compile_options));
 }
 
 test "D5.9 LLVM 19 flags on casts and binary ops are dropped" {
@@ -4718,7 +4719,7 @@ test "float constants are built at their own width: a signalling NaN stays signa
         \\  ret float %__2
         \\}
         \\
-    , .{ .entry = "fragmentShader", .fm = fragment_fm }, air_target.default));
+    , .{ .entry = "fragmentShader", .fm = fragment_fm }, air_target.default, metadata.default_compile_options));
 }
 
 test "float literals in LLVM 22's f0x bit-pattern form are parsed by width" {
@@ -4819,7 +4820,7 @@ test "the bitcode's triple and module metadata follow the deployment target (lit
     for (apple) |e| {
         var b = try Builder.init(.{ .allocator = gpa, .strip = true, .name = "air-splice" });
         defer b.deinit();
-        try build(&b, gpa, module, .{ .entry = "fragmentShader", .fm = fragment_fm }, air_target.get(e.name));
+        try build(&b, gpa, module, .{ .entry = "fragmentShader", .fm = fragment_fm }, air_target.get(e.name), metadata.default_compile_options);
         var aw: std.Io.Writer.Allocating = .init(gpa);
         try b.print(&aw.writer);
         const text = aw.written();
@@ -4827,11 +4828,39 @@ test "the bitcode's triple and module metadata follow the deployment target (lit
         try std.testing.expect(has(text, e.air));
         try std.testing.expect(has(text, e.metal));
         try std.testing.expectEqual(e.frame_pointer, has(text, "!\"frame-pointer\""));
-        try std.testing.expect(has(text, "!\"air.compile.fast_math_enable\""));
+        // `xcrun metal -fno-fast-math` output; the default here is strict.
+        try std.testing.expect(has(text, "!\"air.compile.fast_math_disable\""));
         try std.testing.expect(has(text, "!\"air.max_samplers\", i32 16"));
         // No other profile's versions leak in.
         for (apple) |other| {
             if (other.name != e.name) try std.testing.expect(!has(text, other.metal));
         }
     }
+}
+
+test "fast math declared off: the compile options say fast_math_disable and nothing else changes" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const gpa = arena.allocator();
+    const module = test_header ++
+        \\define <4 x float> @fragmentShader(<4 x float> %__0, <3 x float> %__1, <2 x float> %__2, ptr addrspace(1) %__3) {
+        \\  ret <4 x float> %__0
+        \\}
+        \\
+    ;
+    var texts: [2][]const u8 = undefined;
+    inline for (.{ true, false }, 0..) |fast_math, idx| {
+        var b = try Builder.init(.{ .allocator = gpa, .strip = true, .name = "air-splice" });
+        defer b.deinit();
+        try build(&b, gpa, module, .{ .entry = "fragmentShader", .fm = fragment_fm }, air_target.default, .{ .fast_math = fast_math });
+        var aw: std.Io.Writer.Allocating = .init(gpa);
+        try b.print(&aw.writer);
+        texts[idx] = aw.written();
+    }
+    try std.testing.expect(has(texts[0], "!\"air.compile.fast_math_enable\""));
+    try std.testing.expect(!has(texts[0], "fast_math_disable"));
+    try std.testing.expect(has(texts[1], "!\"air.compile.fast_math_disable\""));
+    try std.testing.expect(!has(texts[1], "fast_math_enable"));
+    const normalised = try std.mem.replaceOwned(u8, gpa, texts[0], "fast_math_enable", "fast_math_disable");
+    try std.testing.expectEqualStrings(texts[1], normalised);
 }

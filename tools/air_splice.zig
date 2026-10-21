@@ -39,7 +39,7 @@
 //!   metadata derived from the shader manifest (air/metadata.zig).
 //! Packer (air/metallib.zig): bitcode modules -> MTLB container.
 //!
-//! Usage: air-splice [--target=<profile>] [--allow-unverified] <in.ll> <out.metallib> [out.ll]
+//! Usage: air-splice [--target=<profile>] [--allow-unverified] [--fast-math=<bool>] <in.ll> <out.metallib> [out.ll]
 //! The optional third output is the rewritten IR plus metadata as text, which
 //! `xcrun metal -Xclang -opaque-pointers` also accepts; handy for diffing.
 
@@ -61,16 +61,18 @@ const comptimePrint = std.fmt.comptimePrint;
 /// Numbered values must stay sequential, which our edits would break.
 const rename_prefix = "__";
 
-/// `air-splice [--target=<profile>] [--allow-unverified] <in.ll> <out.metallib> [out.ll]`
+/// `air-splice [--target=<profile>] [--allow-unverified] [--fast-math=<bool>] <in.ll> <out.metallib> [out.ll]`
 const Cli = struct {
     profile: target.Profile = target.default,
     allow_unverified: bool = false,
+    /// What `!air.compile_options` declares (metadata.CompileOptions).
+    fast_math: bool = metadata.default_compile_options.fast_math,
     input: []const u8 = "",
     output: []const u8 = "",
     text_output: ?[]const u8 = null,
 };
 
-const CliError = error{ UnknownOption, UnknownTarget, OptionAfterFile, WrongArgCount, UnverifiedTarget };
+const CliError = error{ UnknownOption, BadOptionValue, UnknownTarget, OptionAfterFile, WrongArgCount, UnverifiedTarget };
 
 /// Parse the arguments after the program name. Options come before the
 /// files, and an argument starting with `-` among the files is an error
@@ -80,6 +82,7 @@ const CliError = error{ UnknownOption, UnknownTarget, OptionAfterFile, WrongArgC
 /// refused unless `--allow-unverified`, rather than producing a library that
 /// only fails at pipeline creation. On error, `bad` names the offending
 /// argument (the profile name for UnknownTarget / UnverifiedTarget).
+/// `--fast-math=` takes exactly `true` or `false`.
 fn parseCli(args: []const [:0]const u8, bad: *[]const u8) CliError!Cli {
     var cli = Cli{};
     var rest = args;
@@ -92,6 +95,16 @@ fn parseCli(args: []const [:0]const u8, bad: *[]const u8) CliError!Cli {
             };
         } else if (std.mem.eql(u8, rest[0], "--allow-unverified")) {
             cli.allow_unverified = true;
+        } else if (std.mem.startsWith(u8, rest[0], "--fast-math=")) {
+            const value = rest[0]["--fast-math=".len..];
+            if (std.mem.eql(u8, value, "true")) {
+                cli.fast_math = true;
+            } else if (std.mem.eql(u8, value, "false")) {
+                cli.fast_math = false;
+            } else {
+                bad.* = rest[0];
+                return error.BadOptionValue;
+            }
         } else {
             bad.* = rest[0];
             return error.UnknownOption;
@@ -128,8 +141,9 @@ pub fn main(init: std.process.Init) !void {
                 std.debug.print("\n", .{});
             },
             error.UnknownOption => std.debug.print("air-splice: unknown option '{s}'\n", .{bad}),
+            error.BadOptionValue => std.debug.print("air-splice: '{s}' takes true or false\n", .{bad}),
             error.OptionAfterFile => std.debug.print("air-splice: '{s}' comes after a file argument; options go before <in.ll>\n", .{bad}),
-            error.WrongArgCount => std.debug.print("usage: air-splice [--target=<profile>] [--allow-unverified] <in.ll> <out.metallib> [out.ll]\n", .{}),
+            error.WrongArgCount => std.debug.print("usage: air-splice [--target=<profile>] [--allow-unverified] [--fast-math=<bool>] <in.ll> <out.metallib> [out.ll]\n", .{}),
             error.UnverifiedTarget => std.debug.print("air-splice: refusing --target={s}: {s}. Pass --allow-unverified (zig build: -Dallow-unverified-target=true) to build it anyway, e.g. to run zig build check on that macOS\n", .{ bad, target.unverifiedReason(target.fromName(bad).?).? }),
         }
         std.process.exit(1);
@@ -149,7 +163,7 @@ pub fn main(init: std.process.Init) !void {
     if (cli.text_output) |path| {
         var text: List = .empty;
         try text.appendSlice(arena, rewritten);
-        try metadata.printModule(arena, &text, try samplerGlobals(arena, rewritten), profile);
+        try metadata.printModule(arena, &text, try samplerGlobals(arena, rewritten), profile, .{ .fast_math = cli.fast_math });
         try cwd.writeFile(io, .{ .sub_path = path, .data = text.items });
     }
 
@@ -158,7 +172,7 @@ pub fn main(init: std.process.Init) !void {
         const bitcode = assembler.assemble(arena, rewritten, .{
             .entry = fm.name,
             .fm = fm,
-        }, profile) catch |err| {
+        }, profile, .{ .fast_math = cli.fast_math }) catch |err| {
             std.debug.print("air-splice: assembling {s}: {t}\n", .{ fm.name, err });
             return err;
         };
@@ -1623,7 +1637,7 @@ test "D4 helpers: reachable non-entry defines are kept, lifetime dropped, ptx_ke
     // The result assembles for the fragment entry with the helpers inside.
     inline for (metadata.function_metadata) |fm| {
         if (comptime std.mem.eql(u8, fm.name, "fragmentShader")) {
-            const bc = try assembler.assemble(gpa, out, .{ .entry = fm.name, .fm = fm }, target.default);
+            const bc = try assembler.assemble(gpa, out, .{ .entry = fm.name, .fm = fm }, target.default, metadata.default_compile_options);
             try std.testing.expectEqualStrings("BC\xC0\xDE", bc[0..4]);
         }
     }
@@ -1664,7 +1678,7 @@ test "D4 block order: a loop latch laid out before its header is moved after it 
     // "use of undefined value"; now the kernel assembles.
     inline for (metadata.function_metadata) |fm| {
         if (comptime std.mem.eql(u8, fm.name, "countKernel")) {
-            const bc = try assembler.assemble(gpa, out, .{ .entry = fm.name, .fm = fm }, target.default);
+            const bc = try assembler.assemble(gpa, out, .{ .entry = fm.name, .fm = fm }, target.default, metadata.default_compile_options);
             try std.testing.expectEqualStrings("BC\xC0\xDE", bc[0..4]);
         }
     }
@@ -1704,7 +1718,7 @@ test "D4 block order: switch targets and a block that reads a case's value follo
     try std.testing.expect(switch_line < find(out, "\ndflt:").?);
     inline for (metadata.function_metadata) |fm| {
         if (comptime std.mem.eql(u8, fm.name, "countKernel")) {
-            const bc = try assembler.assemble(gpa, out, .{ .entry = fm.name, .fm = fm }, target.default);
+            const bc = try assembler.assemble(gpa, out, .{ .entry = fm.name, .fm = fm }, target.default, metadata.default_compile_options);
             try std.testing.expectEqualStrings("BC\xC0\xDE", bc[0..4]);
         }
     }
@@ -1746,7 +1760,7 @@ test "D4 block order: `; preds` comments on labels are not edges, and an unreach
     try std.testing.expect(dead_at > v_at and dead_at > u_at and dead_at > d_at);
     inline for (metadata.function_metadata) |fm| {
         if (comptime std.mem.eql(u8, fm.name, "countKernel")) {
-            const bc = try assembler.assemble(gpa, out, .{ .entry = fm.name, .fm = fm }, target.default);
+            const bc = try assembler.assemble(gpa, out, .{ .entry = fm.name, .fm = fm }, target.default, metadata.default_compile_options);
             try std.testing.expectEqualStrings("BC\xC0\xDE", bc[0..4]);
         }
     }
@@ -1776,7 +1790,7 @@ test "D4 block order: a branch naming the same target twice is followed once" {
     try std.testing.expect(findPos(out, find(out, "\ny:").? + 1, "\ny:") == null);
     inline for (metadata.function_metadata) |fm| {
         if (comptime std.mem.eql(u8, fm.name, "countKernel")) {
-            const bc = try assembler.assemble(gpa, out, .{ .entry = fm.name, .fm = fm }, target.default);
+            const bc = try assembler.assemble(gpa, out, .{ .entry = fm.name, .fm = fm }, target.default, metadata.default_compile_options);
             try std.testing.expectEqualStrings("BC\xC0\xDE", bc[0..4]);
         }
     }
@@ -1806,7 +1820,7 @@ test "D4 block order: labels and values containing '-' are whole identifiers" {
     try std.testing.expect(find(out, "\nbody.unr-lcssa:").? < find(out, "\nexit:").?);
     inline for (metadata.function_metadata) |fm| {
         if (comptime std.mem.eql(u8, fm.name, "countKernel")) {
-            const bc = try assembler.assemble(gpa, out, .{ .entry = fm.name, .fm = fm }, target.default);
+            const bc = try assembler.assemble(gpa, out, .{ .entry = fm.name, .fm = fm }, target.default, metadata.default_compile_options);
             try std.testing.expectEqualStrings("BC\xC0\xDE", bc[0..4]);
         }
     }
@@ -1846,7 +1860,7 @@ test "D4 block order: a loop-carried pointer phi over a relocated table assemble
     try std.testing.expect(find(out, "\nheader:").? < find(out, "\nlatch:").?);
     inline for (metadata.function_metadata) |fm| {
         if (comptime std.mem.eql(u8, fm.name, "countKernel")) {
-            const bc = try assembler.assemble(gpa, out, .{ .entry = fm.name, .fm = fm }, target.default);
+            const bc = try assembler.assemble(gpa, out, .{ .entry = fm.name, .fm = fm }, target.default, metadata.default_compile_options);
             try std.testing.expectEqualStrings("BC\xC0\xDE", bc[0..4]);
         }
     }
@@ -1877,7 +1891,7 @@ test "D4 float literals: LLVM 22's f0x spellings become the legacy forms Apple's
     try std.testing.expect(find(out, "[float 0x3810000000000000, float 1.000000e+00]") != null);
     inline for (metadata.function_metadata) |fm| {
         if (comptime std.mem.eql(u8, fm.name, "countKernel")) {
-            const bc = try assembler.assemble(gpa, out, .{ .entry = fm.name, .fm = fm }, target.default);
+            const bc = try assembler.assemble(gpa, out, .{ .entry = fm.name, .fm = fm }, target.default, metadata.default_compile_options);
             try std.testing.expectEqualStrings("BC\xC0\xDE", bc[0..4]);
         }
     }
@@ -1929,7 +1943,7 @@ test "D4 float literals: LLVM 22's special values and mask comments become legac
     try std.testing.expect(find(out, "@llvm.is.fpclass.f32(float %__10, i32 783)") != null);
     inline for (metadata.function_metadata) |fm| {
         if (comptime std.mem.eql(u8, fm.name, "countKernel")) {
-            const bc = try assembler.assemble(gpa, out, .{ .entry = fm.name, .fm = fm }, target.default);
+            const bc = try assembler.assemble(gpa, out, .{ .entry = fm.name, .fm = fm }, target.default, metadata.default_compile_options);
             try std.testing.expectEqualStrings("BC\xC0\xDE", bc[0..4]);
         }
     }
@@ -2004,7 +2018,7 @@ test "D4 quoted identifiers: generic helpers `@\"mod.Vec(4).sum\"` are followed,
     // The assembler resolves the quoted calls.
     inline for (metadata.function_metadata) |fm| {
         if (comptime std.mem.eql(u8, fm.name, "fragmentShader")) {
-            const bc = try assembler.assemble(gpa, out, .{ .entry = fm.name, .fm = fm }, target.default);
+            const bc = try assembler.assemble(gpa, out, .{ .entry = fm.name, .fm = fm }, target.default, metadata.default_compile_options);
             try std.testing.expectEqualStrings("BC\xC0\xDE", bc[0..4]);
         }
     }
@@ -2069,7 +2083,7 @@ test "D4 quoted named types: the r5_generic shape (quoted `%` type + quoted `@` 
     // And both entries assemble.
     inline for (metadata.function_metadata) |fm| {
         if (comptime (std.mem.eql(u8, fm.name, "fragmentShader") or std.mem.eql(u8, fm.name, "vertexShader"))) {
-            const bc = try assembler.assemble(gpa, out, .{ .entry = fm.name, .fm = fm }, target.default);
+            const bc = try assembler.assemble(gpa, out, .{ .entry = fm.name, .fm = fm }, target.default, metadata.default_compile_options);
             try std.testing.expectEqualStrings("BC\xC0\xDE", bc[0..4]);
         }
     }
@@ -2141,7 +2155,7 @@ test "D4 kernels: an entry block that a phi names by number gets an explicit lab
     // bodies that never name their entry block keep no label (see the
     // kernel test above: its output starts with the first instruction).
     try std.testing.expect(find(out, "@my_shader.helper") == null);
-    const bc = try assembler.assemble(gpa, out, .{ .entry = "reduceKernel", .fm = reduce_fm }, target.default);
+    const bc = try assembler.assemble(gpa, out, .{ .entry = "reduceKernel", .fm = reduce_fm }, target.default, metadata.default_compile_options);
     try std.testing.expectEqualStrings("BC\xC0\xDE", bc[0..4]);
 }
 
@@ -2218,7 +2232,7 @@ test "convert rewrites a Zig sret vertex function into AIR form and the result a
     var n: usize = 0;
     inline for (metadata.function_metadata) |fm| {
         if (find(out, "@" ++ fm.name ++ "(") != null) {
-            const bc = try assembler.assemble(gpa, out, .{ .entry = fm.name, .fm = fm }, target.default);
+            const bc = try assembler.assemble(gpa, out, .{ .entry = fm.name, .fm = fm }, target.default, metadata.default_compile_options);
             try std.testing.expectEqualStrings("BC\xC0\xDE", bc[0..4]);
             functions[n] = .{ .name = fm.name, .stage = if (fm.stage == .vertex) .vertex else .fragment, .bitcode = bc };
             n += 1;
@@ -2302,7 +2316,7 @@ test "D2/D4 fragment struct return: Zig's sret FragOut becomes a packed literal 
     // It assembles with the MRT metadata.
     inline for (metadata.function_metadata) |fm| {
         if (comptime std.mem.eql(u8, fm.name, "fragmentShaderMRT")) {
-            const bc = try assembler.assemble(gpa, out, .{ .entry = fm.name, .fm = fm }, target.default);
+            const bc = try assembler.assemble(gpa, out, .{ .entry = fm.name, .fm = fm }, target.default, metadata.default_compile_options);
             try std.testing.expectEqualStrings("BC\xC0\xDE", bc[0..4]);
         }
     }
@@ -2454,7 +2468,7 @@ test "D4 kernels: `define ptx_kernel void @name` is an entry, header rebuilt fro
     var n: usize = 0;
     inline for (metadata.function_metadata) |fm| {
         if (fm.stage == .kernel and find(out, "@" ++ fm.name ++ "(") != null) {
-            const bc = try assembler.assemble(gpa, out, .{ .entry = fm.name, .fm = fm }, target.default);
+            const bc = try assembler.assemble(gpa, out, .{ .entry = fm.name, .fm = fm }, target.default, metadata.default_compile_options);
             try std.testing.expectEqualStrings("BC\xC0\xDE", bc[0..4]);
             functions[n] = .{ .name = fm.name, .stage = .kernel, .bitcode = bc };
             n += 1;
@@ -2618,6 +2632,15 @@ test "air-splice command line: options, targets, and a misplaced flag" {
     try std.testing.expectEqual(target.Name.macos15, allowed.profile.name);
     const allowed_first = try parseCli(&.{ "--allow-unverified", "--target=macos13", "in.ll", "out.metallib" }, &bad);
     try std.testing.expectEqual(target.Name.macos13, allowed_first.profile.name);
+    // --fast-math takes exactly true or false; the default is the metadata's.
+    try std.testing.expectEqual(metadata.default_compile_options.fast_math, plain.fast_math);
+    const strict = try parseCli(&.{ "--fast-math=false", "in.ll", "out.metallib" }, &bad);
+    try std.testing.expect(!strict.fast_math);
+    const relaxed = try parseCli(&.{ "--fast-math=true", "--target=macos26", "in.ll", "out.metallib" }, &bad);
+    try std.testing.expect(relaxed.fast_math);
+    try std.testing.expectError(error.BadOptionValue, parseCli(&.{ "--fast-math=maybe", "in.ll", "out.metallib" }, &bad));
+    try std.testing.expectEqualStrings("--fast-math=maybe", bad);
+    try std.testing.expectError(error.BadOptionValue, parseCli(&.{ "--fast-math=", "in.ll", "out.metallib" }, &bad));
     // A flag after a file would otherwise be taken as a file name.
     try std.testing.expectError(error.OptionAfterFile, parseCli(&.{ "in.ll", "--target=macos15", "out.metallib" }, &bad));
     try std.testing.expectEqualStrings("--target=macos15", bad);

@@ -70,14 +70,33 @@ pub fn paramUniformity(comptime f: air.Function) []const air.Uniformity {
 
 pub const NamedList = struct { name: []const u8, nodes: []const Node };
 
+/// Module-level choices that are not part of the deployment target. They go
+/// into `!air.compile_options` next to the fixed `denorms_disable` and
+/// `framebuffer_fetch_enable`.
+pub const CompileOptions = struct {
+    /// `air.compile.fast_math_enable`, what `xcrun metal` writes by default,
+    /// or `air.compile.fast_math_disable`, what it writes under
+    /// `-fno-fast-math`. Which GPU behaviours the flag changes is measured in
+    /// docs/crosscheck-float-policy.md.
+    fast_math: bool,
+};
+
+/// What air-splice declares unless told otherwise (`--fast-math=`): fast math
+/// off, because Zig compiles the shaders in strict float mode and the IR
+/// carries no fast-math flags. On the M3 the declaration changes nothing
+/// observable (docs/crosscheck-float-policy.md), so this is about saying what
+/// the code is.
+pub const default_compile_options: CompileOptions = .{ .fast_math = false };
+
 /// The module-level named lists for the deployment target `p`, in the order
 /// Apple emits them. `air.version`, `air.language_version` and the presence of
-/// the frame-pointer flag depend on the target; the limits and compile options
-/// are the same for every profile (target.zig). The order is part of the
+/// the frame-pointer flag depend on the target; the limits are the same for
+/// every profile (target.zig); the fast-math declaration in the compile
+/// options is the caller's choice (`CompileOptions`). The order is part of the
 /// output: it decides the metadata numbering, so moving a list changes the
 /// bitcode. Callers pick the profile by name from target.profiles (every
 /// Profile in this project comes from that table).
-pub fn moduleLists(comptime p: target.Profile) [5]NamedList {
+pub fn moduleLists(comptime p: target.Profile, comptime fast_math: bool) [5]NamedList {
     return .{
         .{
             .name = "llvm.module.flags",
@@ -99,7 +118,7 @@ pub fn moduleLists(comptime p: target.Profile) [5]NamedList {
         .{ .name = "air.language_version", .nodes = &.{t(&.{ .{ .str = "Metal" }, .{ .int = p.lang_major }, .{ .int = p.lang_minor }, .{ .int = 0 } })} },
         .{ .name = "air.compile_options", .nodes = &.{
             t(&.{.{ .str = "air.compile.denorms_disable" }}),
-            t(&.{.{ .str = "air.compile.fast_math_enable" }}),
+            t(&.{.{ .str = if (fast_math) "air.compile.fast_math_enable" else "air.compile.fast_math_disable" }}),
             t(&.{.{ .str = "air.compile.framebuffer_fetch_enable" }}),
         } },
     };
@@ -431,14 +450,14 @@ fn mangle(comptime T: type) []const u8 {
 /// Append the metadata block for a whole module (all entry points) as text.
 /// `samplers` names the constexpr sampler globals (`@name`, already in
 /// address space 2 in the text) to list under `!air.sampler_states`.
-pub fn printModule(gpa: std.mem.Allocator, out: *std.ArrayList(u8), samplers: []const []const u8, profile: target.Profile) !void {
-    return printManifestWith(gpa, out, &function_metadata, samplers, profile);
+pub fn printModule(gpa: std.mem.Allocator, out: *std.ArrayList(u8), samplers: []const []const u8, profile: target.Profile, compile: CompileOptions) !void {
+    return printManifestWith(gpa, out, &function_metadata, samplers, profile, compile);
 }
 
 /// `printModule` for an explicit list of entry points (tests use their own),
-/// for the default deployment target.
+/// for the default deployment target and compile options.
 pub fn printManifest(gpa: std.mem.Allocator, out: *std.ArrayList(u8), comptime fms: []const FunctionMetadata) !void {
-    return printManifestWith(gpa, out, fms, &.{}, target.default);
+    return printManifestWith(gpa, out, fms, &.{}, target.default, default_compile_options);
 }
 
 /// `!air.sampler_states = !{!N, ...}` with `!N = !{!"air.sampler_state",
@@ -450,28 +469,33 @@ pub const sampler_states_list = "air.sampler_states";
 pub const sampler_state_tag = "air.sampler_state";
 
 /// The module-level lists of `profile` as text. `moduleLists` needs the
-/// profile at comptime, so this picks the matching one of the known profiles.
-fn printModuleLists(gpa: std.mem.Allocator, nodes: *std.ArrayList(u8), named: *std.ArrayList(u8), next: *u32, profile: target.Profile) !void {
+/// profile and the fast-math choice at comptime, so this picks the matching
+/// one of the known profiles and of the two choices.
+fn printModuleLists(gpa: std.mem.Allocator, nodes: *std.ArrayList(u8), named: *std.ArrayList(u8), next: *u32, profile: target.Profile, compile: CompileOptions) !void {
     inline for (target.profiles) |p| {
         if (p.name == profile.name) {
-            inline for (comptime moduleLists(p)) |list| {
-                var refs: std.ArrayList(u8) = .empty;
-                inline for (list.nodes) |node| {
-                    const id = try printNode(gpa, nodes, next, node, "");
-                    try appendRef(gpa, &refs, id);
+            inline for (.{ true, false }) |fast_math| {
+                if (compile.fast_math == fast_math) {
+                    inline for (comptime moduleLists(p, fast_math)) |list| {
+                        var refs: std.ArrayList(u8) = .empty;
+                        inline for (list.nodes) |node| {
+                            const id = try printNode(gpa, nodes, next, node, "");
+                            try appendRef(gpa, &refs, id);
+                        }
+                        try named.print(gpa, "!{s} = !{{{s}}}\n", .{ list.name, refs.items });
+                    }
                 }
-                try named.print(gpa, "!{s} = !{{{s}}}\n", .{ list.name, refs.items });
             }
         }
     }
 }
 
-pub fn printManifestWith(gpa: std.mem.Allocator, out: *std.ArrayList(u8), comptime fms: []const FunctionMetadata, samplers: []const []const u8, profile: target.Profile) !void {
+pub fn printManifestWith(gpa: std.mem.Allocator, out: *std.ArrayList(u8), comptime fms: []const FunctionMetadata, samplers: []const []const u8, profile: target.Profile, compile: CompileOptions) !void {
     var next: u32 = 0;
     var nodes: std.ArrayList(u8) = .empty;
     var named: std.ArrayList(u8) = .empty;
 
-    try printModuleLists(gpa, &nodes, &named, &next, profile);
+    try printModuleLists(gpa, &nodes, &named, &next, profile, compile);
     inline for (stage_order) |stage| {
         var refs: std.ArrayList(u8) = .empty;
         inline for (fms) |fm| {
@@ -536,16 +560,21 @@ fn printNode(gpa: std.mem.Allocator, nodes: *std.ArrayList(u8), next: *u32, comp
 /// and `!air.sampler_states` for the constexpr sampler globals the
 /// assembler saw as sampler operands (`samplers`; empty for a module that
 /// samples through bound samplers only).
-pub fn lowerModule(b: *Builder, comptime fm: FunctionMetadata, func: Builder.Function.Index, samplers: []const Builder.Global.Index, profile: target.Profile) !void {
-    // `moduleLists` needs the profile at comptime: pick the matching one of
-    // the few known profiles (only these lists are instantiated per profile,
-    // not the entry-point node below).
+pub fn lowerModule(b: *Builder, comptime fm: FunctionMetadata, func: Builder.Function.Index, samplers: []const Builder.Global.Index, profile: target.Profile, compile: CompileOptions) !void {
+    // `moduleLists` needs the profile and the fast-math choice at comptime:
+    // pick the matching one of the few known profiles and of the two choices
+    // (only these lists are instantiated per combination, not the entry-point
+    // node below).
     inline for (target.profiles) |p| {
         if (p.name == profile.name) {
-            inline for (comptime moduleLists(p)) |list| {
-                var operands: [list.nodes.len]Builder.Metadata = undefined;
-                inline for (list.nodes, 0..) |node, idx| operands[idx] = try lowerNode(b, node, func);
-                try b.addNamedMetadata(try b.string(list.name), &operands);
+            inline for (.{ true, false }) |fast_math| {
+                if (compile.fast_math == fast_math) {
+                    inline for (comptime moduleLists(p, fast_math)) |list| {
+                        var operands: [list.nodes.len]Builder.Metadata = undefined;
+                        inline for (list.nodes, 0..) |node, idx| operands[idx] = try lowerNode(b, node, func);
+                        try b.addNamedMetadata(try b.string(list.name), &operands);
+                    }
+                }
             }
         }
     }
@@ -848,7 +877,7 @@ test "D2 textures and samplers: air.texture nodes per access, air.sampler node, 
     defer arena.deinit();
     const gpa = arena.allocator();
     var out: std.ArrayList(u8) = .empty;
-    try printManifestWith(gpa, &out, &.{ test_textured_fragment_fm, test_texture_kernel_fm }, &.{ "gpu.constexprSampler.Holder.state", "__air_sampler_state.1" }, target.default);
+    try printManifestWith(gpa, &out, &.{ test_textured_fragment_fm, test_texture_kernel_fm }, &.{ "gpu.constexprSampler.Holder.state", "__air_sampler_state.1" }, target.default, default_compile_options);
     const text = out.items;
     // Fragment: position, then texture slot 3 (sample), sampler slot 2, read_write texture slot 4.
     try std.testing.expect(has(text, "!{i32 1, !\"air.texture\", !\"air.location_index\", i32 3, i32 1, !\"air.sample\", !\"air.arg_type_name\", !\"texture2d<float, sample>\", !\"air.arg_name\", !\"tex\"}\n"));
@@ -874,4 +903,23 @@ test "D2 textures and samplers: air.texture nodes per access, air.sampler node, 
     var plain: std.ArrayList(u8) = .empty;
     try printManifest(gpa, &plain, &.{test_textured_fragment_fm});
     try std.testing.expect(!has(plain.items, "air.sampler_states"));
+}
+
+test "compile options: fast math declared on or off, nothing else moves" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const gpa = arena.allocator();
+    var on: std.ArrayList(u8) = .empty;
+    try printManifestWith(gpa, &on, &.{test_kernel_fm}, &.{}, target.default, .{ .fast_math = true });
+    try std.testing.expect(std.mem.indexOf(u8, on.items, "!\"air.compile.fast_math_enable\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, on.items, "fast_math_disable") == null);
+    var off: std.ArrayList(u8) = .empty;
+    try printManifestWith(gpa, &off, &.{test_kernel_fm}, &.{}, target.default, .{ .fast_math = false });
+    try std.testing.expect(std.mem.indexOf(u8, off.items, "!\"air.compile.fast_math_disable\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, off.items, "fast_math_enable") == null);
+    // The other two options stay, and the two texts differ only in that word.
+    try std.testing.expect(std.mem.indexOf(u8, off.items, "!\"air.compile.denorms_disable\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, off.items, "!\"air.compile.framebuffer_fetch_enable\"") != null);
+    const on_normalised = try std.mem.replaceOwned(u8, gpa, on.items, "fast_math_enable", "fast_math_disable");
+    try std.testing.expectEqualStrings(off.items, on_normalised);
 }

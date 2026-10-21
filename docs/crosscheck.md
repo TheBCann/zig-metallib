@@ -17,6 +17,8 @@ zig build crosscheck -Dcrosscheck-body=path/to/body.zig   # a hand-written body
 zig build crosscheck-apple -Dcrosscheck-body=path/to/body.zig   # same kernel, library built by Apple's assembler
 zig build crosscheck -Dseed=7 -Dcrosscheck-floats=true          # float mode (docs/crosscheck-float-policy.md)
 CROSSCHECK_ARGS="-Dcrosscheck-floats=true" tools/crosscheck/sweep.sh 1 200
+zig build crosscheck-msl -Dcrosscheck-body=tools/crosscheck/known/round_negative_zero.zig \
+    -Dcrosscheck-metal=tools/crosscheck/known/round_negative_zero.metal   # the body in Metal Shading Language, through Apple's front end
 ```
 
 `sweep.sh` runs under macOS's stock `/bin/bash` (3.2). Every seed lands in one bucket:
@@ -33,7 +35,10 @@ CROSSCHECK_ARGS="-Dcrosscheck-floats=true" tools/crosscheck/sweep.sh 1 200
 Anything but a match is saved under `zig-out/crosscheck/<seed>/` as the generated
 `body.zig` plus the full log, so it can be reproduced with `zig build crosscheck
 -Dseed=<seed>` and reduced. The script exits 1 if any seed was a MISMATCH, REFUSED, METAL
-or ERROR.
+or ERROR. Every seed leaves about 50 MB of build products in `.zig-cache` (its GPU object,
+library and Debug driver), so the script clears that cache every 25 seeds
+(`CROSSCHECK_CACHE_EVERY`, 0 to never); the seed after a clear rebuilds the tools, about a
+minute. Do not run other `zig build`s in the tree while a sweep runs.
 
 `-Dcrosscheck-body=<file>` runs a hand-written or reduced body through the same pipeline
 instead of a generated one. The file must define `pub const seed: u64` and
@@ -50,6 +55,15 @@ finding that persists is in Metal's GPU compiler; one that disappears is in our 
 or container. It needs the Metal toolchain (`xcrun metal --version`), and it re-assembles
 on every run rather than from the build cache, so the verdict always reflects the
 installed toolchain.
+
+`zig build crosscheck-msl` goes one step further back: the kernel is compiled by Apple's
+front end from a Metal Shading Language twin of the body (`-Dcrosscheck-metal=<file.metal>`;
+the twins of the recorded findings sit beside them in `tools/crosscheck/known/`), under
+`-fno-fast-math`, or `-ffast-math` with `-Dmetal-fast-math=true`, and compared with the Zig
+body on the CPU as before. A finding that reproduces there reproduces from MSL source,
+which is what a bug report to Apple needs, and `xcrun metal -S -emit-llvm` on the twin shows
+which intrinsic Apple's own compiler picks for the operation. Both Apple steps re-run the
+toolchain every time for the same reason.
 
 ## Reducing a failure
 
@@ -157,7 +171,7 @@ surface new problems. `tools/crosscheck/gen.zig` says where to add them back.
 [docs/crosscheck-float-policy.md](crosscheck-float-policy.md): inputs and locals carry
 float values as bit patterns; a float subtree starts from a flushed bit-cast or an integer
 conversion and ends in canonical bits or a guarded conversion; every operation goes
-through a flushing helper, which is also the contraction barrier. The driver's edge inputs
+through a flushing helper, so the CPU flushes the intermediate results the GPU flushes. The driver's edge inputs
 gain float bit patterns, and the reducer handles float programs. Float mode is opt-in so
 that every integer seed keeps its program.
 
@@ -178,13 +192,31 @@ in `tools/crosscheck/known/`:
 **Attribution: all six are faults in Metal's GPU compiler.** Each reproducer was also
 run through `zig build crosscheck-apple`, where Apple's own assembler builds the library
 from our printed IR, and failed identically: the same crash, and the same mismatch counts
-(1,990, 2,103, 949, 1,067 and 223). That rules out this project's bitcode encoder and container. Our text
+(1,990, 2,103, 949, 1,067 and 223), with the library's fast-math declaration on and off
+(`-Dmetal-fast-math`; see [the float policy](crosscheck-float-policy.md#the-fast-math-declaration)).
+That rules out this project's bitcode encoder and container. Our text
 rewrite is ruled out too: the intrinsic declarations and calls in the rewritten IR are the
 ones Zig emitted, apart from the attribute group our cleanup drops from every `declare`.
 This project's assembler passes all six intrinsics to Metal unchanged
 (`tools/air/intrinsics.zig`). The overflow bit of `@mulWithOverflow` matches. The two float
 findings came out of the probes behind [docs/crosscheck-float-policy.md](crosscheck-float-policy.md),
 which also records the GPU behaviours that are normalised rather than reported.
+
+**Through Apple's front end** (`zig build crosscheck-msl`, 2026-10-20). Four of the six
+reproduce from Metal Shading Language compiled by `xcrun metal -fno-fast-math`, with the
+same counts: the overflow bits through clang's `__builtin_sadd_overflow` and
+`__builtin_ssub_overflow` (1,990 and 2,103; the unsigned builtins are right on every
+input), `round()` (949) and `fma()` with two constant multiplicands (223; with the
+multiplicand read from a buffer instead, the same fma is exact on every input, so the
+hardware is right and the constant fold is wrong). The overflow bits have an exact
+description: the GPU computes the signed add's flag as `(a + b) < a` and the signed
+subtract's as `a < b`, both as signed comparisons, which are the unsigned carry and borrow
+formulas; that predicts every one of 10 chosen inputs and every sweep sample. MSL has no
+spelling for `llvm.smul.fix.sat`; its `madsat(a, b, 0)` (`air.mad_sat.s.i32`) computes
+`a *| b` correctly on all 4,096 inputs. And MSL's `fmod` (`air.fmod.f32`) is exact on all
+4,096 inputs where LLVM's `frem` is not, so that finding is in the lowering of `frem`. Bug
+reports with standalone reproducers (the `.metal` twins, two `.ll` files Apple's assembler
+accepts, and a Swift runner) are drafted in [`docs/apple-reports/`](apple-reports/README.md).
 
 **In this project.** The first sweep with control flow produced the bench's first
 `REFUSED` results: `air-splice: use of undefined value` on seeds 5 and 21. LLVM had laid a
@@ -291,13 +323,27 @@ On an Apple M3 (macOS 26.3, Zig 0.18.0-dev.253):
   the failing seed's inputs and mode, cleaning its cache on every exit and reverting the
   trial it was in when its budget ran out). Another 100-seed float sweep is 100 match; 115
   unit tests.
+- **Strict fast-math declaration, and Apple's front end** (2026-10-20): the three float
+  findings give the same counts with the library's fast-math declaration on and off,
+  through our assembler and Apple's (949, 1,067, 223 under seed 1); a contraction probe
+  matches on all 4,096 inputs under both, and `fmax` of a signalling NaN behaves the same.
+  With the new default (`fast_math_disable`) the default library changed bytes and passes
+  the 42 checks, 50 integer seeds and 100 float seeds all match, 122 unit tests. Through
+  `crosscheck-msl`, the six Metal Shading Language twins compiled with `-fno-fast-math`:
+  both overflow bits, `round` and the constant fma fail with the same counts as the Zig
+  bodies, `madsat` and `fmod` match on all 4,096 inputs, and so do the unsigned overflow
+  bits and the fma with a run-time multiplicand.
 - The default build is untouched: `default.metallib` is byte-identical with and without
   the bench.
 
 ## Next
 
-- Vectors and floats. Floats need explicit tolerance rules (contraction, denormals,
-  transcendental precision).
-- A reducer that shrinks a failing seed to a minimal program before it is reported.
+- Workarounds in the assembler for the findings Apple's own intrinsics get right:
+  `llvm.smul.fix.sat.i32` with a zero scale as `air.mad_sat.s.i32`, `frem` as
+  `air.fmod.f32`, and a sign-preserving lowering of `llvm.round.f32`; then `*|`, `@rem` and
+  `@round` can join the exact set and the generator.
+- File the drafted reports in `docs/apple-reports/` with Apple, and record the feedback
+  numbers in the findings table.
+- f16 as a generated type, then vectors; the precision survey for the transcendentals.
 - Later, the same generated shaders on Asahi Linux's Mesa stack once its M3 GPU driver
   works, so the two compilers can be compared on the same hardware.

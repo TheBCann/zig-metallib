@@ -20,7 +20,7 @@ applies the rules of the next section inside the program.
 | --- | --- | --- | --- |
 | `+`, `-`, `*`, `/` on f32 | 1,100–1,500 differ | **all match** | NaN payload/sign, denormals flushed on input and output |
 | `@mulAdd` (explicit fma) | 1,424 differ | **all match** | same |
-| `x * y + x` written separately | 1,429 differ | 6 differ | Metal fused the two operations into an fma; a flush between them stops it, then all match |
+| `x * y + x` written separately | 1,429 differ | 6 differ | the GPU flushes the denormal intermediate product that the CPU keeps; a flush between the two operations models it, then all match. Not contraction: `x * (1 + 2^-23) - x`, which a fused multiply-add computes differently for nearly every x, matches on all 4,096 inputs |
 | `@sqrt` | 1,024 differ | **all match** | denormal inputs flushed (`sqrt(-denormal)` is NaN on the CPU, `-0.0` on the GPU) |
 | f16 `*`, `+`, `/`, `@sqrt` | 986 differ | **all match** | NaN payloads only: **f16 denormals are kept** |
 | `@floor`, `@ceil`, `@trunc` | | **all match** | |
@@ -35,11 +35,15 @@ applies the rules of the next section inside the program.
 | 4-lane vectors, lane-wise | | **all match** | with the flush between dependent operations |
 | `@setFloatMode(.optimized)` | CPU panics | | Zig's Debug build treats float division by zero as undefined in that mode |
 
-Four behaviours of the GPU are systematic and documented by Metal, so they are
-normalised rather than reported: single-precision denormals are flushed to zero on input
-and output (half precision is not), NaNs are canonicalised, a separate multiply and add
-are contracted into an fma even though the IR carries no `contract` flag, and `fmin`/`fmax`
-treat a signalling NaN as quiet. The last one was found by the first float-mode sweep: eight
+Three behaviours of the GPU are systematic and documented by Metal, so they are
+normalised rather than reported: single-precision denormals are flushed to zero on input,
+on output and between dependent operations (half precision is not), NaNs are canonicalised,
+and `fmin`/`fmax` treat a signalling NaN as quiet. The GPU does **not** contract a separate
+multiply and add when the IR carries no `contract` flag: the six differences in the
+`x * y + x` row were first read as contraction, and a probe that a fused multiply-add
+computes differently for nearly every input, `x * (1 + 2^-23) - x`, matches on all 4,096
+inputs (2026-10-20); the six were denormal intermediate products, flushed on the GPU and
+kept on the CPU. The signalling-NaN behaviour was found by the first float-mode sweep: eight
 of a hundred seeds mismatched, every one through a signalling NaN reaching `fmin`/`fmax`
 (the reducer brought seed 15 down to `fmax(fin(a), FLT_MIN)` in two minutes).
 
@@ -66,10 +70,10 @@ of a hundred seeds mismatched, every one through a signalling NaN reaching `fmin
    - the result of `@min`/`@max` is passed through `+ 0.0`, which turns `-0.0` into `+0.0`
      and changes nothing else, because IEEE leaves the choice of zero unspecified;
    - everywhere else the sign of zero is significant.
-3. **Contraction.** The flush helper between dependent operations is also the contraction
-   barrier: with it the GPU and the CPU both compute the unfused result. Fused
-   multiply-add is covered explicitly by `@mulAdd`. Metal's default contraction is
-   recorded as a documented deviation, not a finding.
+3. **Intermediate results.** The flush helper between dependent operations makes the CPU
+   flush what the GPU flushes, a denormal product before the add that consumes it. It
+   would also stop a contraction, but Metal does not contract separate operations (above),
+   so the fused multiply-add is covered only where the program asks for it, by `@mulAdd`.
 4. **Exact mode** (a difference is a finding): `+`, `-`, `*`, `/`, negation, `@abs`,
    `@sqrt`, `@mulAdd`, `@floor`, `@ceil`, `@trunc`, `@min`, `@max`, comparisons feeding
    `if`/`else`, `i32 → f32`, guarded `f32 → i32`, `f32 ↔ f16` and f16 arithmetic, 2- and
@@ -107,13 +111,41 @@ of a hundred seeds mismatched, every one through a signalling NaN reaching `fmin
   fma keeps the intermediate (found by the review of the float-mode generator, which now
   always gives an fma an input-dependent multiplicand, since LLVM folds even a local that
   only ever held constants). All persist through Apple's assembler.
-- **Documented deviations, normalised by the policy:** single-precision flush to zero, NaN
-  canonicalisation, contraction of separate multiply and add.
+- **Through Apple's front end** (`zig build crosscheck-msl`, 2026-10-20): the Metal Shading
+  Language twins of the reproducers, compiled with `xcrun metal -fno-fast-math`, reproduce
+  the `@round` sign loss (`air.round.f32`, 949) and the fma fold (`air.fma.f32`, 223)
+  exactly, while MSL's `fmod` (`air.fmod.f32`) is exact on all 4,096 inputs where LLVM's
+  `frem` is not: the `@rem` finding is in how `frem` is lowered, and lowering it to
+  `air.fmod.f32` is the fix for this project. The fma with its multiplicand read from a
+  buffer instead of a constant is exact on every input: the hardware fma keeps the
+  intermediate, the compiler's constant fold does not.
+- **Documented deviations, normalised by the policy:** single-precision flush to zero
+  (inputs, outputs and intermediates), NaN canonicalisation, signalling NaNs quieted by
+  `fmin`/`fmax`.
+
+## The fast-math declaration
+
+Every library this project writes carries `!air.compile_options`, copied from Apple's
+output, and until 2026-10-20 that included `air.compile.fast_math_enable`, what `xcrun
+metal` writes by default. Metal's fast math permits ignoring the sign of zero and assuming
+no NaN or infinity, so the declaration could have licensed the `@round` finding. It does
+not. `-Dmetal-fast-math=false` writes `air.compile.fast_math_disable`, as `xcrun metal
+-fno-fast-math` does, and every probe then gives the same result as before, through our
+assembler and through Apple's: `@round` 949, `@rem` 1,067 and the fma fold 223 of 4,096
+under seed 1, the contraction probe all match, `fmax` of a signalling NaN still returns the
+other operand, and the 42 checks pass. The declaration is informational: Apple's front end
+encodes fast math in the IR itself, by choosing `air.fast_round.f32` over `air.round.f32`
+and `air.fast_fmod.f32` over `air.fmod.f32` (both seen in `xcrun metal -S -emit-llvm`
+output), and the back end reads the instructions, not the flag. The default is now
+`fast_math_disable`, because Zig compiles the shaders in strict float mode and the IR
+carries no fast-math flags; `-Dmetal-fast-math=true` restores Apple's default wording.
+`default.metallib` changed bytes with the new default and passes the 42 checks.
 
 ## Decisions taken
 
-1. Contraction of a separate multiply and add is a documented deviation, not a finding;
-   the generator's flush between dependent operations keeps it out of the comparison.
+1. A flush between dependent operations stays in every generated program: it models the
+   GPU's flushing of intermediate results, and it would keep any contraction out of the
+   comparison, although none was measured.
 2. The sign of zero is significant everywhere except after `@min`/`@max`.
 3. The precision survey for `exp`, `log`, `sin`, `cos` and `pow` reports measured ulp
    distributions; it has no pass/fail threshold for now.

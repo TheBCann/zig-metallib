@@ -2,9 +2,10 @@
 
 Shaders are written in Zig. They are compiled to Apple AIR bitcode, packed into a
 `.metallib`, and loaded by a Metal app — **without Apple's Metal Shading Language
-toolchain anywhere in the build**. No `.metal` files, no `xcrun metal`, no checked-in
-`.ll`, no C or Objective-C sources: every AppKit and Metal call goes through
-`objc_msgSend` from Zig.
+toolchain anywhere in the build**. The build has no `.metal` files, no `xcrun metal`, no
+checked-in `.ll`, no C or Objective-C sources: every AppKit and Metal call goes through
+`objc_msgSend` from Zig. The only `.metal` and `.ll` files in the repository are
+reproducers for the Metal compiler findings below, used outside the build.
 
 ```
 src/engine/my_shader.zig        Zig shader source + the binding manifest
@@ -40,6 +41,8 @@ zig build crosscheck -Dseed=7                          # random kernel: GPU vs C
 tools/crosscheck/sweep.sh 1 200                        # many seeds, each outcome sorted
 zig build reduce -Dseed=8                              # shrink a failing seed to a minimal program
 zig build crosscheck -Dseed=7 -Dcrosscheck-floats=true # the same with f32 arithmetic in the program
+zig build crosscheck-msl -Dcrosscheck-body=tools/crosscheck/known/round_negative_zero.zig \
+    -Dcrosscheck-metal=tools/crosscheck/known/round_negative_zero.metal   # a body in Metal Shading Language, Apple's front end
 ```
 
 Requires the Zig nightly **0.18.0-dev.253+16d31ceed** (pinned in `build.zig.zon`,
@@ -49,9 +52,9 @@ between Zig versions, so `zig build` warns when a different Zig runs it. ziglang
 deletes old nightlies within days; once this one is gone, CI fails at its setup step until
 the pin moves to a current nightly. For a toolchain that stays downloadable, check out the
 **`zig-0.17.0`** tag, which pins the Zig 0.17.0 release. Zig 0.17.0 also builds this
-commit. Zig 0.18 changed the IR the shader compiles to, so `default.metallib` differs
-between the two (`1969ef4d…` on 0.17.0, `108736c1…` on the 0.18 nightlies), and both
-pass all 42 checks.
+commit. Zig 0.18 changed the IR the shader compiles to, and master now declares
+`fast_math_disable` in the library, so `default.metallib` differs between the two
+(`1969ef4d…` on the tag, `5a179469…` on master), and both pass all 42 checks.
 
 ## What is verified, and how
 
@@ -66,7 +69,7 @@ are read back and compared.
 | `zig build test` | rewriter, assembler, metadata, packer, uniformity analysis, target profiles | 91 tests pass |
 | `zig build` | Zig → IR → container, end to end | builds |
 | `zig build check -- …` | Metal loads it, compiles every pipeline, and the GPU computes the right answers | **42 ok, 0 fail** |
-| `tools/crosscheck/sweep.sh` | randomly generated integer kernels compute the same on the GPU as on the CPU ([docs/crosscheck.md](docs/crosscheck.md)) | 100 seeds, all match; 6 Metal compiler [findings](docs/crosscheck.md#findings) recorded with reproducers |
+| `tools/crosscheck/sweep.sh` | randomly generated integer and float kernels compute the same on the GPU as on the CPU ([docs/crosscheck.md](docs/crosscheck.md)) | 100 seeds in each mode, all match; 6 Metal compiler [findings](docs/crosscheck.md#findings) recorded with reproducers, 4 of them reproduced from Metal Shading Language through Apple's own front end; bug reports drafted in [docs/apple-reports](docs/apple-reports/README.md) |
 | `xcrun metal-objdump -d` | our container is readable by Apple's own tooling | passes |
 | `xcrun metal` on `shader.air.ll` | Apple's assembler accepts our printed IR; the library *it* builds also passes `zig build check` | **42 ok, 0 fail** |
 
@@ -162,6 +165,7 @@ tools/air/target.zig        deployment-target profiles: triple, versions, header
 tools/metallib_check.zig    loads a library into Metal and runs every entry point
 tools/crosscheck/           differential test bench: program model, generator, reducer, GPU/CPU driver, sweep
 src/engine/crosscheck_harness.zig  fixed GPU kernel wrapper for the bench
+docs/apple-reports/         drafted Metal compiler bug reports: standalone reproducers and a Swift runner
 docs/pipeline.md            how the pipeline works, and how to add a shader
 docs/air-format.md          the container, bitcode dialect and metadata reference
 docs/crosscheck.md          the differential test bench

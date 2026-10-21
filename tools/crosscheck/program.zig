@@ -210,8 +210,8 @@ pub const helpers =
 pub const float_helpers =
     \\// Floats (docs/crosscheck-float-policy.md): the GPU flushes single-precision
     \\// denormals on input and output and canonicalises NaNs, so every float
-    \\// value is flushed here too (a no-op on the GPU), which also keeps a
-    \\// multiply and an add from being contracted, and NaNs leave as one bit
+    \\// value is flushed here too (a no-op on the GPU), so an intermediate
+    \\// result is flushed on both sides, and NaNs leave as one bit
     \\// pattern. The flush tests the exponent bits rather than comparing, so
     \\// LLVM does not turn it into llvm.is.fpclass. Inputs are quieted: Metal's
     \\// min/max treat a signalling NaN as quiet (return the other operand),
@@ -292,7 +292,7 @@ pub const max_depth = 3;
 pub const Cmp = enum { eq, ne, lt, le, gt, ge };
 
 /// Float operators (docs/crosscheck-float-policy.md). Every one goes through
-/// a helper that flushes denormals, which is also the contraction barrier.
+/// a helper that flushes denormals, as the GPU does between operations.
 pub const FOp = enum { neg, abs, sqrt, floor, ceil, trunc, add, sub, mul, div, min, max };
 const funary = [_]FOp{ .neg, .abs, .sqrt, .floor, .ceil, .trunc };
 const fbinary = [_]FOp{ .add, .sub, .mul, .div, .min, .max };
