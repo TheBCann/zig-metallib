@@ -155,9 +155,10 @@ GPU/CPU difference can never be undefined behaviour diverging between targets:
   narrowed type `u31` in Zig, which `@byteSwap` rejects (about 0.2% of seeds failed to
   compile before this) and which would run every operator above it at that width;
 - division and remainder go through helpers that return the dividend for a zero divisor
-  and for `minInt / -1`. `@rem` and `@mod` need the `minInt` guard too: Zig's Debug build
-  defines `@rem(minInt, -1)` as 0, but its release lowering is a plain LLVM `srem`, which
-  is undefined for that input.
+  and for `minInt / -1`. `@rem` and `@mod` need the `minInt` guard too: the language
+  reference allows the operands and comptime gives 0, but every mode lowers them to a plain
+  LLVM `srem`, which is undefined for that pair: 0 on arm64 by luck, a crash on x86-64
+  ([docs/zig-rem-minint.md](zig-rem-minint.md)).
 
 The host driver, and the body's host compilation, are pinned to Debug in `build.zig`
 whatever `-Doptimize` says, so their safety checks double as an undefined-behaviour
@@ -191,8 +192,9 @@ in `tools/crosscheck/known/`:
 | `@rem(x, y)` on f32 | `frem` | not the exact remainder: 0 for 1.02e-10, 8 for 6.91, `-inf` for finite operands (1,067 of 4,096) | `zig build crosscheck -Dcrosscheck-body=tools/crosscheck/known/rem_inexact.zig` |
 | `@mulAdd(f32, C1, C2, x)` with a denormal constant product | `llvm.fma.f32` with two constant multiplicands | the compiler folds the product and flushes it, so the fma degenerates to `x`; the hardware fma keeps the exact intermediate (223 of 4,096; 266 with the float-mode inputs) | `zig build crosscheck -Dcrosscheck-body=tools/crosscheck/known/fma_constant_product_flush.zig` |
 | `@rem(x, y)` on f16 | `frem half`; the finding is in Apple's own `air.fmod.f16`, what MSL's `fmod(half, half)` compiles to | `+0.0` where the remainder is an exact `-0.0`, for every negative x (9 of 4,096 through Apple's front end; single precision keeps the sign; `frem half` through Apple's assembler differs on 672) | `zig build crosscheck-msl -Dcrosscheck-body=tools/crosscheck/known/fmod_half_negative_zero.zig -Dcrosscheck-metal=tools/crosscheck/known/fmod_half_negative_zero.metal` |
+| `@exp(x)` on f32 | `llvm.exp.f32`, passed through | lowered as Apple's fast exp: up to 60 ulp, 68% of inputs beyond 4 ulp, where `llvm.exp2`, `llvm.log` and `llvm.log2` pass through within 3 ulp and `air.exp.f32` is within 1.4 ulp; the assembler renames it now ([precision survey](crosscheck-float-policy.md#precision-survey)) | `zig build survey`, the `air.fast_exp` row |
 
-**Attribution: all seven are faults in Metal's compiler.** Each of the first six
+**Attribution: all eight are faults in Metal's compiler.** Each of the first six
 reproducers was also run through `zig build crosscheck-apple`, where Apple's own assembler builds the library
 from our printed IR, and failed identically: the same crash, and the same mismatch counts
 (1,990, 2,103, 949, 1,067 and 223), with the library's fast-math declaration on and off
@@ -359,6 +361,11 @@ On an Apple M3 (macOS 26.3, Zig 0.18.0-dev.253):
   front end, 672 for `frem half` through Apple's assembler). With `*|`, `@round` and `@rem`
   back in the menus, 100 integer seeds and 100 float seeds all match; 126 unit tests; the
   default library is byte-identical (the sample shader uses none of the three).
+- **Precision survey** (2026-10-20): `zig build survey` measured the transcendentals
+  against an f64 reference ([table](crosscheck-float-policy.md#precision-survey)); the
+  intrinsic renames now pick Apple's precise functions unless fast math is declared, and
+  `llvm.exp` is renamed too (the eighth finding above). The sample shader uses none of
+  them, so the default library is byte-identical.
 - The default build is untouched: `default.metallib` is byte-identical with and without
   the bench.
 
@@ -366,6 +373,6 @@ On an Apple M3 (macOS 26.3, Zig 0.18.0-dev.253):
 
 - File the drafted reports in `docs/apple-reports/` with Apple, and record the feedback
   numbers in the findings table.
-- f16 as a generated type, then vectors; the precision survey for the transcendentals.
+- f16 as a generated type, then vectors.
 - Later, the same generated shaders on Asahi Linux's Mesa stack once its M3 GPU driver
   works, so the two compilers can be compared on the same hardware.

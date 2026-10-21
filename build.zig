@@ -335,4 +335,62 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     }) });
     test_step.dependOn(&b.addRunArtifact(reduce_tests).step);
+
+    // ── 8. Precision survey: `zig build survey` ─────────────────────────────────
+    // src/engine/survey_harness.zig holds one kernel per transcendental function
+    // and variant; tools/crosscheck/survey.zig runs them over sampled domains
+    // against an f64 reference and reports ulp distributions
+    // (docs/crosscheck-float-policy.md). A measurement, not a pass/fail step.
+    const survey_samples = b.option(u32, "survey-samples", "Inputs per function and domain for `zig build survey` (default 262144)") orelse 262144;
+    const survey_shader_obj = b.addObject(.{
+        .name = "survey_shader",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/engine/survey_harness.zig"),
+            .target = gpu_target,
+            .optimize = shader_optimize,
+        }),
+        .use_llvm = true,
+    });
+    survey_shader_obj.bundle_ubsan_rt = false;
+    const survey_manifest = b.createModule(.{
+        .root_source_file = b.path("src/engine/survey_harness.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const survey_splice = b.addExecutable(.{
+        .name = "survey-air-splice",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/air_splice.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "shader", .module = survey_manifest }},
+        }),
+    });
+    const run_survey_splice = b.addRunArtifact(survey_splice);
+    run_survey_splice.addArg(fast_math_arg);
+    run_survey_splice.addFileArg(survey_shader_obj.getEmittedLlvmIr());
+    const survey_metallib = run_survey_splice.addOutputFileArg2("survey.metallib", .{});
+    _ = run_survey_splice.addOutputFileArg2("survey.air.ll", .{});
+    const survey_exe = b.addExecutable(.{
+        .name = "crosscheck-survey",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/crosscheck/survey.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "objc", .module = objc_mod },
+                .{ .name = "survey_harness", .module = survey_manifest },
+            },
+        }),
+    });
+    survey_exe.root_module.linkSystemLibrary("c", .{});
+    survey_exe.root_module.linkSystemLibrary("objc", .{});
+    survey_exe.root_module.linkFramework("Foundation", .{});
+    survey_exe.root_module.linkFramework("Metal", .{});
+    const run_survey = b.addRunArtifact(survey_exe);
+    run_survey.addArg(b.fmt("--seed={d}", .{crosscheck_seed}));
+    run_survey.addArg(b.fmt("--samples={d}", .{survey_samples}));
+    run_survey.addFileArg(survey_metallib);
+    run_survey.has_side_effects = true;
+    b.step("survey", "Precision survey: ulp error of exp, log, sin, cos, tan and sqrt on the GPU against an f64 reference (docs/crosscheck-float-policy.md)").dependOn(&run_survey.step);
 }

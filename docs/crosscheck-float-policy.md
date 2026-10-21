@@ -129,6 +129,43 @@ of a hundred seeds mismatched, every one through a signalling NaN reaching `fmin
   (inputs, outputs and intermediates), NaN canonicalisation, signalling NaNs quieted by
   `fmin`/`fmax`.
 
+## Precision survey
+
+`zig build survey` (`tools/crosscheck/survey.zig`, kernels in `src/engine/survey_harness.zig`)
+runs each transcendental function over sampled domains on the GPU and reports the error in
+units of the f32 ulp at an f64 reference computed on the CPU: the share of results that are
+correctly rounded (within 0.5 ulp), within 1 ulp, and the worst case. Each function comes in
+three variants: the Zig builtin as the assembler lowers it, Apple's precise `air.<f>.f32`
+(what `xcrun metal -fno-fast-math` emits) and Apple's `air.fast_<f>.f32`. It is a
+measurement, not a check. `-Dsurvey-samples=N` and `-Dseed=N` vary the inputs. Measured on
+the M3 with 65,536 samples per row (seed 1), 2026-10-20:
+
+| function | domain | precise `air.<f>`: max ulp, within 1 ulp | fast `air.fast_<f>`: max ulp, within 1 ulp |
+| --- | --- | --- | --- |
+| exp | [−87, 88] | 1.39, 93.4% | **62.6, 10.8%** (68.6% beyond 4 ulp) |
+| exp2 | [−126, 127] | 1.45, 99.99% | 1.21, 100% |
+| log | [FLT_MIN, FLT_MAX] | 1.85, 87.3% | 2.90, 87.5% |
+| log2 | [FLT_MIN, FLT_MAX] | 2.10, 99.9% | 2.22, 99.9% |
+| log10 | [FLT_MIN, FLT_MAX] | 2.25, 98.8% | 2.94, 98.8% |
+| sin | [−2π, 2π] | 2.38, 88.4% | 2.48, 88.5% |
+| sin | [−1e5, 1e5] | 2.38, 88.4% | 2.45, 88.3% |
+| sin | ±[1e5, FLT_MAX] | 2.57, 89.0% | **1.7e7, 4.9%** (returns 0: 94.5% beyond 4 ulp) |
+| cos | [−2π, 2π] | 2.54, 88.5% | 2.52, 88.2% |
+| cos | ±[1e5, FLT_MAX] | 2.55, 88.9% | **1.7e7, 4.8%** |
+| tan | [−2π, 2π] | 3.51, 78.5% | 4.46, 71.3% |
+| tan | [−1e5, 1e5] | 3.92, 78.6% | 4.25, 71.7% |
+| sqrt | [FLT_MIN, FLT_MAX] | 0.50, 100% (correctly rounded) | 1.59, 97.9% |
+
+What the builtins get: `llvm.exp2`, `llvm.log`, `llvm.log2` and `llvm.sqrt` pass through to
+Metal and measure like the precise functions (1.08, 3.03, 1.61 and 0.50 ulp at most).
+`llvm.exp` passed through measured like `air.fast_exp` (60.2 ulp at most, 67.6% beyond 4 ulp
+over 4,096 samples), so the assembler renames it to `air.exp` now; and the functions whose
+`llvm.*` form crashes the compiler (`sin`, `cos`, `tan`, `log10`, `exp10`, `pow`) are renamed
+to the precise `air.*` instead of `air.fast_*`, unless the library declares fast math
+(`-Dmetal-fast-math=true`), as Apple's own front end chooses. The fast `sin` and `cos`
+return 0 for arguments beyond about 1e5; the precise ones reduce the argument correctly up
+to FLT_MAX. `pow` has no Zig builtin, so it is not surveyed.
+
 ## The fast-math declaration
 
 Every library this project writes carries `!air.compile_options`, copied from Apple's
@@ -153,6 +190,6 @@ carries no fast-math flags; `-Dmetal-fast-math=true` restores Apple's default wo
    GPU's flushing of intermediate results, and it would keep any contraction out of the
    comparison, although none was measured.
 2. The sign of zero is significant everywhere except after `@min`/`@max`.
-3. The precision survey for `exp`, `log`, `sin`, `cos` and `pow` reports measured ulp
-   distributions; it has no pass/fail threshold for now.
+3. The precision survey for `exp`, `log`, `sin`, `cos` and `tan` reports measured ulp
+   distributions (above); it has no pass/fail threshold for now.
 4. f32 first; f16 as a generated type comes after.

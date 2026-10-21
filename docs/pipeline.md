@@ -286,7 +286,7 @@ host build.
 | `-Dshader-optimize=<mode>` | optimize mode of the GPU module (`fast` default; `safe` keeps Zig's safety checks) |
 | `-Dmetal-target=<profile>` | the macOS the library targets: `macos26` (default), `macos15`, `macos14`, `macos13` ([air-format.md §1.7](air-format.md#17-deployment-targets)) |
 | `-Dallow-unverified-target=true` | build a profile other than `macos26` anyway (they are refused by default; see below) |
-| `-Dmetal-fast-math=true` | declare fast math in the library's `!air.compile_options`, as `xcrun metal` does by default. The default is `fast_math_disable`, like `xcrun metal -fno-fast-math`, because Zig compiles the shaders in strict float mode; nothing measurable changes with the flag ([crosscheck-float-policy.md](crosscheck-float-policy.md#the-fast-math-declaration)) |
+| `-Dmetal-fast-math=true` | declare fast math in the library's `!air.compile_options`, as `xcrun metal` does by default, and call Apple's `air.fast_*` math functions instead of the precise ones. The default is `fast_math_disable`, like `xcrun metal -fno-fast-math`, because Zig compiles the shaders in strict float mode; nothing measurable changes with the flag ([crosscheck-float-policy.md](crosscheck-float-policy.md#the-fast-math-declaration)) |
 
 `air-splice` can also be run by hand:
 `air-splice [--target=<profile>] [--allow-unverified] <in.ll> <out.metallib> [out.ll]`.

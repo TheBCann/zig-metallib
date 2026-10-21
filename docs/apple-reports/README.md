@@ -18,7 +18,8 @@ the two `.ll` files, for the findings Metal Shading Language cannot express, are
 | 7 | [`fmod` on `half` returns `+0.0` for a `-0.0` remainder](07-fmod-half-negative-zero.md) | MSL `fmod(half, half)`, `-fno-fast-math` | drafted |
 
 Fill in the feedback number (`FB…`) in the Status column once filed, and copy it to the
-findings table in `docs/crosscheck.md`.
+findings table in `docs/crosscheck.md`. The eighth finding there, `llvm.exp.f32` lowered as
+the fast exp, has no draft yet; `zig build survey` is its reproducer.
 
 ## Environment the reports were measured on
 

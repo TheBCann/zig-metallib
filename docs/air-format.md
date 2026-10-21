@@ -235,9 +235,10 @@ diagnostic.
 
 | `llvm.*` | behaviour at pipeline creation | what we emit |
 | --- | --- | --- |
-| `sin cos tan log10 pow` | abort: *unable to legalize instruction* (all widths) | `air.fast_sin` … `air.fast_pow` |
-| `exp10 ldexp` | `Undefined symbols` | `air.fast_exp10`, `air.fast_ldexp` |
-| `powi.<T>.i32` | abort | `air.fast_pow.<T>` with the exponent `sitofp`-converted |
+| `sin cos tan log10 pow` | abort: *unable to legalize instruction* (all widths) | `air.sin` … `air.pow`, Apple's precise functions; `air.fast_*` with `-Dmetal-fast-math=true` |
+| `exp10 ldexp` | `Undefined symbols` | `air.exp10`, `air.ldexp` (or the `fast_` ones) |
+| `exp` | accepted, but lowered as the fast exp: up to 60 ulp ([crosscheck-float-policy.md](crosscheck-float-policy.md#precision-survey)) | `air.exp` (`air.fast_exp` under fast math) |
+| `powi.<T>.i32` | abort | `air.pow.<T>` with the exponent `sitofp`-converted |
 | `minimum maximum` | abort | `air.fast_fmin`, `air.fast_fmax` |
 | `nearbyint roundeven` | abort | `llvm.rint` (which passes) |
 | `smul.fix.sat umul.fix.sat` (Zig's `*|`) | abort: MTLCompilerService's connection is interrupted ([crosscheck.md](crosscheck.md#findings), finding 1) | `air.mad_sat.s.<T>` / `air.mad_sat.u.<T>` when the scale is 0 (MSL's `madsat(a, b, 0)`); a non-zero scale is refused |
@@ -247,7 +248,7 @@ diagnostic.
 | `ctpop.i4` | abort | refused with a hint |
 | `nvvm.*` | no AIR equivalent | refused with a hint |
 | `fence` | abort | refused; use `air.atomic.fence` |
-| `sqrt exp exp2 log log2 fabs floor ceil trunc rint fma fmuladd minnum maxnum copysign ctlz cttz ctpop bswap bitreverse`, `umin/umax/smin/smax`, `sadd/ssub/uadd/usub.sat`, `*.with.overflow`, `assume`, `trap`, `memcpy/memset/memmove` | accepted | unchanged |
+| `sqrt exp2 log log2 fabs floor ceil trunc rint fma fmuladd minnum maxnum copysign ctlz cttz ctpop bswap bitreverse`, `umin/umax/smin/smax`, `sadd/ssub/uadd/usub.sat`, `*.with.overflow`, `assume`, `trap`, `memcpy/memset/memmove` | accepted | unchanged |
 
 The `frem` instruction is accepted but lowered by Metal as the fast fmod, which is inexact
 and returns `-inf` for finite operands (finding 5); the assembler emits a call to

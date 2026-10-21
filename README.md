@@ -43,6 +43,7 @@ zig build reduce -Dseed=8                              # shrink a failing seed t
 zig build crosscheck -Dseed=7 -Dcrosscheck-floats=true # the same with f32 arithmetic in the program
 zig build crosscheck-msl -Dcrosscheck-body=tools/crosscheck/known/round_negative_zero.zig \
     -Dcrosscheck-metal=tools/crosscheck/known/round_negative_zero.metal   # a body in Metal Shading Language, Apple's front end
+zig build survey                                       # ulp error of exp/log/sin/cos/tan on the GPU vs an f64 reference
 ```
 
 Requires the Zig nightly **0.18.0-dev.253+16d31ceed** (pinned in `build.zig.zon`,
@@ -69,7 +70,8 @@ are read back and compared.
 | `zig build test` | rewriter, assembler, metadata, packer, uniformity analysis, target profiles | 91 tests pass |
 | `zig build` | Zig → IR → container, end to end | builds |
 | `zig build check -- …` | Metal loads it, compiles every pipeline, and the GPU computes the right answers | **42 ok, 0 fail** |
-| `tools/crosscheck/sweep.sh` | randomly generated integer and float kernels compute the same on the GPU as on the CPU ([docs/crosscheck.md](docs/crosscheck.md)) | 100 seeds in each mode, all match; 7 Metal compiler [findings](docs/crosscheck.md#findings) recorded with reproducers, 5 of them reproduced from Metal Shading Language through Apple's own front end, 4 worked around in the assembler; bug reports drafted in [docs/apple-reports](docs/apple-reports/README.md) |
+| `tools/crosscheck/sweep.sh` | randomly generated integer and float kernels compute the same on the GPU as on the CPU ([docs/crosscheck.md](docs/crosscheck.md)) | 100 seeds in each mode, all match; 8 Metal compiler [findings](docs/crosscheck.md#findings) recorded with reproducers, 5 of them reproduced from Metal Shading Language through Apple's own front end, 5 worked around in the assembler; bug reports drafted in [docs/apple-reports](docs/apple-reports/README.md) |
+| `zig build survey` | the transcendental functions' error on the GPU against an f64 reference ([table](docs/crosscheck-float-policy.md#precision-survey)) | precise `air.*` within 1.4 ulp (exp), 2.6 (sin, cos up to FLT_MAX), 3.9 (tan); sqrt correctly rounded; Zig's builtins now get these |
 | `xcrun metal-objdump -d` | our container is readable by Apple's own tooling | passes |
 | `xcrun metal` on `shader.air.ll` | Apple's assembler accepts our printed IR; the library *it* builds also passes `zig build check` | **42 ok, 0 fail** |
 

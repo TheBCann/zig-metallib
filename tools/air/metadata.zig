@@ -42,6 +42,9 @@ pub const function_metadata: [shader.functions.len]FunctionMetadata = blk: {
 /// Metadata for one manifest entry. Tests build their own manifests with
 /// it so they do not depend on what `shader.functions` currently lists.
 pub fn functionMetadata(comptime f: air.Function) FunctionMetadata {
+    // A manifest with dozens of entry points (src/engine/survey_harness.zig)
+    // needs more than the default quota for its type-name string building.
+    @setEvalBranchQuota(100_000);
     return .{ .name = f.name, .stage = f.stage, .node = functionNode(f), .param_uniformity = paramUniformity(f) };
 }
 

@@ -69,7 +69,8 @@
 //!     simd_sum(...)` is fine, while `if (gid >= n) return; barrier` and
 //!     `if (sgid == 0) barrier` are refused.
 //!   * Intrinsics go through intrinsics.zig (DESIGN.md D5-12): `llvm.sin`
-//!     and friends are called under their `air.fast_*` name (the `llvm.*`
+//!     and friends are called under their `air.*` name, `air.fast_*` when the
+//!     library declares fast math (the `llvm.*`
 //!     declaration never enters the module), `llvm.vector.reduce.*` is
 //!     expanded into an `extractelement` chain (an op with no expansion is
 //!     refused), `bitcast <N x i1>` to an integer is packed lane by lane
@@ -146,7 +147,7 @@ fn build(b: *Builder, gpa: Allocator, ir: []const u8, comptime opts: Options, pr
     b.data_layout.deinit(gpa);
     b.data_layout = try Builder.DataLayout.parseString(try b.string(air_target.datalayout), b);
 
-    var mod = ModuleState{ .gpa = gpa, .b = b };
+    var mod = ModuleState{ .gpa = gpa, .b = b, .fast_math = compile.fast_math };
     defer mod.deinit();
 
     // Pass 1: named types, global names, declarations and function headers.
@@ -263,6 +264,9 @@ const PendingGlobal = struct {
 const ModuleState = struct {
     gpa: Allocator,
     b: *Builder,
+    /// The library's fast-math declaration: picks Apple's fast intrinsics
+    /// over the precise ones (intrinsics.classify, lowerFrem).
+    fast_math: bool,
     named_types: std.ArrayList(NamedType) = .empty,
     globals: std.ArrayList(Global) = .empty,
     /// Variables not yet referenced (see `PendingGlobal`).
@@ -1564,7 +1568,7 @@ const FunctionState = struct {
                 // Metal lowers frem as the fast fmod (docs/crosscheck.md,
                 // finding 5); Apple's own air.fmod is exact (intrinsics.zig).
                 var declarer = ModuleState.Declarer{ .m = f.m };
-                const value = intrinsics.lowerFrem(b, wip, &declarer, lhs, rhs, tag == .@"frem fast") catch |err| switch (err) {
+                const value = intrinsics.lowerFrem(b, wip, &declarer, lhs, rhs, tag == .@"frem fast" or f.m.fast_math) catch |err| switch (err) {
                     error.OutOfMemory => return error.OutOfMemory,
                     error.Unsupported => return fail(c.line, c.s, "frem on a type without a float scalar (or air.fmod is declared with another type)", error.Unsupported),
                 };
@@ -1967,7 +1971,7 @@ const FunctionState = struct {
 
         // Intrinsics Metal's backend cannot take in their llvm.* form
         // (DESIGN.md D5-12a/12b): call the air.* equivalent, or expand.
-        const lowering = try intrinsics.classify(m.gpa, callee_name);
+        const lowering = try intrinsics.classify(m.gpa, callee_name, m.fast_math);
         defer lowering.deinit(m.gpa);
         switch (lowering) {
             .pass => {},
@@ -3229,11 +3233,11 @@ test "D5.12 intrinsic table: renames declare the air.* name only, powi exponent,
         \\
     );
     // Renamed: the air.* names are declared and called, the llvm.* ones are gone.
-    try std.testing.expect(has(text, "declare float @air.fast_sin.f32("));
-    try std.testing.expect(has(text, "call float @air.fast_sin.f32(float"));
-    try std.testing.expect(has(text, "declare <4 x float> @air.fast_cos.v4f32("));
-    try std.testing.expect(has(text, "declare half @air.fast_tan.f16("));
-    try std.testing.expect(has(text, "declare float @air.fast_pow.f32(float %0, float %1)"));
+    try std.testing.expect(has(text, "declare float @air.sin.f32("));
+    try std.testing.expect(has(text, "call float @air.sin.f32(float"));
+    try std.testing.expect(has(text, "declare <4 x float> @air.cos.v4f32("));
+    try std.testing.expect(has(text, "declare half @air.tan.f16("));
+    try std.testing.expect(has(text, "declare float @air.pow.f32(float %0, float %1)"));
     try std.testing.expect(has(text, "sitofp i32 %3 to float"));
     try std.testing.expect(has(text, "call float @llvm.rint.f32("));
     try std.testing.expect(has(text, "call float @air.fast_fmax.f32("));

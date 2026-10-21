@@ -10,11 +10,22 @@
 //!     abort MTLCompilerService ("unable to legalize instruction") at every
 //!     width; `llvm.exp10` and `llvm.ldexp` fail with "Undefined symbols".
 //!     Their `air.fast_*` spellings all build (research/math-builtins/
-//!     RESULTS_TABLE.tsv, _results/r02.txt findings 3/5/6, r11 finding 13).
-//!     `llvm.nearbyint`/`llvm.roundeven` become `llvm.rint`, which passes.
-//!     `llvm.powi.<T>.i32` has no AIR form; it becomes `air.fast_pow.<T>`
-//!     with the exponent converted by `sitofp`. `llvm.ldexp.<T>.i32` keeps
-//!     its integer parameter but Apple spells it `air.fast_ldexp.<T>`.
+//!     RESULTS_TABLE.tsv, _results/r02.txt findings 3/5/6, r11 finding 13),
+//!     and so do the precise `air.sin`, `air.cos`, `air.tan`, `air.log10`,
+//!     `air.exp`, `air.exp10` and `air.pow`, what `xcrun metal -fno-fast-math`
+//!     emits. The rename picks the precise one unless the library declares
+//!     fast math (`-Dmetal-fast-math=true`), as Apple's front end does; the
+//!     precision survey (`zig build survey`, docs/crosscheck-float-policy.md)
+//!     measured the difference: `air.sin` stays within 2.3 ulp up to FLT_MAX
+//!     where `air.fast_sin` returns 0 beyond about 1e5. `llvm.exp` passed
+//!     through is the fast exp (up to 60 ulp), so it is renamed too, while
+//!     `llvm.exp2`, `llvm.log`, `llvm.log2` and `llvm.sqrt` pass through
+//!     within 2 ulp. `llvm.nearbyint`/`llvm.roundeven` become `llvm.rint`,
+//!     which passes. `llvm.powi.<T>.i32` has no AIR form; it becomes
+//!     `air.pow.<T>` with the exponent converted by `sitofp`.
+//!     `llvm.ldexp.<T>.i32` keeps its integer parameter but Apple spells it
+//!     `air.ldexp.<T>`. `llvm.minimum`/`maximum` keep the fast spelling, the
+//!     only one verified to build.
 //!   * Every `llvm.vector.reduce.*` crashes the GPU backend (r11 finding
 //!     15, dumps/air_acceptance.txt reduce_*); a scalar chain of
 //!     `extractelement` + the operation passes (shuffle_reduce_manual_fadd),
@@ -30,7 +41,7 @@
 //!     @bitCast(uN))`) crashes the same way (review-a2/h_bitcast_rev.ll);
 //!     it becomes splat + `lshr` by the lane index + `and 1` + `icmp ne 0`
 //!     on `<N x i32>`, all of which pass.
-//!   * Accepted unchanged: sqrt exp exp2 log log2 fabs floor ceil trunc
+//!   * Accepted unchanged: sqrt exp2 log log2 fabs floor ceil trunc
 //!     rint fma fmuladd minnum maxnum copysign ctlz cttz ctpop bswap
 //!     bitreverse umin umax smin smax abs sadd/ssub/uadd/usub.sat
 //!     *.with.overflow assume trap memcpy memset memmove (r11 finding 14).
@@ -112,30 +123,41 @@ pub const Lowering = union(enum) {
 const RenameRule = struct {
     /// Segment after `llvm.`.
     op: []const u8,
-    /// Replacement for `llvm.<op>`.
-    to: []const u8,
+    /// Apple's function after `air.`: `air.<air>` precise, `air.fast_<air>`
+    /// under fast math, exactly as `xcrun metal` picks between them for
+    /// -fno-fast-math and -ffast-math.
+    air: []const u8 = "",
+    /// A replacement that is not such a pair (`llvm.rint`).
+    to: []const u8 = "",
+    /// Only the fast spelling is known to build.
+    always_fast: bool = false,
     /// Keep only the first suffix segment (`f32.i32` -> `f32`).
     drop_int_suffix: bool = false,
     exponent_to_float: bool = false,
 };
 
 const rename_rules = [_]RenameRule{
-    .{ .op = "sin", .to = "air.fast_sin" },
-    .{ .op = "cos", .to = "air.fast_cos" },
-    .{ .op = "tan", .to = "air.fast_tan" },
-    .{ .op = "log10", .to = "air.fast_log10" },
-    .{ .op = "exp10", .to = "air.fast_exp10" },
-    .{ .op = "pow", .to = "air.fast_pow" },
-    .{ .op = "powi", .to = "air.fast_pow", .drop_int_suffix = true, .exponent_to_float = true },
-    .{ .op = "ldexp", .to = "air.fast_ldexp", .drop_int_suffix = true },
+    .{ .op = "sin", .air = "sin" },
+    .{ .op = "cos", .air = "cos" },
+    .{ .op = "tan", .air = "tan" },
+    .{ .op = "log10", .air = "log10" },
+    .{ .op = "exp10", .air = "exp10" },
+    // Passed through, `llvm.exp` is lowered as the fast exp (up to 60 ulp;
+    // `zig build survey`), unlike `llvm.exp2`, `llvm.log` and `llvm.log2`.
+    .{ .op = "exp", .air = "exp" },
+    .{ .op = "pow", .air = "pow" },
+    .{ .op = "powi", .air = "pow", .drop_int_suffix = true, .exponent_to_float = true },
+    .{ .op = "ldexp", .air = "ldexp", .drop_int_suffix = true },
     .{ .op = "nearbyint", .to = "llvm.rint" },
     .{ .op = "roundeven", .to = "llvm.rint" },
-    .{ .op = "minimum", .to = "air.fast_fmin" },
-    .{ .op = "maximum", .to = "air.fast_fmax" },
+    .{ .op = "minimum", .air = "fmin", .always_fast = true },
+    .{ .op = "maximum", .air = "fmax", .always_fast = true },
 };
 
 /// Decide how a call to `name` is lowered. Non-intrinsics pass through.
-pub fn classify(gpa: Allocator, name: []const u8) Allocator.Error!Lowering {
+/// `fast_math` is the library's declaration (metadata.CompileOptions): it
+/// picks Apple's fast implementations over the precise ones.
+pub fn classify(gpa: Allocator, name: []const u8, fast_math: bool) Allocator.Error!Lowering {
     const prefix = "llvm.";
     if (!std.mem.startsWith(u8, name, prefix)) return .pass;
     const rest = name[prefix.len..];
@@ -160,7 +182,10 @@ pub fn classify(gpa: Allocator, name: []const u8) Allocator.Error!Lowering {
         if (rule.drop_int_suffix) {
             if (std.mem.findScalar(u8, suffix, '.')) |dot| suffix = suffix[0..dot];
         }
-        const new_name = try std.mem.concat(gpa, u8, &.{ rule.to, ".", suffix });
+        const new_name = if (rule.to.len > 0)
+            try std.mem.concat(gpa, u8, &.{ rule.to, ".", suffix })
+        else
+            try std.mem.concat(gpa, u8, &.{ "air.", if (fast_math or rule.always_fast) "fast_" else "", rule.air, ".", suffix });
         return .{ .rename = .{ .name = new_name, .exponent_to_float = rule.exponent_to_float } };
     }
     return .pass;
@@ -533,30 +558,36 @@ test "texture intrinsic table: canonical signatures, sampler positions, declare 
 
 test "rename table: every suffix, powi/ldexp suffix handling, pass-through" {
     const gpa = std.testing.allocator;
-    const cases = [_]struct { in: []const u8, out: []const u8 }{
-        .{ .in = "llvm.sin.f32", .out = "air.fast_sin.f32" },
-        .{ .in = "llvm.sin.f16", .out = "air.fast_sin.f16" },
-        .{ .in = "llvm.cos.v4f32", .out = "air.fast_cos.v4f32" },
-        .{ .in = "llvm.tan.v3f32", .out = "air.fast_tan.v3f32" },
-        .{ .in = "llvm.log10.v2f32", .out = "air.fast_log10.v2f32" },
-        .{ .in = "llvm.exp10.v2f16", .out = "air.fast_exp10.v2f16" },
-        .{ .in = "llvm.pow.v4f16", .out = "air.fast_pow.v4f16" },
-        .{ .in = "llvm.powi.f32.i32", .out = "air.fast_pow.f32" },
-        .{ .in = "llvm.powi.v4f32.i32", .out = "air.fast_pow.v4f32" },
-        .{ .in = "llvm.ldexp.f32.i32", .out = "air.fast_ldexp.f32" },
-        .{ .in = "llvm.nearbyint.f32", .out = "llvm.rint.f32" },
-        .{ .in = "llvm.roundeven.v4f32", .out = "llvm.rint.v4f32" },
-        .{ .in = "llvm.minimum.f32", .out = "air.fast_fmin.f32" },
-        .{ .in = "llvm.maximum.v4f16", .out = "air.fast_fmax.v4f16" },
+    // Precise under strict math (the default), Apple's fast ones under fast
+    // math; `llvm.rint` and the fmin/fmax pair do not depend on it.
+    const cases = [_]struct { in: []const u8, strict: []const u8, fast: []const u8 }{
+        .{ .in = "llvm.sin.f32", .strict = "air.sin.f32", .fast = "air.fast_sin.f32" },
+        .{ .in = "llvm.sin.f16", .strict = "air.sin.f16", .fast = "air.fast_sin.f16" },
+        .{ .in = "llvm.cos.v4f32", .strict = "air.cos.v4f32", .fast = "air.fast_cos.v4f32" },
+        .{ .in = "llvm.tan.v3f32", .strict = "air.tan.v3f32", .fast = "air.fast_tan.v3f32" },
+        .{ .in = "llvm.log10.v2f32", .strict = "air.log10.v2f32", .fast = "air.fast_log10.v2f32" },
+        .{ .in = "llvm.exp10.v2f16", .strict = "air.exp10.v2f16", .fast = "air.fast_exp10.v2f16" },
+        .{ .in = "llvm.exp.f32", .strict = "air.exp.f32", .fast = "air.fast_exp.f32" },
+        .{ .in = "llvm.pow.v4f16", .strict = "air.pow.v4f16", .fast = "air.fast_pow.v4f16" },
+        .{ .in = "llvm.powi.f32.i32", .strict = "air.pow.f32", .fast = "air.fast_pow.f32" },
+        .{ .in = "llvm.powi.v4f32.i32", .strict = "air.pow.v4f32", .fast = "air.fast_pow.v4f32" },
+        .{ .in = "llvm.ldexp.f32.i32", .strict = "air.ldexp.f32", .fast = "air.fast_ldexp.f32" },
+        .{ .in = "llvm.nearbyint.f32", .strict = "llvm.rint.f32", .fast = "llvm.rint.f32" },
+        .{ .in = "llvm.roundeven.v4f32", .strict = "llvm.rint.v4f32", .fast = "llvm.rint.v4f32" },
+        .{ .in = "llvm.minimum.f32", .strict = "air.fast_fmin.f32", .fast = "air.fast_fmin.f32" },
+        .{ .in = "llvm.maximum.v4f16", .strict = "air.fast_fmax.v4f16", .fast = "air.fast_fmax.v4f16" },
     };
     for (cases) |cs| {
-        const l = try classify(gpa, cs.in);
-        defer l.deinit(gpa);
-        try std.testing.expectEqualStrings(cs.out, l.rename.name);
-        try std.testing.expectEqual(std.mem.startsWith(u8, cs.in, "llvm.powi."), l.rename.exponent_to_float);
+        const strict = try classify(gpa, cs.in, false);
+        defer strict.deinit(gpa);
+        try std.testing.expectEqualStrings(cs.strict, strict.rename.name);
+        try std.testing.expectEqual(std.mem.startsWith(u8, cs.in, "llvm.powi."), strict.rename.exponent_to_float);
+        const fast = try classify(gpa, cs.in, true);
+        defer fast.deinit(gpa);
+        try std.testing.expectEqualStrings(cs.fast, fast.rename.name);
     }
     const untouched = [_][]const u8{
-        "llvm.sqrt.f32",         "llvm.exp.f32",       "llvm.exp2.v4f32",             "llvm.log.f16",     "llvm.log2.f32",
+        "llvm.sqrt.f32",         "llvm.exp2.f32",      "llvm.exp2.v4f32",             "llvm.log.f16",     "llvm.log2.f32",
         "llvm.fabs.v3f32",       "llvm.floor.f32",     "llvm.ceil.f32",               "llvm.trunc.f32",   "llvm.rint.v4f32",
         "llvm.rint.f32",         "llvm.fma.v4f32",     "llvm.fmuladd.f32",            "llvm.minnum.f32",  "llvm.maxnum.v4f16",
         "llvm.copysign.f32",     "llvm.ctlz.i32",      "llvm.cttz.i32",               "llvm.ctpop.i32",   "llvm.bswap.i32",
@@ -565,21 +596,21 @@ test "rename table: every suffix, powi/ldexp suffix handling, pass-through" {
         "llvm.memcpy.p0.p1.i64", "llvm.memset.p0.i64", "llvm.memmove.p0.p0.i64",      "air.fast_sin.f32", "my.helper",
     };
     for (untouched) |name| {
-        const l = try classify(gpa, name);
+        const l = try classify(gpa, name, false);
         defer l.deinit(gpa);
         try std.testing.expect(l == .pass);
     }
     // A reduce op without an expansion is refused, never passed through
     // (the llvm.* name crashes or fails to link at pipeline creation).
     for ([_][]const u8{ "llvm.vector.reduce.fmaximum.v4f32", "llvm.vector.reduce.fminimum.v2f16", "llvm.vector.reduce.bogus.v4f32" }) |name| {
-        const l = try classify(gpa, name);
+        const l = try classify(gpa, name, false);
         defer l.deinit(gpa);
         try std.testing.expect(l == .refuse);
     }
     for ([_][]const u8{ "fadd", "fmul", "fmax", "fmin", "add", "mul", "and", "or", "xor", "umax", "umin", "smax", "smin" }, 0..) |op, i| {
         var buf: [64]u8 = undefined;
         const name = try std.mem.print(&buf, "llvm.vector.reduce.{s}.v4i32", .{op});
-        const l = try classify(gpa, name);
+        const l = try classify(gpa, name, false);
         try std.testing.expectEqual(@as(ReduceOp, @fromBackingInt(@intCast(i))), l.reduce);
     }
 }
@@ -720,7 +751,7 @@ test "reduce lowering: fadd with start operand, fmax via maxnum, integer min via
 
 const RenameCase = struct { name: []const u8 };
 fn renameBody(b: *Builder, wip: *WipFunction, d: *TestDeclarer, ctx: RenameCase) Error!Value {
-    const l = try classify(b.gpa, ctx.name);
+    const l = try classify(b.gpa, ctx.name, false);
     defer l.deinit(b.gpa);
     const base_ty = wip.arg(0).typeOfWip(wip);
     const llvm_ty = try b.fnType(base_ty, &.{ base_ty, .i32 }, .normal);
@@ -731,18 +762,18 @@ fn renameBody(b: *Builder, wip: *WipFunction, d: *TestDeclarer, ctx: RenameCase)
     return wip.call(.normal, .ccc, .none, new_ty, callee, &args, "");
 }
 
-test "powi becomes air.fast_pow with a sitofp exponent (splat for vectors); ldexp keeps its i32" {
+test "powi becomes air.pow with a sitofp exponent (splat for vectors); ldexp keeps its i32" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const gpa = arena.allocator();
     const scalar = try testLower(gpa, renameBody, RenameCase{ .name = "llvm.powi.f32.i32" }, .{ .elem = .float }, &.{ .{ .elem = .float }, .{ .elem = .i32 } });
-    try std.testing.expect(std.mem.find(u8, scalar, "declare float @air.fast_pow.f32(float %0, float %1)") != null);
+    try std.testing.expect(std.mem.find(u8, scalar, "declare float @air.pow.f32(float %0, float %1)") != null);
     try std.testing.expect(std.mem.find(u8, scalar, "sitofp i32 %1 to float") != null);
     const vector = try testLower(gpa, renameBody, RenameCase{ .name = "llvm.powi.v4f32.i32" }, .{ .len = 4, .elem = .float }, &.{ .{ .len = 4, .elem = .float }, .{ .elem = .i32 } });
-    try std.testing.expect(std.mem.find(u8, vector, "declare <4 x float> @air.fast_pow.v4f32(<4 x float> %0, <4 x float> %1)") != null);
+    try std.testing.expect(std.mem.find(u8, vector, "declare <4 x float> @air.pow.v4f32(<4 x float> %0, <4 x float> %1)") != null);
     try std.testing.expect(std.mem.find(u8, vector, "shufflevector <1 x float>") != null);
     const ldexp = try testLower(gpa, renameBody, RenameCase{ .name = "llvm.ldexp.f32.i32" }, .{ .elem = .float }, &.{ .{ .elem = .float }, .{ .elem = .i32 } });
-    try std.testing.expect(std.mem.find(u8, ldexp, "declare float @air.fast_ldexp.f32(float %0, i32 %1)") != null);
+    try std.testing.expect(std.mem.find(u8, ldexp, "declare float @air.ldexp.f32(float %0, i32 %1)") != null);
     try std.testing.expect(std.mem.find(u8, ldexp, "sitofp") == null);
 }
 
@@ -797,23 +828,23 @@ test "int-to-bool-vector bitcast becomes splat + lshr + and + icmp on <N x i32>"
 
 test "workarounds: *mul.fix.sat renames to air.mad_sat with the zero-scale requirement, round expands" {
     const gpa = std.testing.allocator;
-    const s = try classify(gpa, "llvm.smul.fix.sat.i32");
+    const s = try classify(gpa, "llvm.smul.fix.sat.i32", false);
     defer s.deinit(gpa);
     try std.testing.expectEqualStrings("air.mad_sat.s.i32", s.rename.name);
     try std.testing.expect(s.rename.zero_scale);
-    const u = try classify(gpa, "llvm.umul.fix.sat.v4i32");
+    const u = try classify(gpa, "llvm.umul.fix.sat.v4i32", false);
     defer u.deinit(gpa);
     try std.testing.expectEqualStrings("air.mad_sat.u.v4i32", u.rename.name);
     try std.testing.expect(u.rename.zero_scale);
-    const r = try classify(gpa, "llvm.round.v4f16");
+    const r = try classify(gpa, "llvm.round.v4f16", false);
     defer r.deinit(gpa);
     try std.testing.expect(r == .round_keep_sign);
     // Other renames carry no scale requirement; the non-saturating fixed-point
     // multiply is not touched.
-    const p = try classify(gpa, "llvm.pow.f32");
+    const p = try classify(gpa, "llvm.pow.f32", false);
     defer p.deinit(gpa);
     try std.testing.expect(!p.rename.zero_scale);
-    const plain = try classify(gpa, "llvm.smul.fix.i32");
+    const plain = try classify(gpa, "llvm.smul.fix.i32", false);
     defer plain.deinit(gpa);
     try std.testing.expect(plain == .pass);
 }
