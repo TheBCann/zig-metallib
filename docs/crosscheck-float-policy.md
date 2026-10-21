@@ -102,8 +102,11 @@ of a hundred seeds mismatched, every one through a signalling NaN reaching `fmin
   tests on the bit pattern, since Metal has no such intrinsic, and the splice drops the
   comment.
 - **Metal, recorded under "Findings" in `docs/crosscheck.md`:** `@round` loses the sign of
-  a negative zero; `@rem` is not the exact remainder. Both persist through Apple's
-  assembler.
+  a negative zero; `@rem` is not the exact remainder; an fma with two constant
+  multiplicands whose exact product is a denormal is folded and flushed, where the hardware
+  fma keeps the intermediate (found by the review of the float-mode generator, which now
+  always gives an fma an input-dependent multiplicand, since LLVM folds even a local that
+  only ever held constants). All persist through Apple's assembler.
 - **Documented deviations, normalised by the policy:** single-precision flush to zero, NaN
   canonicalisation, contraction of separate multiply and add.
 

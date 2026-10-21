@@ -81,8 +81,9 @@ The result goes to `zig-out/crosscheck/reduce/<seed>/`: `original.zig`, `reduced
 last candidate tried. The candidates are built in a cache directory of their own under
 that folder, deleted when the reduction ends: every candidate is a new body, and hundreds
 of kernel, library and driver builds would otherwise fill the project's cache and the disk.
-The reduced file runs like any other body:
-`zig build crosscheck -Dcrosscheck-body=zig-out/crosscheck/reduce/<seed>/reduced.zig`.
+The reduced file runs like any other body, under the seed and mode it was judged with, which
+its header repeats: `zig build crosscheck -Dseed=<seed> [-Dcrosscheck-floats=true]
+-Dcrosscheck-body=zig-out/crosscheck/reduce/<seed>/reduced.zig`.
 
 `-Dcrosscheck-known=true` makes the generator emit the operations recorded under
 "Findings" again. It exists to re-test them on a newer macOS, and to give the reducer
@@ -172,14 +173,15 @@ in `tools/crosscheck/known/`:
 | `@subWithOverflow(a, b)[1]` | overflow bit of `llvm.ssub.with.overflow.i32` | GPU and CPU disagree on 2,103 of 4,096 inputs | `zig build crosscheck -Dcrosscheck-body=tools/crosscheck/known/sub_overflow_bit.zig` |
 | `@round(x)` on f32 | `llvm.round.f32` | returns `+0.0` where the result is `-0.0` (949 of 4,096 inputs; `floor`, `ceil`, `trunc` are exact) | `zig build crosscheck -Dcrosscheck-body=tools/crosscheck/known/round_negative_zero.zig` |
 | `@rem(x, y)` on f32 | `frem` | not the exact remainder: 0 for 1.02e-10, 8 for 6.91, `-inf` for finite operands (1,067 of 4,096) | `zig build crosscheck -Dcrosscheck-body=tools/crosscheck/known/rem_inexact.zig` |
+| `@mulAdd(f32, C1, C2, x)` with a denormal constant product | `llvm.fma.f32` with two constant multiplicands | the compiler folds the product and flushes it, so the fma degenerates to `x`; the hardware fma keeps the exact intermediate (223 of 4,096; 266 with the float-mode inputs) | `zig build crosscheck -Dcrosscheck-body=tools/crosscheck/known/fma_constant_product_flush.zig` |
 
-**Attribution: all five are faults in Metal's GPU compiler.** Each reproducer was also
+**Attribution: all six are faults in Metal's GPU compiler.** Each reproducer was also
 run through `zig build crosscheck-apple`, where Apple's own assembler builds the library
 from our printed IR, and failed identically: the same crash, and the same mismatch counts
-(1,990, 2,103, 949 and 1,067). That rules out this project's bitcode encoder and container. Our text
+(1,990, 2,103, 949, 1,067 and 223). That rules out this project's bitcode encoder and container. Our text
 rewrite is ruled out too: the intrinsic declarations and calls in the rewritten IR are the
 ones Zig emitted, apart from the attribute group our cleanup drops from every `declare`.
-This project's assembler passes all five intrinsics to Metal unchanged
+This project's assembler passes all six intrinsics to Metal unchanged
 (`tools/air/intrinsics.zig`). The overflow bit of `@mulWithOverflow` matches. The two float
 findings came out of the probes behind [docs/crosscheck-float-policy.md](crosscheck-float-policy.md),
 which also records the GPU behaviours that are normalised rather than reported.
@@ -283,6 +285,12 @@ On an Apple M3 (macOS 26.3, Zig 0.18.0-dev.253):
   `fmin`/`fmax`, now normalised) and 2 `REFUSED` (LLVM 22 spellings, now parsed); after
   those changes a fresh 100-seed float sweep is 100 match, a float program passes through
   `crosscheck-apple`, the default library is byte-identical and 114 unit tests pass.
+- **Float mode after its review**: eight confirmed findings fixed (the fma constant-product
+  flush recorded as the sixth Metal finding; exact-width float constants so a signalling
+  NaN stays signalling; strings left alone by the text rewrites; the reducer judging under
+  the failing seed's inputs and mode, cleaning its cache on every exit and reverting the
+  trial it was in when its budget ran out). Another 100-seed float sweep is 100 match; 115
+  unit tests.
 - The default build is untouched: `default.metallib` is byte-identical with and without
   the bench.
 

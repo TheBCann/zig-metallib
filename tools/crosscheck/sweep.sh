@@ -51,9 +51,15 @@ for seed in $(seq "$from" "$to"); do
     mkdir -p "$out_dir/$seed"
     printf '%s\n' "$log" > "$out_dir/$seed/log.txt"
     # Regenerate the exact body for the seed as a standalone reproducer.
+    # The same spellings `zig build` treats as true: the bare flag or `=true`.
     gen_args=""
-    case "${CROSSCHECK_ARGS:-}" in *floats*) gen_args="$gen_args --floats";; esac
-    case "${CROSSCHECK_ARGS:-}" in *known*) gen_args="$gen_args --include-known-findings";; esac
+    # shellcheck disable=SC2086
+    for tok in ${CROSSCHECK_ARGS:-}; do
+      case "$tok" in
+        -Dcrosscheck-floats|-Dcrosscheck-floats=true) gen_args="$gen_args --floats";;
+        -Dcrosscheck-known|-Dcrosscheck-known=true) gen_args="$gen_args --include-known-findings";;
+      esac
+    done
     # shellcheck disable=SC2086
     zig run tools/crosscheck/gen.zig -- --seed="$seed" $gen_args "$out_dir/$seed/body.zig" >/dev/null 2>&1
     reason=$(grep -m1 -E '^(FAIL|air-splice:|error:)' <<<"$log" | cut -c1-140)

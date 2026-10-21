@@ -157,6 +157,9 @@ pub const Engine = struct {
     kept: u32 = 0,
     max_candidates: u32,
     verbose: bool,
+    /// Set when the budget ran out: every later trial is rejected unjudged
+    /// (so the caller reverts it) and `run` stops after the current pass.
+    exhausted: bool = false,
 
     const ListSlot = struct { list: *[]Stmt, in_loop: bool };
     const ExprSlot = struct { p: **Expr, rt: bool };
@@ -168,7 +171,10 @@ pub const Engine = struct {
     /// Renders the current program and asks the judge. Returns whether the
     /// change that produced it is kept.
     fn accept(e: *Engine, what: []const u8) !bool {
-        if (e.tried >= e.max_candidates) return error.CandidateBudgetExhausted;
+        if (e.exhausted or e.tried >= e.max_candidates) {
+            e.exhausted = true;
+            return false;
+        }
         var hb: std.Io.Writer.Allocating = .init(e.gpa);
         try e.header(&hb);
         const text = try program.render(e.gpa, e.prog, hb.written());
@@ -185,10 +191,15 @@ pub const Engine = struct {
         while (true) {
             var changed = false;
             if (try e.passStatements()) changed = true;
+            if (e.exhausted) return error.CandidateBudgetExhausted;
             if (try e.passHoist()) changed = true;
+            if (e.exhausted) return error.CandidateBudgetExhausted;
             if (try e.passSimplify()) changed = true;
+            if (e.exhausted) return error.CandidateBudgetExhausted;
             if (try e.passExprs()) changed = true;
+            if (e.exhausted) return error.CandidateBudgetExhausted;
             if (try e.passLocals()) changed = true;
+            if (e.exhausted) return error.CandidateBudgetExhausted;
             if (!changed) return;
         }
     }
@@ -767,7 +778,11 @@ pub fn main(init: std.process.Init) !void {
 
     var prog = try program.generate(arena, sd, .{ .include_known = include_known, .floats = floats });
     const known_note: []const u8 = if (include_known and floats) " -Dcrosscheck-known=true -Dcrosscheck-floats=true" else if (include_known) " -Dcrosscheck-known=true" else if (floats) " -Dcrosscheck-floats=true" else "";
-    const build_args: []const []const u8 = if (floats) &.{"-Dcrosscheck-floats=true"} else &.{};
+    // The judge runs every candidate under the failing seed's input stream
+    // and mode; the reduced file's hint repeats both.
+    const mode_note: []const u8 = if (floats) " -Dcrosscheck-floats=true" else "";
+    const seed_arg = try std.fmt.allocPrint(arena, "-Dseed={d}", .{sd});
+    const build_args: []const []const u8 = if (floats) &.{ seed_arg, "-Dcrosscheck-floats=true" } else &.{seed_arg};
     const original_header = try std.fmt.allocPrint(arena,
         \\// The program of `zig build crosscheck -Dseed={d}{s}`, as crosscheck-reduce
         \\// started from it.
@@ -796,10 +811,12 @@ pub fn main(init: std.process.Init) !void {
     std.debug.print("info reduce seed {d}{s}: {d} statements, {d} nodes; failure: {t} {s}\n", .{ sd, known_note, stmts0, nodes0, judge.target.bucket, judge.target.key });
     if (judge.target.bucket == .match) {
         std.debug.print("nothing to reduce: seed {d} matches\n", .{sd});
+        Io.Dir.cwd().deleteTree(io, judge.cache_dir) catch {}; // exit skips the defer
         std.process.exit(3);
     }
     if (judge.target.bucket == .skip) {
         std.debug.print("SKIP no Metal device; cannot judge candidates\n", .{});
+        Io.Dir.cwd().deleteTree(io, judge.cache_dir) catch {};
         std.process.exit(77);
     }
 
@@ -821,11 +838,11 @@ pub fn main(init: std.process.Init) !void {
         \\// {d} statements / {d} nodes -> {d} / {d}, {d} candidates, {d} kept.
         \\// Failure: {t} {s}
         \\//
-        \\//   zig build crosscheck -Dcrosscheck-body=<this file>
+        \\//   zig build crosscheck -Dseed={d}{s} -Dcrosscheck-body=<this file>
         \\pub const seed: u64 = {d};
         \\
         \\
-    , .{ sd, known_note, stmts0, nodes0, program.countStmts(prog.stmts), program.countNodes(&prog), engine.tried, engine.kept, judge.target.bucket, judge.target.key, sd });
+    , .{ sd, known_note, stmts0, nodes0, program.countStmts(prog.stmts), program.countNodes(&prog), engine.tried, engine.kept, judge.target.bucket, judge.target.key, sd, mode_note, sd });
     const reduced = try program.render(arena, &prog, reduced_header);
     const reduced_path = try std.fmt.allocPrint(arena, "{s}/reduced.zig", .{dir});
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = reduced_path, .data = reduced });
@@ -939,6 +956,27 @@ test "the engine shrinks a float program, keeping types consistent" {
     try std.testing.expect(program.countStmts(prog.stmts) <= 1);
     try std.testing.expect(program.countNodes(&prog) <= 6);
     try std.testing.expectEqual(@as(u8, 0), prog.nvars);
+}
+
+test "running out of candidates leaves the program exactly as last kept" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const gpa = arena.allocator();
+    var prog = try program.generate(gpa, 3, .{});
+    const before = try program.render(gpa, &prog, "");
+    // A judge that keeps nothing, and a budget of one: the single trial is
+    // rejected unjudged and reverted, and run() reports the exhaustion.
+    var prop: TextProperty = .{ .needle = "this text appears in no program" };
+    var engine: Engine = .{
+        .gpa = gpa,
+        .judge = .{ .ctx = @ptrCast(&prop), .func = TextProperty.judge },
+        .prog = &prog,
+        .seed = 3,
+        .max_candidates = 1,
+        .verbose = false,
+    };
+    try std.testing.expectError(error.CandidateBudgetExhausted, engine.run());
+    try std.testing.expectEqualStrings(before, try program.render(gpa, &prog, ""));
 }
 
 test "hoisting a loop body out of its loop drops break and continue, nested loops keep theirs" {

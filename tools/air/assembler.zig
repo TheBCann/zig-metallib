@@ -843,6 +843,53 @@ const ModuleState = struct {
         };
     }
 
+    /// A float literal as a constant of `ty`, built at the type's own width: a
+    /// detour through f64 and `@floatCast` would quiet a signalling NaN, which
+    /// the splice took care to keep signalling. Spellings: `f0x` + the type's
+    /// bit pattern (LLVM 22), legacy `0xH` (half) and `0x` + 16 digits (a
+    /// double that must convert to the type exactly, as LLVM requires), and
+    /// decimal.
+    fn floatLiteralConst(m: *ModuleState, c: *Cursor, w: []const u8, ty: Type) Error!Constant {
+        const b = m.b;
+        if (std.mem.startsWith(u8, w, "f0x")) {
+            const hex = w[3..];
+            const bits = std.fmt.parseInt(u64, hex, 16) catch return fail(c.line, c.s, "bad f0x float literal", error.Syntax);
+            const ok = switch (hex.len) {
+                4 => ty == .half,
+                8 => ty == .float,
+                16 => ty == .double,
+                else => false,
+            };
+            if (!ok) return fail(c.line, c.s, "f0x float literal does not match the constant's type", error.Syntax);
+            return switch (ty) {
+                .half => b.halfConst(@bitCast(@as(u16, @intCast(bits)))),
+                .float => b.floatConst(@bitCast(@as(u32, @intCast(bits)))),
+                else => b.doubleConst(@bitCast(bits)),
+            };
+        }
+        if (std.mem.startsWith(u8, w, "0xH")) {
+            if (ty != .half) return fail(c.line, c.s, "0xH half literal for a non-half type", error.Syntax);
+            const bits = std.fmt.parseInt(u16, w[3..], 16) catch return fail(c.line, c.s, "bad half literal", error.Syntax);
+            return b.halfConst(@bitCast(bits));
+        }
+        if (std.mem.startsWith(u8, w, "0x")) {
+            if (w.len > 2 and std.ascii.isAlphabetic(w[2]) and !std.ascii.isHex(w[2]))
+                return fail(c.line, c.s, "unsupported float literal kind", error.Unsupported);
+            const bits = std.fmt.parseInt(u64, w[2..], 16) catch return fail(c.line, c.s, "bad hex float literal", error.Syntax);
+            return switch (ty) {
+                .double => b.doubleConst(@bitCast(bits)),
+                .float => b.floatConst(@bitCast(narrowDoubleBits(bits, 32) orelse return fail(c.line, c.s, "floating point constant invalid for type", error.Syntax))),
+                else => b.halfConst(@bitCast(@as(u16, @intCast(narrowDoubleBits(bits, 16) orelse return fail(c.line, c.s, "floating point constant invalid for type", error.Syntax))))),
+            };
+        }
+        const value = std.fmt.parseFloat(f64, w) catch return fail(c.line, c.s, "bad float literal", error.Syntax);
+        return switch (ty) {
+            .float => b.floatConst(@floatCast(value)),
+            .half => b.halfConst(@floatCast(value)),
+            else => b.doubleConst(value),
+        };
+    }
+
     fn parseConst(m: *ModuleState, c: *Cursor, ty: Type) Error!Constant {
         const b = m.b;
         c.skipWs();
@@ -914,12 +961,7 @@ const ModuleState = struct {
 
         if (ty == .float or ty == .half or ty == .double) {
             if (try m.specialFloat(c, w, ty)) |k| return k;
-            const value = try parseFloatLiteral(w, c);
-            return switch (ty) {
-                .float => b.floatConst(@floatCast(value)),
-                .half => b.halfConst(@floatCast(value)),
-                else => b.doubleConst(value),
-            };
+            return m.floatLiteralConst(c, w, ty);
         }
         if (std.fmt.parseInt(i64, w, 10)) |v| return b.intConst(ty, v) else |_| {}
         if (std.fmt.parseInt(u64, w, 10)) |v| return b.intConst(ty, v) else |_| {}
@@ -1027,49 +1069,53 @@ const ModuleState = struct {
     }
 };
 
-/// LLVM prints `1.000000e+00`, `-0.5`, or hex IEEE-754 doubles `0x3FF0...`
-/// (and `0xH3C00` for half). LLVM 22 also prints the bit pattern of the
-/// constant's own type, `f0x` + 4 (half), 8 (float) or 16 (double) hex
-/// digits, for values that do not round-trip through decimal; Apple's LLVM
-/// does not know that spelling, so the splice rewrites it in the text, and
-/// the assembler accepts it for inputs that did not pass through the splice.
-fn parseFloatLiteral(w: []const u8, c: *Cursor) Error!f64 {
-    if (std.mem.startsWith(u8, w, "f0x")) {
-        const hex = w[3..];
-        return switch (hex.len) {
-            4 => @floatCast(@as(f16, @bitCast(std.fmt.parseInt(u16, hex, 16) catch return fail(c.line, c.s, "bad f0x half literal", error.Syntax)))),
-            8 => @floatCast(@as(f32, @bitCast(std.fmt.parseInt(u32, hex, 16) catch return fail(c.line, c.s, "bad f0x float literal", error.Syntax)))),
-            16 => @bitCast(std.fmt.parseInt(u64, hex, 16) catch return fail(c.line, c.s, "bad f0x double literal", error.Syntax)),
-            else => fail(c.line, c.s, "bad f0x float literal: expected 4, 8 or 16 hex digits", error.Syntax),
-        };
-    }
-    if (std.mem.startsWith(u8, w, "0xH")) {
-        const bits = std.fmt.parseInt(u16, w[3..], 16) catch return fail(c.line, c.s, "bad half literal", error.Syntax);
-        return @floatCast(@as(f16, @bitCast(bits)));
-    }
-    if (std.mem.startsWith(u8, w, "0x")) {
-        if (w.len > 2 and std.ascii.isAlphabetic(w[2]) and !std.ascii.isHex(w[2]))
-            return fail(c.line, c.s, "unsupported float literal kind", error.Unsupported);
-        const bits = std.fmt.parseInt(u64, w[2..], 16) catch return fail(c.line, c.s, "bad hex float literal", error.Syntax);
-        return @bitCast(bits);
-    }
-    return std.fmt.parseFloat(f64, w) catch fail(c.line, c.s, "bad float literal", error.Syntax);
-}
-
 /// The bit pattern of ±inf, a quiet NaN (`quiet` bit plus `payload`) or a
-/// signalling NaN (`payload` alone, at least 1) of the given float type.
+/// signalling NaN of the given float type, as APFloat::makeNaN builds them:
+/// the payload is masked to the mantissa; a signalling NaN clears the quiet
+/// bit and, left with nothing, sets the bit below it; a quiet NaN ORs it in.
 pub fn specialFloatBits(ty: Type, neg: bool, inf: bool, signalling: bool, payload: u64) ?u64 {
-    const exp: u64, const quiet: u64, const mant_bits: u6, const sign: u64 = switch (ty) {
-        .float => .{ 0x7f800000, 0x00400000, 23, 0x80000000 },
-        .half => .{ 0x7c00, 0x0200, 10, 0x8000 },
-        .double => .{ 0x7ff0000000000000, 0x0008000000000000, 52, 0x8000000000000000 },
+    const exp: u64, const quiet: u64, const mant_mask: u64, const sign: u64 = switch (ty) {
+        .float => .{ 0x7f800000, 0x00400000, 0x007fffff, 0x80000000 },
+        .half => .{ 0x7c00, 0x0200, 0x03ff, 0x8000 },
+        .double => .{ 0x7ff0000000000000, 0x0008000000000000, 0x000fffffffffffff, 0x8000000000000000 },
         else => return null,
     };
-    if (payload >= quiet) return null;
     var mant: u64 = 0;
-    if (!inf) mant = if (signalling) (if (payload == 0) 1 else payload) else quiet | payload;
-    _ = mant_bits;
+    if (!inf) {
+        var p = payload & mant_mask;
+        if (signalling) {
+            p &= ~quiet;
+            if (p == 0) p = quiet >> 1;
+            mant = p;
+        } else mant = quiet | p;
+    }
     return (if (neg) sign else 0) | exp | mant;
+}
+
+/// A legacy `0x` double bit pattern as the bit pattern of a narrower type,
+/// exactly: finite values must convert without rounding (LLVM rejects the
+/// literal otherwise), a NaN keeps its payload (shifted) and stays signalling
+/// or quiet, and a NaN whose payload would be lost is rejected.
+fn narrowDoubleBits(bits: u64, width: u8) ?u32 {
+    const sign: u64 = bits >> 63;
+    const exp: u64 = (bits >> 52) & 0x7ff;
+    const mant: u64 = bits & 0x000fffffffffffff;
+    const shift: u6 = if (width == 32) 29 else 42;
+    if (exp == 0x7ff) {
+        if (mant & ((@as(u64, 1) << shift) - 1) != 0) return null;
+        const exp_bits: u64 = if (width == 32) 0x7f800000 else 0x7c00;
+        const sign_bits: u64 = if (width == 32) sign << 31 else sign << 15;
+        return @intCast(sign_bits | exp_bits | (mant >> shift));
+    }
+    const v: f64 = @bitCast(bits);
+    if (width == 32) {
+        const f: f32 = @floatCast(v);
+        if (@as(f64, f) != v) return null;
+        return @bitCast(f);
+    }
+    const h: f16 = @floatCast(v);
+    if (@as(f64, h) != v) return null;
+    return @as(u16, @bitCast(h));
 }
 
 fn allDigits(s: []const u8) bool {
@@ -4614,10 +4660,15 @@ test "special float values: inf, nan, snan with payloads, as LLVM 22 prints them
     const gpa = arena.allocator();
     try std.testing.expectEqual(@as(?u64, 0xFFFFFFFE), specialFloatBits(.float, true, false, false, 0x3FFFFE));
     try std.testing.expectEqual(@as(?u64, 0x7F800000), specialFloatBits(.float, false, true, false, 0));
-    try std.testing.expectEqual(@as(?u64, 0x7F800001), specialFloatBits(.float, false, false, true, 0));
+    // As APFloat::makeNaN: a signalling NaN with no payload sets the bit below
+    // the quiet bit; a payload with the quiet bit set is masked, not refused.
+    try std.testing.expectEqual(@as(?u64, 0x7FA00000), specialFloatBits(.float, false, false, true, 0));
+    try std.testing.expectEqual(@as(?u64, 0x7F800001), specialFloatBits(.float, false, false, true, 1));
     try std.testing.expectEqual(@as(?u64, 0x7FC00000), specialFloatBits(.float, false, false, false, 0));
+    try std.testing.expectEqual(@as(?u64, 0x7FC00000), specialFloatBits(.float, false, false, false, 0x400000));
+    try std.testing.expectEqual(@as(?u64, 0x7FFFFFFF), specialFloatBits(.float, false, false, false, 0x7FFFFF));
     try std.testing.expectEqual(@as(?u64, 0xFE00), specialFloatBits(.half, true, false, false, 0));
-    try std.testing.expectEqual(@as(?u64, null), specialFloatBits(.float, false, false, false, 0x400000));
+    try std.testing.expectEqual(@as(?u64, 0x7D00), specialFloatBits(.half, false, false, true, 0));
     // The constants are built with the exact bit pattern; the Builder prints
     // them as doubles with the whole mantissa shifted, quiet bit included:
     // -nan(0x3FFFFE) is 0xFFFFFFFFC0000000, +qnan 0x7FF8000000000000.
@@ -4634,7 +4685,40 @@ test "special float values: inf, nan, snan with payloads, as LLVM 22 prints them
     );
     try std.testing.expect(has(text, "0xFFFFFFFFC0000000"));
     try std.testing.expect(has(text, "0x7FF0000000000000") and has(text, "0xFFF0000000000000"));
-    try std.testing.expect(has(text, "0x7FF8000000000000") and has(text, "0x7FF0000020000000"));
+    try std.testing.expect(has(text, "0x7FF8000000000000") and has(text, "0x7FF4000000000000"));
+}
+
+test "float constants are built at their own width: a signalling NaN stays signalling" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const gpa = arena.allocator();
+    // Legacy double spellings of f32/f16 signalling NaNs (payload in the kept
+    // bits) and f0x spellings come back with the same bits; a payload that
+    // would be lost in the narrowing is refused, as LLVM refuses it.
+    const text = try testRoundTrip(gpa, test_header ++
+        \\define float @fragmentShader(float %__0, half %__1) {
+        \\  %__3 = fadd float %__0, 0x7FF0000020000000
+        \\  %__4 = fadd float %__3, f0x7F800001
+        \\  %__5 = fadd half %__1, 0x7FF4000000000000
+        \\  %__6 = fadd half %__5, 0xH7D00
+        \\  %__7 = fpext half %__6 to float
+        \\  %__8 = fadd float %__4, %__7
+        \\  ret float %__8
+        \\}
+        \\
+    );
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, text, "0x7FF0000020000000"));
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, text, "0xH7D00"));
+    // A NaN payload that the narrowing would drop is a syntax error, as in LLVM.
+    var b2 = try Builder.init(.{ .allocator = gpa, .strip = true, .name = "air-splice" });
+    defer b2.deinit();
+    try std.testing.expectError(error.Syntax, build(&b2, gpa, test_header ++
+        \\define float @fragmentShader(float %__0) {
+        \\  %__2 = fadd float %__0, 0x7FF0000000000001
+        \\  ret float %__2
+        \\}
+        \\
+    , .{ .entry = "fragmentShader", .fm = fragment_fm }, air_target.default));
 }
 
 test "float literals in LLVM 22's f0x bit-pattern form are parsed by width" {

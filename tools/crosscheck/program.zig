@@ -333,6 +333,27 @@ pub const Expr = union(enum) {
     ftoi: *Expr,
 };
 
+/// Whether an expression depends on an input (`a` or `b`). Locals do not
+/// count: LLVM constant-folds one that is only ever assigned constants.
+pub fn inputDependent(e: *const Expr) bool {
+    return switch (e.*) {
+        .a, .b => true,
+        .v, .constant, .fconst => false,
+        .un => |n| inputDependent(n.x),
+        .fun => |n| inputDependent(n.x),
+        .bin => |n| inputDependent(n.x) or inputDependent(n.y),
+        .fbin => |n| inputDependent(n.x) or inputDependent(n.y),
+        .ffma => |n| inputDependent(n.x) or inputDependent(n.y) or inputDependent(n.z),
+        .select => |n| condInputDependent(n.c) or inputDependent(n.x) or inputDependent(n.y),
+        .fsel => |n| condInputDependent(n.c) or inputDependent(n.x) or inputDependent(n.y),
+        .fin, .fromint, .fbits, .ftoi => |x| inputDependent(x),
+    };
+}
+
+fn condInputDependent(c: *const Cond) bool {
+    return inputDependent(c.x) or inputDependent(c.y) or (if (c.rest) |r| condInputDependent(r.c) else false);
+}
+
 pub fn exprType(e: *const Expr) Ty {
     return switch (e.*) {
         .a, .b, .v, .constant, .un, .bin, .select, .fbits, .ftoi => .int,
@@ -541,9 +562,15 @@ pub const Gen = struct {
                 return g.new(.{ .fbin = .{ .op = op, .x = x, .y = y } });
             },
             14, 15 => {
-                const x = try g.fexpr(d, rt);
+                var x = try g.fexpr(d, rt);
                 const y = try g.fexpr(d, rt);
                 const z = try g.fexpr(d, rt);
+                // Apple's compiler folds an fma whose multiplicands are both
+                // constants and flushes a denormal product, where the hardware
+                // fma keeps it (docs/crosscheck.md, "Findings"). LLVM folds a
+                // constant-initialised local too, so one multiplicand must
+                // depend on an input. No random draw is involved.
+                if (!inputDependent(x) and !inputDependent(y)) x = try g.new(.{ .fin = try g.new(.a) });
                 return g.new(.{ .ffma = .{ .x = x, .y = y, .z = z } });
             },
             16, 17 => {

@@ -1322,13 +1322,22 @@ fn rewriteFloatLiterals(gpa: Allocator, src: []const u8) Error![]u8 {
     var line_start: usize = 0;
     while (i < src.len) {
         const at_boundary = i == 0 or !isIdentChar(src[i - 1]);
-        // `/* ... */`: LLVM 22 annotates an is.fpclass mask with one; Apple's
-        // reader knows only `;` comments.
-        if (std.mem.startsWith(u8, src[i..], "/*")) {
-            const close = std.mem.indexOfPos(u8, src, i + 2, "*/") orelse src.len - 2;
-            i = close + 2;
-            if (i < src.len and src[i] == ' ') i += 1;
+        // A string (`c"..."`, a quoted name, a metadata string) is copied as
+        // it is: LLVM escapes `"` and `\\` as `\\XX`, so the next `"` closes it.
+        if (src[i] == '"') {
+            const close = std.mem.indexOfScalarPos(u8, src, i + 1, '"') orelse src.len - 1;
+            try out.appendSlice(gpa, src[i .. close + 1]);
+            i = close + 1;
             continue;
+        }
+        // `/* ... */`: LLVM 22 annotates an is.fpclass mask with one; Apple's
+        // reader knows only `;` comments. An unterminated one is plain text.
+        if (std.mem.startsWith(u8, src[i..], "/*")) {
+            if (std.mem.indexOfPos(u8, src, i + 2, "*/")) |close| {
+                i = close + 2;
+                if (i < src.len and src[i] == ' ') i += 1;
+                continue;
+            }
         }
         // `float -nan(0x3FFFFE)`, `fadd half %x, +qnan`, `double snan`: LLVM
         // 22's special values, to the legacy hex spelling for their type: the
@@ -1423,7 +1432,8 @@ fn rewriteSpecialFloat(gpa: Allocator, out: *List, src: []const u8, i: usize, li
         payload = std.fmt.parseInt(u64, inner[2..], 16) catch return null;
         j = close + 1;
     }
-    if (ty.len == 0) {
+    const adjacent = ty.len != 0;
+    if (!adjacent) {
         // The operand type: the last float type word earlier on this line.
         const line = src[line_start..i];
         var best: usize = 0;
@@ -1440,22 +1450,23 @@ fn rewriteSpecialFloat(gpa: Allocator, out: *List, src: []const u8, i: usize, li
             }
         }
         if (ty.len == 0) return null;
-    } else {
-        try out.appendSlice(gpa, ty);
-        try out.append(gpa, ' ');
     }
     const is_inf = std.mem.eql(u8, kind, "inf");
     const signalling = std.mem.eql(u8, kind, "snan");
-    if (std.mem.eql(u8, ty, "half")) {
-        const bits = assembler.specialFloatBits(.half, neg, is_inf, signalling, payload) orelse return null;
-        try out.print(gpa, "0xH{X:0>4}", .{bits});
-    } else if (std.mem.eql(u8, ty, "float")) {
-        const bits = assembler.specialFloatBits(.float, neg, is_inf, signalling, payload) orelse return null;
-        try out.print(gpa, "0x{X:0>16}", .{widenF32Bits(@intCast(bits))});
-    } else {
-        const bits = assembler.specialFloatBits(.double, neg, is_inf, signalling, payload) orelse return null;
-        try out.print(gpa, "0x{X:0>16}", .{bits});
+    // The constant first, so nothing is written when it cannot be built. The
+    // buffer holds the longest spelling (`0x` + 16 digits), so bufPrint cannot fail.
+    var buf: [24]u8 = undefined;
+    const spelled: []const u8 = if (std.mem.eql(u8, ty, "half"))
+        std.fmt.bufPrint(&buf, "0xH{X:0>4}", .{assembler.specialFloatBits(.half, neg, is_inf, signalling, payload) orelse return null}) catch unreachable
+    else if (std.mem.eql(u8, ty, "float"))
+        std.fmt.bufPrint(&buf, "0x{X:0>16}", .{widenF32Bits(@intCast(assembler.specialFloatBits(.float, neg, is_inf, signalling, payload) orelse return null))}) catch unreachable
+    else
+        std.fmt.bufPrint(&buf, "0x{X:0>16}", .{assembler.specialFloatBits(.double, neg, is_inf, signalling, payload) orelse return null}) catch unreachable;
+    if (adjacent) {
+        try out.appendSlice(gpa, ty);
+        try out.append(gpa, ' ');
     }
+    try out.appendSlice(gpa, spelled);
     return j;
 }
 
@@ -1902,6 +1913,19 @@ test "D4 float literals: LLVM 22's special values and mask comments become legac
     try std.testing.expect(find(out, "float 0x7FF8000000000000, float %__6") != null);
     try std.testing.expect(find(out, "fadd half %__8, 0xHFE00") != null);
     try std.testing.expect(find(out, "float 0x7FF0000020000000") != null); // snan(0x1): mantissa 1 << 29
+    // Strings are untouched, whatever they contain.
+    const quoted = try convertWith(gpa,
+        \\@msg = private unnamed_addr constant [22 x i8] c"inf /* nan */ f0x3C00\00", align 1
+        \\
+        \\define ptx_kernel void @countKernel(ptr addrspace(1) %0, ptr addrspace(1) %1, i32 %2) {
+        \\  %4 = load i8, ptr @msg, align 1
+        \\  %5 = zext i8 %4 to i32
+        \\  store i32 %5, ptr addrspace(1) %0, align 4
+        \\  ret void
+        \\}
+        \\
+    , .{ .require_all_entries = false });
+    try std.testing.expect(find(quoted, "c\"inf /* nan */ f0x3C00\\00\"") != null);
     try std.testing.expect(find(out, "@llvm.is.fpclass.f32(float %__10, i32 783)") != null);
     inline for (metadata.function_metadata) |fm| {
         if (comptime std.mem.eql(u8, fm.name, "countKernel")) {
