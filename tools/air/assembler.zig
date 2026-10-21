@@ -2377,9 +2377,11 @@ fn binaryTag(op: []const u8, c: *Cursor) ?Builder.Function.Instruction.Tag {
     return null;
 }
 
-/// Cast mnemonics. LLVM >= 19 flags (`trunc nuw`, `zext nneg`, ...) are
-/// dropped: the Builder would encode them as flag records that Apple's
-/// reader rejects with "Failed to materializeAll".
+/// Cast mnemonics. LLVM >= 19 flags (`trunc nuw`, `zext nneg`, ...) and the
+/// LLVM >= 20 fast-math flags on `fptrunc`/`fpext` (`fptrunc nnan`, which
+/// LLVM infers for a value it knows is not NaN) are dropped: the Builder
+/// would encode them as flag records that Apple's reader rejects with
+/// "Failed to materializeAll", and a plain cast computes the same thing.
 fn castTag(op: []const u8, c: *Cursor) ?Builder.Function.Instruction.Tag {
     const T = Builder.Function.Instruction.Tag;
     const casts = [_]struct { name: []const u8, tag: T }{
@@ -2392,6 +2394,7 @@ fn castTag(op: []const u8, c: *Cursor) ?Builder.Function.Instruction.Tag {
     };
     for (casts) |ct| if (std.mem.eql(u8, op, ct.name)) {
         while (c.eatWord("nuw") or c.eatWord("nsw") or c.eatWord("nneg")) {}
+        _ = skipFastMath(c);
         return ct.tag;
     };
     return null;
@@ -4984,4 +4987,24 @@ test "workarounds: llvm.round becomes trunc(x + copysign(0.5 - ulp, x)), scalar 
     try std.testing.expect(has(text, "fadd float %1, %"));
     // Nothing names llvm.round any more: the unused declarations are dropped too.
     try std.testing.expect(!has(text, "llvm.round"));
+}
+
+test "fast-math flags on fptrunc and fpext (LLVM 20+) are dropped" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const gpa = arena.allocator();
+    const text = try testRoundTrip(gpa, test_header ++
+        \\define float @fragmentShader(float %__0, half %__1) {
+        \\  %__3 = fptrunc nnan float %__0 to half
+        \\  %__4 = fpext nnan ninf half %__1 to float
+        \\  %__5 = fadd half %__3, %__1
+        \\  %__6 = fpext half %__5 to float
+        \\  %__7 = fadd float %__4, %__6
+        \\  ret float %__7
+        \\}
+        \\
+    );
+    try std.testing.expect(has(text, "fptrunc float %0 to half"));
+    try std.testing.expect(has(text, "fpext half %1 to float"));
+    try std.testing.expect(!has(text, "nnan"));
 }

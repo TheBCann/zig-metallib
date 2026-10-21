@@ -37,6 +37,8 @@ Over 4,096 random and edge-value inputs, 949 differ, all of them results that sh
 
 ## Notes
 
+- The Metal Shading Language Specification (section 8.1, Table 8.1) lists `round` as
+  correctly rounded without fast math; the correctly rounded value of `round(-0.3)` is `-0.0`.
 - `-fno-fast-math` is the mode in which the sign of zero is significant per the Metal
   Shading Language specification; the report is about that mode. (With `-ffast-math`,
   `air.fast_round.f32` is used, and the sign may legitimately be dropped.)

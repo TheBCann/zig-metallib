@@ -1,4 +1,4 @@
-# Bug reports for Apple: seven Metal compiler findings
+# Bug reports for Apple: nine Metal compiler findings
 
 Drafts for Feedback Assistant, one per finding of the crosscheck bench
 ([../crosscheck.md](../crosscheck.md#findings)). Each report is self-contained: the
@@ -16,10 +16,12 @@ the two `.ll` files, for the findings Metal Shading Language cannot express, are
 | 5 | [`frem` is compiled as the fast `fmod`](05-frem-inexact.md) | LLVM IR (`air.fmod.f32` from MSL is exact) | drafted |
 | 6 | [`fma` with two constant multiplicands is folded and flushed](06-fma-constant-product.md) | MSL `fma`, `-fno-fast-math` | drafted |
 | 7 | [`fmod` on `half` returns `+0.0` for a `-0.0` remainder](07-fmod-half-negative-zero.md) | MSL `fmod(half, half)`, `-fno-fast-math` | drafted |
+| 8 | `llvm.exp.f32` is lowered as the fast exp (60 ulp) | LLVM IR; `zig build survey` | no draft |
+| 9 | [`half` division by a constant is not correctly rounded](09-half-division-by-constant.md) | MSL `half / 33.0h`, `-fno-fast-math` | drafted |
 
 Fill in the feedback number (`FB…`) in the Status column once filed, and copy it to the
-findings table in `docs/crosscheck.md`. The eighth finding there, `llvm.exp.f32` lowered as
-the fast exp, has no draft yet; `zig build survey` is its reproducer.
+findings table in `docs/crosscheck.md`. The eighth finding, `llvm.exp.f32` lowered as the
+fast exp, has no draft; `zig build survey` is its reproducer.
 
 ## Environment the reports were measured on
 

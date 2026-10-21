@@ -1178,6 +1178,15 @@ fn sanitizeBodyLine(gpa: Allocator, line: []const u8) Error![]u8 {
     s = try replaceAll(gpa, s, " trunc nuw nsw ", " trunc ");
     s = try replaceAll(gpa, s, " trunc nuw ", " trunc ");
     s = try replaceAll(gpa, s, " trunc nsw ", " trunc ");
+    // LLVM 20 fast-math flags on fptrunc/fpext (`fptrunc nnan float`, which
+    // LLVM infers for a value it knows is not NaN): the assembler drops them,
+    // and Apple's reader does not know them on a cast. LLVM prints the flags in
+    // this order, so one pass strips any combination.
+    inline for (.{ " fptrunc ", " fpext " }) |cast| {
+        inline for (.{ "fast", "nnan", "ninf", "nsz", "arcp", "contract", "afn", "reassoc" }) |flag| {
+            s = try replaceAll(gpa, s, cast ++ flag ++ " ", cast);
+        }
+    }
     s = try replaceAll(gpa, s, " captures(none)", "");
     s = try replaceAll(gpa, s, " dead_on_unwind", "");
     s = try replaceAll(gpa, s, " dead_on_return", "");
@@ -2669,4 +2678,14 @@ test "the printed IR carries the chosen deployment target's triple" {
     try std.testing.expect(find(out15, "air64_v28") == null);
     const out26 = try convertWith(arena.allocator(), src, .{ .require_all_entries = false });
     try std.testing.expect(find(out26, "target triple = \"air64_v28-apple-macosx26.0.0\"") != null);
+}
+
+test "fast-math flags on fptrunc/fpext are stripped from the text for Apple's reader" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const gpa = arena.allocator();
+    try std.testing.expectEqualStrings("  %__31 = fptrunc float %__30 to half", try sanitizeBodyLine(gpa, "  %__31 = fptrunc nnan float %__30 to half"));
+    try std.testing.expectEqualStrings("  %__9 = fpext half %__8 to float", try sanitizeBodyLine(gpa, "  %__9 = fpext nnan ninf nsz half %__8 to float"));
+    // A plain cast is left alone, and so is an unrelated `fast`.
+    try std.testing.expectEqualStrings("  %__2 = fadd fast float %__0, %__1", try sanitizeBodyLine(gpa, "  %__2 = fadd fast float %__0, %__1"));
 }

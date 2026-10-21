@@ -42,6 +42,8 @@ all 4,096.
 
 ## Notes
 
+- The Metal Shading Language Specification (section 8.1, Table 8.1) lists `fma` as correctly
+  rounded without fast math.
 - Metal flushes single-precision denormals on inputs and outputs. The exact product inside
   an fma is neither, and `fma(2^-126, 0.5, 2^-126) = 1.5 · 2^-126` is a normal number, which
   the hardware produces. Folding `c1 * c2` as if it were a separate multiply (whose result

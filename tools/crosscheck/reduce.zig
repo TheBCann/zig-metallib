@@ -489,6 +489,16 @@ pub const Engine = struct {
                 e.renumberExpr(n.y, at, delta);
                 e.renumberExpr(n.z, at, delta);
             },
+            .hfma => |n| {
+                e.renumberExpr(n.x, at, delta);
+                e.renumberExpr(n.y, at, delta);
+                e.renumberExpr(n.z, at, delta);
+            },
+            .hun => |n| e.renumberExpr(n.x, at, delta),
+            .hbin => |n| {
+                e.renumberExpr(n.x, at, delta);
+                e.renumberExpr(n.y, at, delta);
+            },
             .select => |n| {
                 e.renumberCond(n.c, at, delta);
                 e.renumberExpr(n.x, at, delta);
@@ -565,6 +575,24 @@ pub const Engine = struct {
                 try e.collectChildren(n.y, rt, out);
                 try out.append(e.gpa, .{ .p = &n.z, .rt = rt });
                 try e.collectChildren(n.z, rt, out);
+            },
+            .hfma => |*n| {
+                try out.append(e.gpa, .{ .p = &n.x, .rt = rt });
+                try e.collectChildren(n.x, rt, out);
+                try out.append(e.gpa, .{ .p = &n.y, .rt = rt });
+                try e.collectChildren(n.y, rt, out);
+                try out.append(e.gpa, .{ .p = &n.z, .rt = rt });
+                try e.collectChildren(n.z, rt, out);
+            },
+            .hun => |*n| {
+                try out.append(e.gpa, .{ .p = &n.x, .rt = rt });
+                try e.collectChildren(n.x, rt, out);
+            },
+            .hbin => |*n| {
+                try out.append(e.gpa, .{ .p = &n.x, .rt = rt });
+                try e.collectChildren(n.x, rt, out);
+                try out.append(e.gpa, .{ .p = &n.y, .rt = rt });
+                try e.collectChildren(n.y, rt, out);
             },
             .fsel => |*n| {
                 try e.collectCond(n.c, out);
@@ -691,6 +719,16 @@ pub const Engine = struct {
                     candidates[0] = n.x;
                     candidates[1] = n.y;
                     candidates[2] = n.z;
+                },
+                .hfma => |n| {
+                    candidates[0] = n.x;
+                    candidates[1] = n.y;
+                    candidates[2] = n.z;
+                },
+                .hun => |n| candidates[0] = n.x,
+                .hbin => |n| {
+                    candidates[0] = n.x;
+                    candidates[1] = n.y;
                 },
                 .fsel => |n| {
                     candidates[0] = n.x;
@@ -952,10 +990,13 @@ test "the engine shrinks a float program, keeping types consistent" {
     const reduced = try program.render(gpa, &prog, "pub const seed: u64 = 0;\n\n");
     try std.testing.expect(std.mem.indexOf(u8, bodyOf(reduced), "fsqrt(") != null);
     // Smallest under the engine's moves: one fsqrt(fin(a)) kept alive by a
-    // bits/toInt bridge or a single comparison, a leaf result, no locals.
+    // bits/toInt bridge or a single comparison, a leaf result, and no local
+    // unless the needle started in an assignment: the engine has no move that
+    // lifts a local's value into the result, so then one `v0 = bits(fsqrt(
+    // fin(a)))` plus `return v0` remains.
     try std.testing.expect(program.countStmts(prog.stmts) <= 1);
     try std.testing.expect(program.countNodes(&prog) <= 6);
-    try std.testing.expectEqual(@as(u8, 0), prog.nvars);
+    try std.testing.expect(prog.nvars <= 1);
 }
 
 test "running out of candidates leaves the program exactly as last kept" {

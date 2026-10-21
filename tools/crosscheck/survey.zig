@@ -206,8 +206,8 @@ fn classify(st: *Stats, x: f32, got: f32, ref: f64) void {
 /// A few exact values first (those inside the domain, plus NaN and the
 /// infinities everywhere), then the domain's draws.
 const specials = [_]f32{
-    0.0,       -0.0,      1.0,                     -1.0,                    0.5,                   2.0,
-    1.5707964, 3.1415927, 6.2831855,               88.0,                    -88.0,                 1.0e-10,
+    0.0,                    -0.0,                   1.0,               -1.0,               0.5,               2.0,
+    1.5707964,              3.1415927,              6.2831855,         88.0,               -88.0,             1.0e-10,
     std.math.floatMin(f32), std.math.floatMax(f32), std.math.inf(f32), -std.math.inf(f32), std.math.nan(f32), 0.1,
 };
 
@@ -363,11 +363,11 @@ pub fn main(init: std.process.Init) !void {
         var st = Stats{};
         for (inputs, out.items(f32)) |x, got| classify(&st, x, got, e.ref(@as(f64, x)));
         std.debug.print("{s:<28} {s:<24} {d:>9.2} {d:>6.2}% {d:>6.2}% {d:>6.2}% {d:>6.2}% {d:>6.2}%  x={e:.7} got {e:.7} ref {e:.7}; special ok/bad {d}/{d}, tiny ok/bad {d}/{d}\n", .{
-            e.what,                       e.domain.label,                st.max_ulp,
-            pct(st.le_half, st.finite),   pct(st.le_1, st.finite),       pct(st.le_2, st.finite),
-            pct(st.le_4, st.finite),      pct(st.le_16 + st.gt_16, st.finite), st.max_x,
-            st.max_got,                   st.max_ref,                    st.special_ok,
-            st.special_bad,               st.tiny_ok,                    st.tiny_bad,
+            e.what,                     e.domain.label,                      st.max_ulp,
+            pct(st.le_half, st.finite), pct(st.le_1, st.finite),             pct(st.le_2, st.finite),
+            pct(st.le_4, st.finite),    pct(st.le_16 + st.gt_16, st.finite), st.max_x,
+            st.max_got,                 st.max_ref,                          st.special_ok,
+            st.special_bad,             st.tiny_ok,                          st.tiny_bad,
         });
     }
 }

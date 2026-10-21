@@ -174,27 +174,30 @@ sweeps surface new problems; `tools/crosscheck/program.zig` says where to add th
 [docs/crosscheck-float-policy.md](crosscheck-float-policy.md): inputs and locals carry
 float values as bit patterns; a float subtree starts from a flushed bit-cast or an integer
 conversion and ends in canonical bits or a guarded conversion; every operation goes
-through a flushing helper, so the CPU flushes the intermediate results the GPU flushes. The driver's edge inputs
-gain float bit patterns, and the reducer handles float programs. Float mode is opt-in so
-that every integer seed keeps its program.
+through a flushing helper, so the CPU flushes the intermediate results the GPU flushes;
+half-precision nodes apply the same operators in f16 between exact conversions. The
+driver's edge inputs gain float and f16 bit patterns, and the reducer handles float
+programs. Float mode is opt-in so that every integer seed keeps its program.
 
 ## Findings
 
 Found on an Apple M3, macOS 26.3, with Zig 0.18.0-dev.253. Each has a one-line reproducer
-in `tools/crosscheck/known/`:
+in `tools/crosscheck/known/`. "Table 8.n" refers to the accuracy tables of the Metal Shading
+Language Specification (version 4, section 8.1), which the bench's expectations stay within:
 
 | Operation | Zig lowers it to | Result | Reproducer |
 | --- | --- | --- | --- |
 | `a *\| b` (saturating multiply) | `llvm.smul.fix.sat.i32` | building the compute pipeline fails: Metal's compiler service connection is interrupted | `zig build crosscheck -Dcrosscheck-body=tools/crosscheck/known/mul_sat.zig` |
 | `@addWithOverflow(a, b)[1]` | overflow bit of `llvm.sadd.with.overflow.i32` | GPU and CPU disagree on 1,990 of 4,096 inputs | `zig build crosscheck -Dcrosscheck-body=tools/crosscheck/known/add_overflow_bit.zig` |
 | `@subWithOverflow(a, b)[1]` | overflow bit of `llvm.ssub.with.overflow.i32` | GPU and CPU disagree on 2,103 of 4,096 inputs | `zig build crosscheck -Dcrosscheck-body=tools/crosscheck/known/sub_overflow_bit.zig` |
-| `@round(x)` on f32 | `llvm.round.f32` | returns `+0.0` where the result is `-0.0` (949 of 4,096 inputs; `floor`, `ceil`, `trunc` are exact) | `zig build crosscheck -Dcrosscheck-body=tools/crosscheck/known/round_negative_zero.zig` |
+| `@round(x)` on f32 | `llvm.round.f32` | returns `+0.0` where the result is `-0.0` (949 of 4,096 inputs; `floor`, `ceil`, `trunc` are exact; the specification's Table 8.1 lists `round` as correctly rounded) | `zig build crosscheck -Dcrosscheck-body=tools/crosscheck/known/round_negative_zero.zig` |
 | `@rem(x, y)` on f32 | `frem` | not the exact remainder: 0 for 1.02e-10, 8 for 6.91, `-inf` for finite operands (1,067 of 4,096) | `zig build crosscheck -Dcrosscheck-body=tools/crosscheck/known/rem_inexact.zig` |
-| `@mulAdd(f32, C1, C2, x)` with a denormal constant product | `llvm.fma.f32` with two constant multiplicands | the compiler folds the product and flushes it, so the fma degenerates to `x`; the hardware fma keeps the exact intermediate (223 of 4,096; 266 with the float-mode inputs) | `zig build crosscheck -Dcrosscheck-body=tools/crosscheck/known/fma_constant_product_flush.zig` |
-| `@rem(x, y)` on f16 | `frem half`; the finding is in Apple's own `air.fmod.f16`, what MSL's `fmod(half, half)` compiles to | `+0.0` where the remainder is an exact `-0.0`, for every negative x (9 of 4,096 through Apple's front end; single precision keeps the sign; `frem half` through Apple's assembler differs on 672) | `zig build crosscheck-msl -Dcrosscheck-body=tools/crosscheck/known/fmod_half_negative_zero.zig -Dcrosscheck-metal=tools/crosscheck/known/fmod_half_negative_zero.metal` |
-| `@exp(x)` on f32 | `llvm.exp.f32`, passed through | lowered as Apple's fast exp: up to 60 ulp, 68% of inputs beyond 4 ulp, where `llvm.exp2`, `llvm.log` and `llvm.log2` pass through within 3 ulp and `air.exp.f32` is within 1.4 ulp; the assembler renames it now ([precision survey](crosscheck-float-policy.md#precision-survey)) | `zig build survey`, the `air.fast_exp` row |
+| `@mulAdd(f32, C1, C2, x)` with a denormal constant product | `llvm.fma.f32` with two constant multiplicands | the compiler folds the product and flushes it, so the fma degenerates to `x`; the hardware fma keeps the exact intermediate (223 of 4,096; 266 with the float-mode inputs; Table 8.1: `fma` correctly rounded) | `zig build crosscheck -Dcrosscheck-body=tools/crosscheck/known/fma_constant_product_flush.zig` |
+| `@rem(x, y)` on f16 | `frem half`; the finding is in Apple's own `air.fmod.f16`, what MSL's `fmod(half, half)` compiles to | `+0.0` where the remainder is an exact `-0.0`, for every negative x (9 of 4,096 through Apple's front end; single precision keeps the sign; `frem half` through Apple's assembler differs on 672). Table 8.3 lists `fmod` as 0 ulp, which a wrong-signed zero satisfies numerically; C's `fmod` and IEEE 754 give the result x's sign | `zig build crosscheck-msl -Dcrosscheck-body=tools/crosscheck/known/fmod_half_negative_zero.zig -Dcrosscheck-metal=tools/crosscheck/known/fmod_half_negative_zero.metal` |
+| `x / c` on f16, `c` a constant | `fdiv half` with a constant divisor | not correctly rounded: one f16 ulp off on 15 of 4,096 inputs for `c = 33` (103 for 3, 96 for 10), where a power-of-two constant, a run-time divisor, f32 division and f16 multiplication by the same constants are all exact, so the compiler multiplies by a reciprocal; the same from MSL (`half / 33.0h`, `-fno-fast-math`) and through Apple's assembler; Table 8.3 of the specification lists half `x / y` as correctly rounded. Found by the first half-precision sweep (seed 7, reduced); the generator keeps f16 divisors input-dependent since | `zig build crosscheck -Dcrosscheck-body=tools/crosscheck/known/hdiv_constant.zig` |
+| `@exp(x)` on f32 | `llvm.exp.f32`, passed through | lowered as Apple's fast exp: up to 60 ulp, 68% of inputs beyond 4 ulp (Table 8.1 allows 4 ulp without fast math, Table 8.2 `3 + floor(|2x|)` with it), where `llvm.exp2`, `llvm.log` and `llvm.log2` pass through within 3 ulp and `air.exp.f32` is within 1.4 ulp; the assembler renames it now ([precision survey](crosscheck-float-policy.md#precision-survey)) | `zig build survey`, the `air.fast_exp` row |
 
-**Attribution: all eight are faults in Metal's compiler.** Each of the first six
+**Attribution: all nine are faults in Metal's compiler.** Each of the first six
 reproducers was also run through `zig build crosscheck-apple`, where Apple's own assembler builds the library
 from our printed IR, and failed identically: the same crash, and the same mismatch counts
 (1,990, 2,103, 949, 1,067 and 223), with the library's fast-math declaration on and off
@@ -295,7 +298,11 @@ only escaped because its constants print in decimal. The assembler now parses al
 and lowers `is.fpclass` to integer bit tests, and the splice rewrites the constants to the
 legacy spellings (`0xC1E0000000000000`, `0xH3C00`, `0xFFFFFFFFC0000000`) and drops the
 comments in the text it hands to Apple's assembler, which then accepts it (verified
-through `crosscheck-apple`, including a float-mode program).
+through `crosscheck-apple`, including a float-mode program). The half-precision nodes then
+surfaced one more: LLVM 20 and later put fast-math flags on `fptrunc` and `fpext`
+(`fptrunc nnan float %x to half`, inferred for a value LLVM knows is not NaN), which the
+assembler's cast parser refused on 4 of 100 seeds; both the assembler and the text rewrite
+drop them now, as they already dropped `trunc nuw` and `zext nneg`.
 
 ## What has been verified
 
@@ -366,6 +373,12 @@ On an Apple M3 (macOS 26.3, Zig 0.18.0-dev.253):
   intrinsic renames now pick Apple's precise functions unless fast math is declared, and
   `llvm.exp` is renamed too (the eighth finding above). The sample shader uses none of
   them, so the default library is byte-identical.
+- **Half precision** (2026-10-20): the first float sweep with half-precision nodes gave 96
+  match and 4 `REFUSED` (LLVM 20's fast-math flags on `fptrunc`, now dropped); with those
+  seeds assembled, seed 7 mismatched by one f16 ulp and reduced in 70 candidates to
+  `hdiv(fin(a), fromInt(33))`, the ninth finding; with f16 divisors kept input-dependent, a
+  fresh 100-seed float sweep is 100 match; 128 unit tests; the default library is
+  byte-identical.
 - The default build is untouched: `default.metallib` is byte-identical with and without
   the bench.
 
@@ -373,6 +386,6 @@ On an Apple M3 (macOS 26.3, Zig 0.18.0-dev.253):
 
 - File the drafted reports in `docs/apple-reports/` with Apple, and record the feedback
   numbers in the findings table.
-- f16 as a generated type, then vectors.
+- Vectors as a generated type.
 - Later, the same generated shaders on Asahi Linux's Mesa stack once its M3 GPU driver
   works, so the two compilers can be compared on the same hardware.

@@ -32,6 +32,9 @@ is canonicalised to `0x7E00`).
 
 ## Notes
 
+- The Metal Shading Language Specification (section 8.1, Table 8.3) lists half `fmod` as
+  0 ulp, which a zero of the wrong sign satisfies numerically; the report is about the sign,
+  which C's `fmod` and IEEE 754's remainder operations define as x's.
 - Single-precision `fmod` keeps the sign and is exact on all 4,096 inputs in the same
   harness, so this is specific to `half`.
 - The LLVM `frem half` instruction, assembled by `xcrun metal -Xclang -opaque-pointers`,

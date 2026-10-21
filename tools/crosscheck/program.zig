@@ -287,6 +287,67 @@ pub const float_helpers =
     \\
 ;
 
+/// Appended after the float helpers when the program has half-precision nodes.
+pub const half_helpers =
+    \\// Half precision (docs/crosscheck-float-policy.md): the GPU keeps f16
+    \\// denormals, so nothing is flushed; a NaN is canonicalised on entry and on
+    \\// exit, and hout widens exactly, so nested half operations are one f16
+    \\// chain. min/max zero sign as for f32.
+    \\inline fn hin(x: f32) f16 {
+    \\    const h: f16 = @floatCast(x);
+    \\    return if (h != h) @bitCast(@as(u16, 0x7e00)) else h;
+    \\}
+    \\inline fn hout(x: f16) f32 {
+    \\    return if (x != x) fc(0x7fc00000) else @floatCast(x);
+    \\}
+    \\inline fn hneg(x: f32) f32 {
+    \\    return hout(-hin(x));
+    \\}
+    \\inline fn habs(x: f32) f32 {
+    \\    return hout(@abs(hin(x)));
+    \\}
+    \\inline fn hsqrt(x: f32) f32 {
+    \\    return hout(@sqrt(hin(x)));
+    \\}
+    \\inline fn hfloor(x: f32) f32 {
+    \\    return hout(@floor(hin(x)));
+    \\}
+    \\inline fn hceil(x: f32) f32 {
+    \\    return hout(@ceil(hin(x)));
+    \\}
+    \\inline fn htrunc(x: f32) f32 {
+    \\    return hout(@trunc(hin(x)));
+    \\}
+    \\inline fn hround(x: f32) f32 {
+    \\    return hout(@round(hin(x)));
+    \\}
+    \\inline fn hadd(x: f32, y: f32) f32 {
+    \\    return hout(hin(x) + hin(y));
+    \\}
+    \\inline fn hsub(x: f32, y: f32) f32 {
+    \\    return hout(hin(x) - hin(y));
+    \\}
+    \\inline fn hmul(x: f32, y: f32) f32 {
+    \\    return hout(hin(x) * hin(y));
+    \\}
+    \\inline fn hdiv(x: f32, y: f32) f32 {
+    \\    return hout(hin(x) / hin(y));
+    \\}
+    \\inline fn hrem(x: f32, y: f32) f32 {
+    \\    return hout(@rem(hin(x), hin(y)));
+    \\}
+    \\inline fn hmin(x: f32, y: f32) f32 {
+    \\    return hout(@min(hin(x), hin(y)) + 0.0);
+    \\}
+    \\inline fn hmax(x: f32, y: f32) f32 {
+    \\    return hout(@max(hin(x), hin(y)) + 0.0);
+    \\}
+    \\inline fn hfma(x: f32, y: f32, z: f32) f32 {
+    \\    return hout(@mulAdd(f16, hin(x), hin(y), hin(z)));
+    \\}
+    \\
+;
+
 // ── Syntax tree ──────────────────────────────────────────────────────────────
 // The generator builds a tree first and prints it afterwards, so the post-passes
 // (every local assigned and read; which inputs were used) can walk it, and so a
@@ -334,6 +395,13 @@ pub const Expr = union(enum) {
     fun: struct { op: FOp, x: *Expr },
     fbin: struct { op: FOp, x: *Expr, y: *Expr },
     ffma: struct { x: *Expr, y: *Expr, z: *Expr },
+    // Half precision (docs/crosscheck-float-policy.md, "Half precision"): the
+    // operands are float expressions converted to f16 (`hin`), the operation
+    // is done in f16 and the result widened back (`hout`). Widening is exact,
+    // so nested half nodes compute a genuine f16 chain.
+    hun: struct { op: FOp, x: *Expr },
+    hbin: struct { op: FOp, x: *Expr, y: *Expr },
+    hfma: struct { x: *Expr, y: *Expr, z: *Expr },
     fsel: struct { c: *Cond, x: *Expr, y: *Expr },
     fromint: *Expr,
     fbits: *Expr,
@@ -351,6 +419,9 @@ pub fn inputDependent(e: *const Expr) bool {
         .bin => |n| inputDependent(n.x) or inputDependent(n.y),
         .fbin => |n| inputDependent(n.x) or inputDependent(n.y),
         .ffma => |n| inputDependent(n.x) or inputDependent(n.y) or inputDependent(n.z),
+        .hun => |n| inputDependent(n.x),
+        .hbin => |n| inputDependent(n.x) or inputDependent(n.y),
+        .hfma => |n| inputDependent(n.x) or inputDependent(n.y) or inputDependent(n.z),
         .select => |n| condInputDependent(n.c) or inputDependent(n.x) or inputDependent(n.y),
         .fsel => |n| condInputDependent(n.c) or inputDependent(n.x) or inputDependent(n.y),
         .fin, .fromint, .fbits, .ftoi => |x| inputDependent(x),
@@ -364,7 +435,7 @@ fn condInputDependent(c: *const Cond) bool {
 pub fn exprType(e: *const Expr) Ty {
     return switch (e.*) {
         .a, .b, .v, .constant, .un, .bin, .select, .fbits, .ftoi => .int,
-        .fin, .fconst, .fun, .fbin, .ffma, .fsel, .fromint => .float,
+        .fin, .fconst, .fun, .fbin, .ffma, .fsel, .fromint, .hun, .hbin, .hfma => .float,
     };
 }
 
@@ -416,6 +487,8 @@ pub const Usage = struct {
     read: [max_vars]bool = @splat(false),
     /// Any float node: the printer then includes the float helpers.
     floats: bool = false,
+    /// Any half-precision node: the half helpers too.
+    halves: bool = false,
 
     pub fn expr(u: *Usage, e: *const Expr) void {
         switch (e.*) {
@@ -454,6 +527,24 @@ pub const Usage = struct {
             },
             .ffma => |n| {
                 u.floats = true;
+                u.expr(n.x);
+                u.expr(n.y);
+                u.expr(n.z);
+            },
+            .hun => |n| {
+                u.floats = true;
+                u.halves = true;
+                u.expr(n.x);
+            },
+            .hbin => |n| {
+                u.floats = true;
+                u.halves = true;
+                u.expr(n.x);
+                u.expr(n.y);
+            },
+            .hfma => |n| {
+                u.floats = true;
+                u.halves = true;
                 u.expr(n.x);
                 u.expr(n.y);
                 u.expr(n.z);
@@ -555,7 +646,7 @@ pub const Gen = struct {
         if (depth == 0 or g.expr_budget == 0) return g.fleaf(rt);
         g.expr_budget -= 1;
         const d = depth - 1;
-        switch (g.r.uintLessThan(u8, 20)) {
+        switch (g.r.uintLessThan(u8, 24)) {
             0...3 => return g.fleaf(rt),
             4...7 => {
                 const op = g.pickF(&funary);
@@ -586,9 +677,34 @@ pub const Gen = struct {
                 const y = try g.fexpr(d, rt);
                 return g.new(.{ .fsel = .{ .c = c, .x = x, .y = y } });
             },
-            else => {
+            18, 19 => {
                 const e = try g.expr(d, rt);
                 return g.new(.{ .fromint = e });
+            },
+            // Half precision: the same operators, in f16 between conversions.
+            20 => {
+                const op = g.pickF(&funary);
+                const x = try g.fexpr(d, rt);
+                return g.new(.{ .hun = .{ .op = op, .x = x } });
+            },
+            21, 22 => {
+                const op = g.pickF(&fbinary);
+                const x = try g.fexpr(d, rt);
+                var y = try g.fexpr(d, rt);
+                // f16 division by a constant is not correctly rounded on the
+                // GPU (the compiler multiplies by the reciprocal; a run-time
+                // divisor is exact): docs/crosscheck.md, "Findings". No random
+                // draw is involved.
+                if (op == .div and !inputDependent(y)) y = try g.new(.{ .fin = try g.new(.b) });
+                return g.new(.{ .hbin = .{ .op = op, .x = x, .y = y } });
+            },
+            else => {
+                var x = try g.fexpr(d, rt);
+                const y = try g.fexpr(d, rt);
+                const z = try g.fexpr(d, rt);
+                // The same constant-fold guard as ffma.
+                if (!inputDependent(x) and !inputDependent(y)) x = try g.new(.{ .fin = try g.new(.a) });
+                return g.new(.{ .hfma = .{ .x = x, .y = y, .z = z } });
             },
         }
     }
@@ -904,6 +1020,45 @@ pub const Printer = struct {
                 try p.expr(n.z);
                 try w.writeAll(")");
             },
+            .hun => |n| {
+                try w.print("{s}(", .{switch (n.op) {
+                    .neg => "hneg",
+                    .abs => "habs",
+                    .sqrt => "hsqrt",
+                    .floor => "hfloor",
+                    .ceil => "hceil",
+                    .trunc => "htrunc",
+                    .round => "hround",
+                    else => unreachable,
+                }});
+                try p.expr(n.x);
+                try w.writeAll(")");
+            },
+            .hbin => |n| {
+                try w.print("{s}(", .{switch (n.op) {
+                    .add => "hadd",
+                    .sub => "hsub",
+                    .mul => "hmul",
+                    .div => "hdiv",
+                    .rem => "hrem",
+                    .min => "hmin",
+                    .max => "hmax",
+                    else => unreachable,
+                }});
+                try p.expr(n.x);
+                try w.writeAll(", ");
+                try p.expr(n.y);
+                try w.writeAll(")");
+            },
+            .hfma => |n| {
+                try w.writeAll("hfma(");
+                try p.expr(n.x);
+                try w.writeAll(", ");
+                try p.expr(n.y);
+                try w.writeAll(", ");
+                try p.expr(n.z);
+                try w.writeAll(")");
+            },
             .fromint => |x| {
                 try w.writeAll("fromInt(");
                 try p.expr(x);
@@ -1131,6 +1286,7 @@ pub fn render(gpa: std.mem.Allocator, prog: *const Program, header: []const u8) 
     try w.writer.writeAll(header);
     try w.writer.writeAll(helpers);
     if (usage.floats) try w.writer.writeAll(float_helpers);
+    if (usage.halves) try w.writer.writeAll(half_helpers);
     try w.writer.writeAll("\n");
     var printer: Printer = .{ .w = &w.writer };
     try printer.program(prog, usage);
@@ -1145,6 +1301,9 @@ fn exprNodes(e: *const Expr) u32 {
         .bin => |n| 1 + exprNodes(n.x) + exprNodes(n.y),
         .fbin => |n| 1 + exprNodes(n.x) + exprNodes(n.y),
         .ffma => |n| 1 + exprNodes(n.x) + exprNodes(n.y) + exprNodes(n.z),
+        .hun => |n| 1 + exprNodes(n.x),
+        .hbin => |n| 1 + exprNodes(n.x) + exprNodes(n.y),
+        .hfma => |n| 1 + exprNodes(n.x) + exprNodes(n.y) + exprNodes(n.z),
         .select => |n| 1 + condNodes(n.c) + exprNodes(n.x) + exprNodes(n.y),
         .fsel => |n| 1 + condNodes(n.c) + exprNodes(n.x) + exprNodes(n.y),
         .fin, .fromint, .fbits, .ftoi => |x| 1 + exprNodes(x),

@@ -129,6 +129,24 @@ of a hundred seeds mismatched, every one through a signalling NaN reaching `fmin
   (inputs, outputs and intermediates), NaN canonicalisation, signalling NaNs quieted by
   `fmin`/`fmax`.
 
+## Half precision
+
+Since 2026-10-20 float mode also generates f16 nodes: the same operators (`+ - * /`,
+`@rem`, `@min`, `@max`, `@mulAdd`, negation, `@abs`, `@sqrt`, `@floor`, `@ceil`, `@trunc`,
+`@round`) applied to the operands converted to f16 and the result widened back to f32
+(`hin`, `hout` in the generated file). Widening is exact, so nested half nodes compute one
+f16 chain; the conversion to f16 is itself an operation under test. Nothing is flushed, since
+the GPU keeps f16 denormals; a NaN is canonicalised to `0x7e00` on entry and `0x7fc00000` on
+exit; `@min`/`@max` get the same zero-sign normalisation as f32. The driver's edge inputs
+gain the f16 limits as f32 patterns (65504, 65520, the smallest normal, the largest and
+smallest denormals, half of the smallest). `@rem` on f16 goes through the assembler's
+`air.fmod.f16` plus `copysign` lowering (the seventh finding), `@round` through the
+sign-keeping expansion. The first sweep with these nodes found the ninth finding: f16
+division by a constant is not correctly rounded (the compiler multiplies by the reciprocal;
+a run-time divisor is exact), so the generator keeps f16 divisors input-dependent, as it
+keeps one fma multiplicand. LLVM 20's fast-math flags on `fptrunc`/`fpext` also showed up
+here and are dropped by the assembler and the text rewrite.
+
 ## Precision survey
 
 `zig build survey` (`tools/crosscheck/survey.zig`, kernels in `src/engine/survey_harness.zig`)
@@ -156,8 +174,13 @@ the M3 with 65,536 samples per row (seed 1), 2026-10-20:
 | tan | [−1e5, 1e5] | 3.92, 78.6% | 4.25, 71.7% |
 | sqrt | [FLT_MIN, FLT_MAX] | 0.50, 100% (correctly rounded) | 1.59, 97.9% |
 
-What the builtins get: `llvm.exp2`, `llvm.log`, `llvm.log2` and `llvm.sqrt` pass through to
-Metal and measure like the precise functions (1.08, 3.03, 1.61 and 0.50 ulp at most).
+The specification's Table 8.1 (no fast math) allows 4 ulp for `exp`, `exp2`, `log`, `log2`,
+`log10`, `sin` and `cos`, 6 for `tan`, and requires `sqrt` correctly rounded: every precise
+`air.<f>` above is within that. Table 8.2 (fast math) allows `3 + floor(|2x|)` ulp for
+`exp`, which the fast exp meets, and bounds `sin`/`cos` only as an absolute error on
+[−π, π], which is why they may return 0 beyond. What the builtins get: `llvm.exp2`,
+`llvm.log`, `llvm.log2` and `llvm.sqrt` pass through to Metal and measure like the precise
+functions (1.08, 3.03, 1.61 and 0.50 ulp at most).
 `llvm.exp` passed through measured like `air.fast_exp` (60.2 ulp at most, 67.6% beyond 4 ulp
 over 4,096 samples), so the assembler renames it to `air.exp` now; and the functions whose
 `llvm.*` form crashes the compiler (`sin`, `cos`, `tan`, `log10`, `exp10`, `pow`) are renamed
@@ -192,4 +215,4 @@ carries no fast-math flags; `-Dmetal-fast-math=true` restores Apple's default wo
 2. The sign of zero is significant everywhere except after `@min`/`@max`.
 3. The precision survey for `exp`, `log`, `sin`, `cos` and `tan` reports measured ulp
    distributions (above); it has no pass/fail threshold for now.
-4. f32 first; f16 as a generated type comes after.
+4. f32 first; f16 as a generated type came after (above).

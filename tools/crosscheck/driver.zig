@@ -47,12 +47,16 @@ const edges = [_]i32{
 
 /// With `--floats`: the integer edges plus float bit patterns (both signs of
 /// zero, ±1, 0.5, 0.1, ±inf, quiet and signalling NaN, FLT_MIN, FLT_MAX, the
-/// largest denormal, 2^24 and the f32 -> i32 conversion limits).
+/// largest denormal, 2^24, the f32 -> i32 conversion limits, and the f16
+/// limits as f32: 65504, 65520 (rounds to the f16 infinity), the smallest f16
+/// normal, its largest and smallest denormals and half of the smallest).
 const float_edges = edges ++ [_]i32{
     0x3f800000, @bitCast(@as(u32, 0xbf800000)), 0x3f000000,                     0x3dcccccd,
     0x7f800000, @bitCast(@as(u32, 0xff800000)), 0x7fc00000,                     0x7f800001,
     0x00800000, 0x7f7fffff,                     0x007fffff,                     0x4b800000,
     0x4b7fffff, 0x4f000000,                     @bitCast(@as(u32, 0xcf000000)), 0x40400000,
+    0x477fe000, 0x477ff000,                     0x38800000,                     0x387fc000,
+    0x33800000, 0x33000000,
 };
 
 fn fillInputs(r: std.Random, buf: []i32, edge_list: []const i32) void {
