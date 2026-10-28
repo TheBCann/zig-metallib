@@ -1,0 +1,83 @@
+; zig-opencl-params.spvasm: the same kernel, OpenCL flavour (Kernel capability, Physical64 OpenCL, CrossWorkgroup).
+; Zig 0.18.0-dev.253+16d31ceed, self-hosted SPIR-V backend (Zig generator id 41, 0x00290900):
+;   zig build-obj k.zig -target spirv64-opencl -fno-llvm -O ReleaseFast -femit-bin=k-spirv64-opencl.spv
+; Source: tools/spirv/testdata/k.zig; binary: tools/spirv/testdata/k-spirv64-opencl.spv (byte-identical to the
+; command above). Disassembled by tools/spirv/dis.zig; cross-checked token by token against the
+; grammar-driven reference disassembler used in the design (the only differences: ids whose
+; OpName is not unique print numerically here, so the text re-assembles).
+; SPIR-V
+; Version: 1.0
+; Generator: 0x00290900
+; Bound: 107
+; Schema: 0
+OpCapability Kernel
+OpCapability Addresses
+OpCapability Int64
+OpMemoryModel Physical64 OpenCL
+OpEntryPoint Kernel %k.kernel "kernel"
+OpExecutionMode %k.kernel LocalSize 1 1 1
+%46 = OpString "k.zig"
+OpSourceExtension "zig_errors:"
+OpSource Zig 2304
+OpName %void "void"
+OpName %u32 "u32"
+OpName %u64 "u64"
+OpName %k.kernel "k.kernel"
+OpName %k.body "k.body"
+%void = OpTypeVoid
+%u32 = OpTypeInt 32 0
+%5 = OpTypePointer CrossWorkgroup %u32
+%18 = OpTypePointer Function %5
+%u64 = OpTypeInt 64 0
+%84 = OpUndef %u32
+%85 = OpTypeFunction %void %5 %5 %5 %u32
+%97 = OpConstant %u32 3
+%106 = OpTypeFunction %u32 %u32 %u32
+%k.kernel = OpFunction %void None %85
+%6 = OpFunctionParameter %5
+%9 = OpFunctionParameter %5
+%12 = OpFunctionParameter %5
+%14 = OpFunctionParameter %u32
+%15 = OpLabel
+%19 = OpVariable %18 Function
+%29 = OpVariable %18 Function
+%39 = OpVariable %18 Function
+OpStore %19 %6 Aligned 8
+%25 = OpBitcast %18 %19
+OpStore %29 %9 Aligned 8
+%35 = OpBitcast %18 %29
+OpStore %39 %12 Aligned 8
+%45 = OpBitcast %18 %39
+OpLine %46 5 8
+%47 = OpUConvert %u64 %14
+%51 = OpLoad %5 %25 Aligned 8
+%54 = OpInBoundsPtrAccessChain %5 %51 %47
+OpLine %46 5 25
+%56 = OpUConvert %u64 %14
+%60 = OpLoad %5 %35 Aligned 8
+%63 = OpInBoundsPtrAccessChain %5 %60 %56
+%65 = OpLoad %u32 %63 Aligned 4
+OpLine %46 5 36
+%67 = OpUConvert %u64 %14
+%71 = OpLoad %5 %45 Aligned 8
+%74 = OpInBoundsPtrAccessChain %5 %71 %67
+%76 = OpLoad %u32 %74 Aligned 4
+OpLine %46 5 20
+%79 = OpFunctionCall %u32 %k.body %65 %76
+OpStore %54 %79 Aligned 4
+OpReturn
+%82 = OpLabel
+OpUnreachable
+OpFunctionEnd
+%k.body = OpFunction %u32 None %106
+%90 = OpFunctionParameter %u32
+%92 = OpFunctionParameter %u32
+%93 = OpLabel
+OpLine %46 2 5
+%98 = OpIMul %u32 %92 %97
+%100 = OpIAdd %u32 %90 %98
+OpLine %46 2 5
+OpReturnValue %100
+%103 = OpLabel
+OpUnreachable
+OpFunctionEnd

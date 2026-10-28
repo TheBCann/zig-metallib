@@ -116,6 +116,9 @@ var tg_counter: u32 addrspace(.shared) = undefined;
 /// threadgroup).
 var red: [64]f32 addrspace(.shared) = undefined;
 
+/// Threadgroup counter of `barrierJoinKernel`.
+var tg_cell: u32 addrspace(.shared) = undefined;
+
 // --- Entry points -----------------------------------------------------------
 
 pub fn vertexShader(
@@ -401,6 +404,41 @@ pub fn reduceKernel(
     if (tidx == 0) out[tg_pos] = red[0];
 }
 
+/// A workgroup counter: thread 0 seeds it, every thread adds 1 between two
+/// barriers, and the total lands in out[2 * tg_pos] and out[2 * tg_pos + 1].
+/// Both barriers sit in the join block after `if (tidx == 0)`, which the
+/// uniformity analysis accepts.
+///
+/// In a Debug shader build (`-Dshader-optimize=debug`) Zig's LLVM does not
+/// optimize, so the IR reaches Metal as `if (tidx == 0) ...; barrier; add;
+/// barrier; if (tidx == 0) ...`. Metal's optimizer jump-threads the block
+/// between the two branches on the same condition into both arms unless the
+/// barrier is declared `convergent` (the assembler marks it, as Apple's
+/// front end does): the lanes of SIMD-group 0 then reach different copies of
+/// the barriers and every total came out 0x40000021, not 0x40000040
+/// (`zig build check -Dshader-optimize=debug` with the attribute left out,
+/// M3, 2026-10-21). In the other modes Zig's LLVM would thread that shape
+/// itself, before the uniformity analysis, which then refuses it, so they
+/// store the total from `tidx < 2`, a condition SimplifyCFG cannot thread
+/// on, and the kernel checks the same totals (testBarrierJoinKernel in
+/// tools/metallib_check.zig).
+pub fn barrierJoinKernel(
+    out: [*]addrspace(.global) u32,
+    tidx: u32,
+    tg_pos: u32,
+) callconv(.kernel) void {
+    if (tidx == 0) tg_cell = 0x40000000;
+    gpu.threadgroupBarrier(.threadgroup_only);
+    _ = @atomicRmw(u32, &tg_cell, .Add, 1, .monotonic);
+    gpu.threadgroupBarrier(.threadgroup_only);
+    if (builtin.mode == .debug) {
+        if (tidx == 0) {
+            out[2 * tg_pos] = tg_cell;
+            out[2 * tg_pos + 1] = tg_cell;
+        }
+    } else if (tidx < 2) out[2 * tg_pos + tidx] = tg_cell;
+}
+
 /// Partial sums of `twoStageKernel`, one slot per SIMD-group of a
 /// threadgroup (32 covers 1024 threads at a SIMD width of 32).
 var partial: [32]f32 addrspace(.shared) = undefined;
@@ -615,6 +653,16 @@ pub const functions = [_]air.Function{
         },
     },
     .{
+        .name = "barrierJoinKernel",
+        .stage = .kernel,
+        .ret = void,
+        .args = &.{
+            .{ .buffer = .{ .index = 0, .T = u32, .name = "out", .access = .read_write } },
+            .{ .builtin = .{ .kind = .thread_index_in_threadgroup, .T = u32, .name = "tidx" } },
+            .{ .builtin = .{ .kind = .threadgroup_position_in_grid, .T = u32, .name = "tg_pos" } },
+        },
+    },
+    .{
         .name = "copyTextureKernel",
         .stage = .kernel,
         .ret = void,
@@ -650,6 +698,7 @@ comptime {
         @export(&tgBufKernel, .{ .name = "tgBufKernel" });
         @export(&reduceKernel, .{ .name = "reduceKernel" });
         @export(&twoStageKernel, .{ .name = "twoStageKernel" });
+        @export(&barrierJoinKernel, .{ .name = "barrierJoinKernel" });
         @export(&copyTextureKernel, .{ .name = "copyTextureKernel" });
     }
 }

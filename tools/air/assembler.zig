@@ -1,7 +1,8 @@
 //! LLVM IR text -> bitcode, for the subset of IR Zig emits for shader code.
 //!
-//! Input is the text produced by air-splice's rewrite pass: opaque pointers,
-//! AIR target, no attribute groups, no metadata. Output is a bitcode module
+//! Input is the text produced by air-splice's rewrite pass (or by the SPIR-V
+//! front end, tools/spirv/lower.zig): opaque pointers, AIR target, no
+//! attribute groups, no metadata. Output is a bitcode module
 //! containing one entry point (Apple packages one module per function), every
 //! `define` that entry point reaches through calls, and only the globals and
 //! declarations those functions name: a global enters the module the first
@@ -33,7 +34,9 @@
 //!   * To keep that consistent without text surgery, named operands (`%x`,
 //!     `@g`) always take the type they were defined with; the textual type
 //!     annotation is only used to parse literal constants. GEP results
-//!     inherit the base pointer's address space.
+//!     inherit the base pointer's address space. (Text printed with exact
+//!     types, the SPIR-V front end's, sets `Options.check_operand_types`,
+//!     which refuses an operand whose annotation disagrees.)
 //!   * An aggregate or vector that stores the address of a relocated
 //!     constant (`[4 x ptr] [ptr @tab_a, ...]`, `<2 x ptr>`, `{ ptr, i64 }`
 //!     slices, whether as a constant or built with `insertvalue` /
@@ -68,6 +71,29 @@
 //!     `threads_per_threadgroup` may hold a barrier and `if (sgid == 0)
 //!     simd_sum(...)` is fine, while `if (gid >= n) return; barrier` and
 //!     `if (sgid == 0) barrier` are refused.
+//!   * Metal's runtime compiler optimizes the bitcode again, and its jump
+//!     threading duplicates an attribute-less barrier between two branches
+//!     on the same per-thread condition (`if (lid == 0) ...; barrier; ...;
+//!     barrier; if (lid == 0) ...`, every barrier in uniform control flow,
+//!     so the analysis above accepts it): the threadgroup desynchronises
+//!     (exec tests barrier_workgroup_counter, barrier_shared_flag: 33 of 64
+//!     increments counted; metallib-check's barrierJoinKernel in a Debug
+//!     shader build). The SPIR-V front end's unoptimized IR has that shape
+//!     whenever the source does. The assembler therefore writes Apple's
+//!     attribute sets (`xcrun metal -S -emit-llvm` of an MSL kernel):
+//!     `convergent mustprogress nounwind willreturn` on the declaration of
+//!     every intrinsics.isConvergent name, `convergent nounwind willreturn`
+//!     on every call to one, and `convergent` on every define that reaches
+//!     one (divergence.zig's `Func.convergent`) and on the calls to it
+//!     (`ModuleState.attributesFor`). `air.atomic.fence` is not convergent
+//!     in Apple's output and stays bare.
+//!   * Builder's `Value.typeOfWip` recomputes most instruction types from an
+//!     operand, recursively; `FunctionState.define` keeps every operand
+//!     chain at most `max_type_depth` long with a folded-away
+//!     `insertvalue`/`extractvalue` anchor, so a 40 000-long dependence
+//!     chain assembles in linear time instead of overflowing the stack.
+//!     Values, blocks and phis are looked up by name in hash maps, so a
+//!     function of N instructions or blocks costs O(N).
 //!   * Intrinsics go through intrinsics.zig (DESIGN.md D5-12): `llvm.sin`
 //!     and friends are called under their `air.*` name, `air.fast_*` when the
 //!     library declares fast math (the `llvm.*`
@@ -116,6 +142,14 @@ pub const Options = struct {
     entry: []const u8,
     /// Metadata to attach for that entry point.
     fm: metadata.FunctionMetadata,
+    /// Refuse (`error.Syntax`) a `TYPE VALUE` operand whose named value was
+    /// defined with another type. Off for air-splice's text, where
+    /// relocation deliberately retypes values (addrspace renumbering,
+    /// constant globals moved to address space 2; see the module doc) and
+    /// the annotation is stale by design; on for text that is printed with
+    /// exact types (tools/spirv/lower.zig), so a lowering type bug fails
+    /// here instead of becoming ill-typed bitcode.
+    check_operand_types: bool = false,
 };
 
 /// Prefix air-splice puts in front of LLVM's numbered temporaries (`%7` ->
@@ -131,7 +165,7 @@ const constant_space: Builder.AddrSpace = @fromBackingInt(@intCast(2));
 /// `profile` (triple and `!air.version` / `!air.language_version`) with the
 /// module-level `compile` options (`!air.compile_options`). Returns the raw
 /// bitcode bytes (no darwin wrapper).
-pub fn assemble(gpa: Allocator, ir: []const u8, comptime opts: Options, profile: air_target.Profile, compile: metadata.CompileOptions) Error![]u8 {
+pub fn assemble(gpa: Allocator, ir: []const u8, opts: Options, profile: air_target.Profile, compile: metadata.CompileOptions) Error![]u8 {
     var b = try Builder.init(.{ .allocator = gpa, .strip = true, .name = "air-splice" });
     defer b.deinit();
     try build(&b, gpa, ir, opts, profile, compile);
@@ -141,13 +175,13 @@ pub fn assemble(gpa: Allocator, ir: []const u8, comptime opts: Options, profile:
 }
 
 /// Populate `b` with the module for `opts.entry`.
-fn build(b: *Builder, gpa: Allocator, ir: []const u8, comptime opts: Options, profile: air_target.Profile, compile: metadata.CompileOptions) Error!void {
+fn build(b: *Builder, gpa: Allocator, ir: []const u8, opts: Options, profile: air_target.Profile, compile: metadata.CompileOptions) Error!void {
     b.source_filename = try b.string(opts.entry);
     b.target_triple = try b.string(profile.triple);
     b.data_layout.deinit(gpa);
     b.data_layout = try Builder.DataLayout.parseString(try b.string(air_target.datalayout), b);
 
-    var mod = ModuleState{ .gpa = gpa, .b = b, .fast_math = compile.fast_math };
+    var mod = ModuleState{ .gpa = gpa, .b = b, .fast_math = compile.fast_math, .check_operand_types = opts.check_operand_types };
     defer mod.deinit();
 
     // Pass 1: named types, global names, declarations and function headers.
@@ -203,8 +237,17 @@ fn build(b: *Builder, gpa: Allocator, ir: []const u8, comptime opts: Options, pr
     try metadata.lowerModule(b, opts.fm, mod.defines.items[entry].func.?, mod.samplers.items, profile, compile);
 }
 
+/// Whether `fail` prints its message (the SPIR-V fuzz test turns it off).
+pub var print_failures = true;
+
+/// The tool name the failure messages start with: air-splice's, or
+/// spirv-splice's when the SPIR-V front end drives the assembler (the line
+/// numbers are then those of the lowered IR, `spirv-splice ... out.ll`).
+/// tools/crosscheck/reduce.zig and sweep.sh classify refusals by it.
+pub var failure_prefix: []const u8 = "air-splice";
+
 fn fail(line_no: usize, line: []const u8, msg: []const u8, err: Error) Error {
-    std.debug.print("air-splice: line {d}: {s}\n    {s}\n", .{ line_no, msg, line });
+    if (print_failures) std.debug.print("{s}: line {d}: {s}\n    {s}\n", .{ failure_prefix, line_no, msg, line });
     return err;
 }
 
@@ -267,11 +310,21 @@ const ModuleState = struct {
     /// The library's fast-math declaration: picks Apple's fast intrinsics
     /// over the precise ones (intrinsics.classify, lowerFrem).
     fast_math: bool,
+    /// `Options.check_operand_types`.
+    check_operand_types: bool = false,
     named_types: std.ArrayList(NamedType) = .empty,
     globals: std.ArrayList(Global) = .empty,
     /// Variables not yet referenced (see `PendingGlobal`).
     pending_globals: std.ArrayList(PendingGlobal) = .empty,
     defines: std.ArrayList(Define) = .empty,
+    /// Name -> index into `globals`, `pending_globals` and `defines` (the
+    /// first entry of a name, as the linear searches these replace found
+    /// it): a module of F functions is looked up in O(1) per reference
+    /// instead of O(F) (review finding: 20 000 helpers took 113 s, most of
+    /// it in findDefine, findGlobal, calleeInfo and attributesFor).
+    global_index: std.StringHashMapUnmanaged(usize) = .empty,
+    pending_index: std.StringHashMapUnmanaged(usize) = .empty,
+    define_index: std.StringHashMapUnmanaged(usize) = .empty,
     /// Defines to lower, in discovery order.
     worklist: std.ArrayList(usize) = .empty,
     /// Names allocated for re-declared intrinsics.
@@ -280,6 +333,8 @@ const ModuleState = struct {
     /// Uniformity analysis results, parallel to `defines`
     /// (`analyseDivergence`).
     funcs: []divergence.Func = &.{},
+    /// The attribute sets of `convergentAttributes`, built on first use.
+    convergent_attrs: [3]?Builder.FunctionAttributes = @splat(null),
 
     fn deinit(m: *ModuleState) void {
         for (m.funcs) |*f| f.deinit(m.gpa);
@@ -296,6 +351,25 @@ const ModuleState = struct {
         m.named_types.deinit(m.gpa);
         m.pending_globals.deinit(m.gpa);
         m.globals.deinit(m.gpa);
+        m.global_index.deinit(m.gpa);
+        m.pending_index.deinit(m.gpa);
+        m.define_index.deinit(m.gpa);
+    }
+
+    fn addGlobal(m: *ModuleState, g: Global) Error!void {
+        const gop = try m.global_index.getOrPut(m.gpa, g.name);
+        if (!gop.found_existing) gop.value_ptr.* = m.globals.items.len;
+        try m.globals.append(m.gpa, g);
+    }
+
+    fn addDefine(m: *ModuleState, d: Define) Error!void {
+        const gop = try m.define_index.getOrPut(m.gpa, d.name);
+        if (!gop.found_existing) gop.value_ptr.* = m.defines.items.len;
+        try m.defines.append(m.gpa, d);
+    }
+
+    fn lookupGlobal(m: *ModuleState, name: []const u8) ?Global {
+        return m.globals.items[m.global_index.get(name) orelse return null];
     }
 
     /// The identifier after `@`: a plain name, or a quoted one
@@ -348,8 +422,7 @@ const ModuleState = struct {
     }
 
     fn findDefine(m: *ModuleState, name: []const u8) ?usize {
-        for (m.defines.items, 0..) |d, i| if (std.mem.eql(u8, d.name, name)) return i;
-        return null;
+        return m.define_index.get(name);
     }
 
     /// Between the passes: which threads reach every block of every
@@ -382,12 +455,65 @@ const ModuleState = struct {
         return if (di < m.funcs.len) scope.join(m.funcs[di].convergent) else scope;
     }
 
+    /// Where a `convergent` attribute set goes (Apple's sets, from
+    /// `xcrun metal -S -emit-llvm` of an MSL kernel calling
+    /// threadgroup_barrier, simdgroup_barrier, simd_sum, simd_any,
+    /// quad_shuffle and simd_shuffle_down: every declaration carries
+    /// `convergent mustprogress nounwind willreturn`, every call
+    /// `convergent nounwind willreturn`; `air.atomic.fence` is not
+    /// convergent). A define that reaches such a call is only known to be
+    /// convergent (it may loop forever or not return), so it and the calls
+    /// to it get `convergent` alone.
+    const ConvergentUse = enum(u2) { intrinsic_declaration, intrinsic_call, helper };
+
+    fn convergentAttributes(m: *ModuleState, use: ConvergentUse) Error!Builder.FunctionAttributes {
+        const slot = &m.convergent_attrs[@backingInt(use)];
+        if (slot.*) |a| return a;
+        var wip: Builder.FunctionAttributes.Wip = .{};
+        defer wip.deinit(m.b);
+        try wip.addFnAttr(.convergent, m.b);
+        switch (use) {
+            .intrinsic_declaration => {
+                try wip.addFnAttr(.mustprogress, m.b);
+                try wip.addFnAttr(.nounwind, m.b);
+                try wip.addFnAttr(.willreturn, m.b);
+            },
+            .intrinsic_call => {
+                try wip.addFnAttr(.nounwind, m.b);
+                try wip.addFnAttr(.willreturn, m.b);
+            },
+            .helper => {},
+        }
+        const a = try wip.finish(m.b);
+        slot.* = a;
+        return a;
+    }
+
+    /// The function attributes of `name`'s declaration or definition, or of
+    /// a call to it: `convergent` for the barriers and SIMD-group
+    /// collectives (intrinsics.isConvergent) and for every define that
+    /// reaches one through calls (divergence.zig's `Func.convergent`), none
+    /// for everything else. Without it Metal's optimizer treats a barrier
+    /// as an ordinary call and may duplicate it into both arms of a branch
+    /// (jump threading `if (lid == 0) ...; barrier; ...; barrier; if (lid
+    /// == 0) ...`), and the threadgroup then runs the copies as different
+    /// barriers; the uniformity analysis cannot see that, because it runs
+    /// on the IR before Metal optimizes it (exec tests
+    /// barrier_workgroup_counter, barrier_shared_flag).
+    fn attributesFor(m: *ModuleState, name: []const u8, call: bool) Error!Builder.FunctionAttributes {
+        if (intrinsics.isConvergent(name)) return m.convergentAttributes(if (call) .intrinsic_call else .intrinsic_declaration);
+        const di = m.findDefine(name) orelse return .none;
+        if (di < m.funcs.len and m.defines.items[di].body != null and m.funcs[di].convergent != .none) return m.convergentAttributes(.helper);
+        return .none;
+    }
+
     /// Variables and functions something has referred to. A variable,
     /// define or declare enters the Builder the first time it is named;
     /// a variable's initialiser may in turn name further globals.
     fn findGlobal(m: *ModuleState, name: []const u8) Error!?Global {
-        for (m.globals.items) |g| if (std.mem.eql(u8, g.name, name)) return g;
-        for (m.pending_globals.items) |*pg| if (std.mem.eql(u8, pg.name, name)) {
+        if (m.lookupGlobal(name)) |g| return g;
+        if (m.pending_index.get(name)) |pi| {
+            const pg = &m.pending_globals.items[pi];
             switch (pg.state) {
                 .pending => {},
                 .defining => return fail(pg.line_no, pg.line, "global initialiser refers back to the global being defined", error.Unsupported),
@@ -395,18 +521,19 @@ const ModuleState = struct {
             }
             pg.state = .defining;
             try m.defineGlobal(pg.line, pg.line_no);
-            pg.state = .done;
-            for (m.globals.items) |g| if (std.mem.eql(u8, g.name, name)) return g;
-            unreachable;
-        };
+            m.pending_globals.items[pi].state = .done;
+            return m.lookupGlobal(name) orelse unreachable;
+        }
         const di = m.findDefine(name) orelse return null;
         const d = &m.defines.items[di];
         const func = try m.b.addFunction(d.fn_ty, try m.b.strtabString(d.name), .default);
         func.setLinkage(d.linkage, m.b);
         func.setCallConv(d.call_conv, m.b);
+        const attrs = try m.attributesFor(d.name, false);
+        if (attrs != .none) func.setAttributes(attrs, m.b);
         d.func = func;
         const g = Global{ .name = d.name, .index = func.ptr(m.b).global, .fn_ty = d.fn_ty, .call_conv = d.call_conv, .define = di };
-        try m.globals.append(m.gpa, g);
+        try m.addGlobal(g);
         return g;
     }
 
@@ -416,10 +543,10 @@ const ModuleState = struct {
     /// so a call that ends up re-declared (memcpy renaming) leaves no stray
     /// declaration behind.
     fn calleeInfo(m: *ModuleState, name: []const u8, c: *Cursor) Error!Callee {
-        for (m.globals.items) |g| if (std.mem.eql(u8, g.name, name)) {
+        if (m.lookupGlobal(name)) |g| {
             const fn_ty = g.fn_ty orelse return fail(c.line, c.s, "call target is not a function", error.Syntax);
             return .{ .fn_ty = fn_ty, .call_conv = g.call_conv, .define = g.define };
-        };
+        }
         const di = m.findDefine(name) orelse return fail(c.line, c.s, "call to undeclared function", error.UndefinedGlobal);
         const d = m.defines.items[di];
         return .{ .fn_ty = d.fn_ty, .call_conv = d.call_conv, .define = di };
@@ -439,6 +566,8 @@ const ModuleState = struct {
         try c.expect("@");
         const name = try m.globalName(&c);
         if (name.len == 0) return fail(line_no, line, "global without a name", error.Syntax);
+        const gop = try m.pending_index.getOrPut(m.gpa, name);
+        if (!gop.found_existing) gop.value_ptr.* = m.pending_globals.items.len;
         try m.pending_globals.append(m.gpa, .{ .name = name, .line = line, .line_no = line_no });
     }
 
@@ -492,10 +621,10 @@ const ModuleState = struct {
         while (c.eat(",")) {
             c.skipWs();
             if (c.eatWord("align")) {
-                variable.setAlignment(Builder.Alignment.fromByteUnits(try c.int(u64)), m.b);
+                variable.setAlignment(try alignValue(&c), m.b);
             } else break; // section, comdat, metadata: irrelevant here
         }
-        try m.globals.append(m.gpa, .{ .name = name, .index = variable.ptr(m.b).global, .fn_ty = null });
+        try m.addGlobal(.{ .name = name, .index = variable.ptr(m.b).global, .fn_ty = null });
         if (std.mem.find(u8, line, "[2 x i64]") != null) try m.samplers.append(m.gpa, variable.ptr(m.b).global);
     }
 
@@ -551,7 +680,7 @@ const ModuleState = struct {
             fn_ty = try m.textureFnType(ti, line_no);
             ret_ty = fn_ty.functionReturn(m.b);
         }
-        try m.defines.append(m.gpa, .{
+        try m.addDefine(.{
             .name = name,
             .ret_ty = ret_ty,
             .fn_ty = fn_ty,
@@ -614,7 +743,7 @@ const ModuleState = struct {
         // Whatever follows the parameter list (unnamed_addr, #N, section)
         // is irrelevant to the bitcode we emit.
         const fn_ty = try m.b.fnType(ret_ty, param_types.items, .normal);
-        try m.defines.append(gpa, .{
+        try m.addDefine(.{
             .name = name,
             .ret_ty = ret_ty,
             .fn_ty = fn_ty,
@@ -649,9 +778,7 @@ const ModuleState = struct {
                 .phi_hints = &hints,
             };
             defer f.deinit();
-            for (d.param_names, 0..) |pname, i| {
-                try f.locals.append(gpa, .{ .name = pname, .value = f.wip.arg(@intCast(i)) });
-            }
+            for (d.param_names, 0..) |pname, i| try f.define(pname, f.wip.arg(@intCast(i)));
             try f.createBlocks(body, d.param_names);
             // Every retry records a hint for a phi that had none (a hinted phi
             // is `inferred` next time and never hinted again), so the count
@@ -724,8 +851,10 @@ const ModuleState = struct {
         const owned = try m.gpa.dupe(u8, name);
         try m.owned_names.append(m.gpa, owned);
         const func = try m.b.addFunction(fn_ty, try m.b.strtabString(owned), .default);
+        const attrs = try m.attributesFor(owned, false);
+        if (attrs != .none) func.setAttributes(attrs, m.b);
         const g = Global{ .name = owned, .index = func.ptr(m.b).global, .fn_ty = fn_ty };
-        try m.globals.append(m.gpa, g);
+        try m.addGlobal(g);
         return g;
     }
 
@@ -959,15 +1088,19 @@ const ModuleState = struct {
         if (std.mem.eql(u8, w, "zeroinitializer")) return b.zeroInitConst(ty);
         if (std.mem.eql(u8, w, "undef")) return b.undefConst(ty);
         if (std.mem.eql(u8, w, "poison")) return b.poisonConst(ty);
-        if (std.mem.eql(u8, w, "null")) return b.nullConst(ty);
-        if (std.mem.eql(u8, w, "true")) return b.intConst(ty, 1);
-        if (std.mem.eql(u8, w, "false")) return b.intConst(ty, 0);
+        if (std.mem.eql(u8, w, "null")) {
+            if (!ty.isPointer(b)) return fail(c.line, c.s, "null of a non-pointer type", error.Syntax);
+            return b.nullConst(ty);
+        }
         if (w.len == 0) return fail(c.line, c.s, "expected a constant", error.Syntax);
-
         if (ty == .float or ty == .half or ty == .double) {
             if (try m.specialFloat(c, w, ty)) |k| return k;
             return m.floatLiteralConst(c, w, ty);
         }
+        // The Builder asserts an integer type for the rest.
+        if (!ty.isInteger(b)) return fail(c.line, c.s, "integer constant of a non-integer type", error.Syntax);
+        if (std.mem.eql(u8, w, "true")) return b.intConst(ty, 1);
+        if (std.mem.eql(u8, w, "false")) return b.intConst(ty, 0);
         if (std.fmt.parseInt(i64, w, 10)) |v| return b.intConst(ty, v) else |_| {}
         if (std.fmt.parseInt(u64, w, 10)) |v| return b.intConst(ty, v) else |_| {}
         return fail(c.line, c.s, "unsupported constant", error.Unsupported);
@@ -1240,8 +1373,16 @@ const FunctionState = struct {
     /// address space (retryIfUnsettledPhi, resolvePhis).
     derived: std.AutoHashMapUnmanaged(Value, usize) = .empty,
     locals: std.ArrayList(Local) = .empty,
+    /// `locals` by name; the first definition of a name wins.
+    local_index: std.StringHashMapUnmanaged(usize) = .empty,
     blocks: std.ArrayList(BlockRef) = .empty,
+    /// `blocks` by name; the first label of a name wins.
+    block_index: std.StringHashMapUnmanaged(usize) = .empty,
     phis: std.ArrayList(PendingPhi) = .empty,
+    /// `phis` by the phi's value (`unsettledRoot`).
+    phi_index: std.AutoHashMapUnmanaged(Value, usize) = .empty,
+    /// `typeDepth` of the values computed so far.
+    type_depth: std.AutoHashMapUnmanaged(Value, u32) = .empty,
     /// Index into `blocks` of the block being lowered.
     current: usize = 0,
     entry_name: ?[]u8 = null,
@@ -1255,25 +1396,67 @@ const FunctionState = struct {
         const gpa = f.m.gpa;
         for (f.phis.items) |p| gpa.free(p.incoming);
         f.phis.deinit(gpa);
+        f.phi_index.deinit(gpa);
+        f.type_depth.deinit(gpa);
         f.derived.deinit(gpa);
         f.blocks.deinit(gpa);
+        f.block_index.deinit(gpa);
         f.locals.deinit(gpa);
+        f.local_index.deinit(gpa);
         if (f.entry_name) |n| gpa.free(n);
         f.wip.deinit();
     }
 
     fn lookup(f: *FunctionState, name: []const u8, c: *Cursor) Error!Value {
-        for (f.locals.items) |l| if (std.mem.eql(u8, l.name, name)) return l.value;
-        return fail(c.line, c.s, "use of undefined value", error.UndefinedValue);
+        return f.local(name) orelse fail(c.line, c.s, "use of undefined value", error.UndefinedValue);
     }
 
+    fn local(f: *FunctionState, name: []const u8) ?Value {
+        const i = f.local_index.get(name) orelse return null;
+        return f.locals.items[i].value;
+    }
+
+    /// Binds `name` to `value`, through a type anchor when the Builder
+    /// would otherwise follow a chain longer than `max_type_depth` to find
+    /// its type (`typeDepth`).
     fn define(f: *FunctionState, name: []const u8, value: Value) Error!void {
-        try f.locals.append(f.m.gpa, .{ .name = name, .value = value });
+        const gpa = f.m.gpa;
+        const v = if (try f.typeDepth(value) > max_type_depth) try f.typeAnchor(value) else value;
+        const gop = try f.local_index.getOrPut(gpa, name);
+        if (!gop.found_existing) gop.value_ptr.* = f.locals.items.len;
+        try f.locals.append(gpa, .{ .name = name, .value = v });
+    }
+
+    /// How many instructions `Value.typeOfWip(v)` walks through before it
+    /// finds a stored type (`typeOperands`); memoised, so a chain of defined
+    /// values costs one step per value.
+    fn typeDepth(f: *FunctionState, v: Value) Error!u32 {
+        if (f.type_depth.get(v)) |d| return d;
+        var buf: [8]Value = undefined;
+        const ops = typeOperands(&f.wip, v, &buf);
+        var d: u32 = 0;
+        for (ops) |o| d = @max(d, 1 + try f.typeDepth(o));
+        try f.type_depth.put(f.m.gpa, v, d);
+        return d;
+    }
+
+    /// `extractvalue ({ T } insertvalue ({ T } undef, T v, 0)), 0`: the value
+    /// of `v`, whose type the Builder reads off the undef constant.
+    fn typeAnchor(f: *FunctionState, v: Value) Error!Value {
+        const gpa = f.m.gpa;
+        const b = f.m.b;
+        const wrapper = try b.structType(.normal, &.{v.typeOfWip(&f.wip)});
+        const wrapped = try f.wip.insertValue(try b.undefValue(wrapper), v, &.{0}, "");
+        const out = try f.wip.extractValue(wrapped, &.{0}, "");
+        if (f.derived.get(v)) |root| try f.derived.put(gpa, out, root);
+        try f.type_depth.put(gpa, wrapped, 0);
+        try f.type_depth.put(gpa, out, 1);
+        return out;
     }
 
     fn block(f: *FunctionState, name: []const u8, c: *Cursor) Error!BlockIndex {
-        for (f.blocks.items) |blk| if (std.mem.eql(u8, blk.name, name)) return blk.index;
-        return fail(c.line, c.s, "branch to undefined block", error.UndefinedBlock);
+        const i = f.block_index.get(name) orelse return fail(c.line, c.s, "branch to undefined block", error.UndefinedBlock);
+        return f.blocks.items[i].index;
     }
 
     /// Labels end with ':' and start a line. Predecessor counts come from a
@@ -1286,6 +1469,10 @@ const FunctionState = struct {
         defer names.deinit(gpa);
         var counts: std.ArrayList(u32) = .empty;
         defer counts.deinit(gpa);
+        // Names to indices: a branch target is found in constant time, so
+        // a function of N blocks costs O(N), not O(N^2) (review finding: a
+        // 20 000-block chain ran past a minute).
+        f.block_index.clearRetainingCapacity();
 
         // The entry block is implicit unless the body opens with a label.
         // LLVM numbers it right after the parameters, and phis name it that
@@ -1308,10 +1495,13 @@ const FunctionState = struct {
             f.entry_name = try gpa.print("{s}{d}", .{ numbered_prefix, next });
             try names.append(gpa, f.entry_name.?);
             try counts.append(gpa, 0);
+            try f.block_index.put(gpa, f.entry_name.?, 0);
         }
         for (body) |raw| {
             const line = std.mem.trim(u8, raw, " \t\r");
             if (labelName(line)) |name| {
+                const gop = try f.block_index.getOrPut(gpa, name);
+                if (!gop.found_existing) gop.value_ptr.* = names.items.len;
                 try names.append(gpa, name);
                 try counts.append(gpa, 0);
             }
@@ -1327,9 +1517,7 @@ const FunctionState = struct {
                 c.i = p + "label %".len;
                 const target = c.word();
                 pos = c.i;
-                for (names.items, 0..) |n, i| if (std.mem.eql(u8, n, target)) {
-                    counts.items[i] += 1;
-                };
+                if (f.block_index.get(target)) |i| counts.items[i] += 1;
             }
         }
         for (names.items, counts.items) |name, count| {
@@ -1349,9 +1537,7 @@ const FunctionState = struct {
             if (line.len == 0 or line[0] == ';') continue;
             if (labelName(line)) |name| {
                 var c = Cursor{ .s = line, .line = line_no };
-                for (f.blocks.items, 0..) |blk, i| if (std.mem.eql(u8, blk.name, name)) {
-                    f.current = i;
-                };
+                if (f.block_index.get(name)) |i| f.current = i;
                 f.wip.cursor = .{ .block = try f.block(name, &c) };
                 continue;
             }
@@ -1424,6 +1610,7 @@ const FunctionState = struct {
             try c.expectWord("label");
             try c.expect("%");
             const els = try f.block(c.word(), c);
+            if (cond.typeOfWip(wip) != .i1) return fail(c.line, c.s, "br condition is not an i1", error.Syntax);
             _ = try wip.brCond(cond, then, els, .none);
             return;
         }
@@ -1468,6 +1655,7 @@ const FunctionState = struct {
             // A type settled by an earlier attempt at this function wins
             // (lowerDefine); otherwise the incomings defined so far decide.
             if (ty.isPointer(b)) ty = f.phi_hints.get(phi_name) orelse try f.phiPointerType(ty, incoming.items, c.line);
+            if (!(try ty.isSized(b))) return fail(c.line, c.s, "phi of an unsized type", error.Syntax);
             const phi = try wip.phi(ty, "");
             // D1: a pointer phi that kept its textual type and has an
             // incoming derived from another such phi shares that phi's type.
@@ -1480,6 +1668,7 @@ const FunctionState = struct {
                     }
                 }
             }
+            try f.phi_index.put(m.gpa, phi.toValue(), f.phis.items.len);
             try f.phis.append(m.gpa, .{
                 .phi = phi,
                 .ty = ty,
@@ -1520,6 +1709,9 @@ const FunctionState = struct {
                 try f.retryIfUnsettledPhi(lhs, rhs);
                 return fail(c.line, c.s, "select operands have different types", error.Syntax);
             }
+            const cond_ty = cond.typeOfWip(wip);
+            if (cond_ty != .i1 and !(cond_ty.isVector(b) and cond_ty.childType(b) == .i1 and lhs.typeOfWip(wip).isVector(b) and cond_ty.vectorLen(b) == lhs.typeOfWip(wip).vectorLen(b)))
+                return fail(c.line, c.s, "select condition is not an i1 or an i1 vector of the operands' length", error.Syntax);
             const sel = try wip.select(fast, cond, lhs, rhs, "");
             if (pointers) try f.noteDerived(sel, &.{ lhs, rhs });
             try f.define(result orelse return fail(c.line, c.s, "select without result", error.Syntax), sel);
@@ -1639,7 +1831,10 @@ const FunctionState = struct {
             while (true) {
                 c.skipWs();
                 if (!c.eat(",")) break;
-                try indices.append(m.gpa, try f.operand(c));
+                const index = try f.operand(c);
+                const it = index.typeOfWip(wip);
+                if (!it.isInteger(b) and !(it.isVector(b) and it.childType(b).isInteger(b))) return fail(c.line, c.s, "getelementptr index is not an integer", error.Syntax);
+                try indices.append(m.gpa, index);
             }
             const gep = try wip.gep(kind, ty, base, indices.items, "");
             try f.noteDerived(gep, &.{base});
@@ -1730,7 +1925,7 @@ const FunctionState = struct {
                 if (!c.eat(",")) break;
                 c.skipWs();
                 if (c.eatWord("align")) {
-                    alignment = Builder.Alignment.fromByteUnits(try c.int(u64));
+                    alignment = try alignValue(c);
                 } else if (c.eatWord("addrspace")) {
                     try c.expect("(");
                     addr_space = mapAddrSpace(try c.int(u24));
@@ -1780,6 +1975,8 @@ const FunctionState = struct {
             const vec = try f.operand(c);
             try c.expect(",");
             const index = try f.operand(c);
+            if (!vec.typeOfWip(wip).isVector(b)) return fail(c.line, c.s, "extractelement of a non-vector", error.Syntax);
+            if (!index.typeOfWip(wip).isInteger(b)) return fail(c.line, c.s, "extractelement index is not an integer", error.Syntax);
             try f.define(result orelse return fail(c.line, c.s, "extractelement without result", error.Syntax), try wip.extractElement(vec, index, ""));
             return;
         }
@@ -1925,9 +2122,9 @@ const FunctionState = struct {
                 return fail(c.line, c.s, switch (scope) {
                     .threadgroup => switch (level) {
                         .simdgroup => "threadgroup barrier in SIMD-group-divergent control flow: this block runs for some SIMD-groups of the threadgroup only (a branch on simdgroup_index_in_threadgroup or on a simd_sum-style result). A SIMD-group call may sit here, a threadgroup barrier (or a helper that makes one) may not: move the barrier before the branch, see gpu.threadgroupBarrier",
-                        else => "convergent call in divergent control flow: this block runs for a subset of the threadgroup (a branch on a per-thread id such as thread_index_in_threadgroup, a per-thread early return, or a loop some threads leave early). Zig cannot mark barriers, SIMD-group calls and the helpers that make them `convergent`, so LLVM duplicates the call that follows `if (tidx == 0) x = 0;` into both arms and Metal runs the copies as different barriers / partial SIMD sums; make the store before the call unconditional or move the conditional work after it, see gpu.threadgroupBarrier",
+                        else => "convergent call in divergent control flow: this block runs for a subset of the threadgroup (a branch on a per-thread value such as thread_index_in_threadgroup or gl_LocalInvocationID, a per-thread early return, or a loop some threads leave early). A barrier, or a helper that makes one, must be reached by every thread of the threadgroup (MSL and SPIR-V leave anything else undefined; on the Zig path LLVM has also already duplicated such a call into both arms of `if (tidx == 0) x = 0;`, since Zig cannot mark it convergent). Move the conditional work after the barrier or make it unconditional; see gpu.threadgroupBarrier (Zig) or docs/spirv.md, Barriers and atomics (SPIR-V)",
                     },
-                    else => "SIMD-group call in divergent control flow: this block runs for a subset of the SIMD-group (a branch on a per-thread id such as thread_index_in_simdgroup or thread_position_in_grid, a per-thread early return, or a loop some threads leave early). Zig cannot mark simd_* calls, simdgroup_barrier and the helpers that make them `convergent`, so LLVM duplicates the call into the arms of the branch and Metal sums only the lanes of each arm; a branch on simdgroup_index_in_threadgroup is fine, a per-thread one is not, see gpu.simdSum",
+                    else => "SIMD-group call in divergent control flow: this block runs for a subset of the SIMD-group (a branch on a per-thread value such as thread_index_in_simdgroup, thread_position_in_grid or gl_SubgroupInvocationID, a per-thread early return, or a loop some threads leave early). A simd_* call, simdgroup_barrier, or a helper that makes one, must be reached by every lane of the SIMD-group (on the Zig path LLVM has also already duplicated such a call into the arms of the branch, since Zig cannot mark it convergent, and Metal then sums only the lanes of each arm); a branch on simdgroup_index_in_threadgroup is fine, a per-thread one is not, see gpu.simdSum",
                 }, error.Unsupported);
             }
         }
@@ -2068,14 +2265,17 @@ const FunctionState = struct {
         }
         if (callee.define) |di| try m.queue(di);
         const call_conv = explicit_cc orelse callee.call_conv;
-        const value = try wip.call(kind, call_conv, .none, fn_ty, callee.index.toValue(), args.items, "");
+        const value = try wip.call(kind, call_conv, try m.attributesFor(callee_name, true), fn_ty, callee.index.toValue(), args.items, "");
         if (result) |r| try f.define(r, value);
     }
 
     /// `TYPE VALUE` where VALUE is a local or a constant.
     fn operand(f: *FunctionState, c: *Cursor) Error!Value {
         const ty = try f.m.parseType(c);
-        return f.operandOfType(c, ty);
+        const v = try f.operandOfType(c, ty);
+        if (f.m.check_operand_types and v.typeOfWip(&f.wip) != ty)
+            return fail(c.line, c.s, "operand's type differs from the type written before it", error.Syntax);
+        return v;
     }
 
     /// Named values (`%x`, `@g`) keep the type they were defined with; `ty`
@@ -2139,8 +2339,7 @@ const FunctionState = struct {
             '%' => {
                 _ = vc.eat("%");
                 const name = try f.m.quotedOrPlainName(&vc);
-                for (f.locals.items) |l| if (std.mem.eql(u8, l.name, name)) return l.value.typeOfWip(&f.wip);
-                return null;
+                return if (f.local(name)) |v| v.typeOfWip(&f.wip) else null;
             },
             'g' => {
                 if (!std.mem.startsWith(u8, text, "getelementptr")) return null;
@@ -2198,7 +2397,7 @@ const FunctionState = struct {
     /// from (`derived`), when that phi still carries its textual type.
     fn unsettledRoot(f: *FunctionState, v: Value) ?usize {
         if (!v.typeOfWip(&f.wip).isPointer(f.m.b)) return null;
-        for (f.phis.items, 0..) |p, i| if (!p.inferred and p.phi.toValue() == v) return i;
+        if (f.phi_index.get(v)) |i| if (!f.phis.items[i].inferred) return i;
         return f.derived.get(v);
     }
 
@@ -2216,16 +2415,14 @@ const FunctionState = struct {
         if (text.len < 2 or text[0] != '%') return null;
         var vc = Cursor{ .s = text, .line = line_no };
         _ = vc.eat("%");
-        const name = try f.m.quotedOrPlainName(&vc);
-        for (f.locals.items) |l| if (std.mem.eql(u8, l.name, name)) return l.value;
-        return null;
+        return f.local(try f.m.quotedOrPlainName(&vc));
     }
 
     fn resolvePhis(f: *FunctionState) Error!void {
         const gpa = f.m.gpa;
         for (f.phis.items) |p| {
             if (p.incoming.len != p.block_incoming) {
-                std.debug.print("air-splice: line {d}: phi lists {d} incoming values but its block has {d} predecessor edges\n    {s}\n", .{ p.line_no, p.incoming.len, p.block_incoming, p.line });
+                if (print_failures) std.debug.print("{s}: line {d}: phi lists {d} incoming values but its block has {d} predecessor edges\n    {s}\n", .{ failure_prefix, p.line_no, p.incoming.len, p.block_incoming, p.line });
                 return error.Syntax;
             }
             var vals: std.ArrayList(Value) = .empty;
@@ -2276,6 +2473,76 @@ const FunctionState = struct {
     }
 };
 
+/// Builder's `Value.typeOfWip` reads the stored type of a cast, load, phi,
+/// call, alloca or argument, but recomputes the type of most other
+/// instructions from an operand (Builder.zig
+/// `Function.Instruction.Index.typeOfWip`: an add or compare asks its
+/// left operand, a select its true value, a getelementptr its base and
+/// indices, an insert/extract its aggregate or vector, an atomicrmw or
+/// cmpxchg its value). Its assertions and our type checks therefore cost
+/// time proportional to that operand chain and recurse as deep: a
+/// 40 000-long OpIAdd chain (an unrolled accumulation) overflowed the
+/// native stack after a minute, and 30 000-long chains of pointer selects,
+/// OpPtrAccessChain and OpCompositeInsert did the same (review finding
+/// "typeOfWip recursion"). `FunctionState.define` keeps every named value's
+/// chain at most this long by binding a deeper value through
+/// `typeAnchor`, an `insertvalue`/`extractvalue` pair through a one-member
+/// struct whose type the Builder reads off an undef constant. LLVM folds the
+/// pair; shaders stay far below the bound, so their bitcode is unchanged.
+const max_type_depth = 256;
+
+/// What `typeOfWip` follows for an instruction tag (see `max_type_depth`).
+const TypeSource = enum { stored, lhs, operand_in_data, first_extra, second_extra, third_extra, gep };
+
+fn typeSource(comptime tag: Builder.Function.Instruction.Tag) TypeSource {
+    @setEvalBranchQuota(10_000);
+    const name = @tagName(tag);
+    const first = name[0 .. std.mem.findScalar(u8, name, ' ') orelse name.len];
+    const binary = [_][]const u8{ "add", "and", "ashr", "fadd", "fdiv", "fmul", "frem", "fsub", "lshr", "mul", "or", "sdiv", "shl", "srem", "sub", "udiv", "urem", "xor", "fcmp", "icmp" };
+    for (binary) |w| if (std.mem.eql(u8, first, w)) return .lhs;
+    if (std.mem.eql(u8, first, "fneg")) return .operand_in_data;
+    for ([_][]const u8{ "extractelement", "extractvalue", "insertelement", "insertvalue", "shufflevector" }) |w| {
+        if (std.mem.eql(u8, first, w)) return .first_extra;
+    }
+    if (std.mem.eql(u8, first, "select")) return .second_extra;
+    if (std.mem.eql(u8, first, "cmpxchg") or std.mem.eql(u8, first, "atomicrmw")) return .third_extra;
+    if (std.mem.eql(u8, first, "getelementptr")) return .gep;
+    return .stored;
+}
+
+/// The operands `typeOfWip(v)` recurses into (none for a constant, an
+/// argument or an instruction whose type is stored). Mirrors the Builder's
+/// extra-data layout, one u32 per field (`WipFunction.extraDataTrail`):
+/// `Binary{lhs, rhs}`, `Select{cond, lhs, rhs}`, `GetElementPtr{type, base,
+/// indices_len, indices...}`, `ExtractValue{val, ...}`, `CmpXchg{info, ptr,
+/// cmp, new}`, `AtomicRmw{info, ptr, val}`; the test "type operands follow
+/// the Builder's typeOfWip" pins it.
+fn typeOperands(wip: *const WipFunction, v: Value, buf: *[8]Value) []const Value {
+    const inst = switch (v.unwrap()) {
+        .instruction => |i| @backingInt(i),
+        else => return buf[0..0],
+    };
+    const tag = wip.instructions.items(.tag)[inst];
+    const data = wip.instructions.items(.data)[inst];
+    const extra = wip.extra.items;
+    switch (tag) {
+        inline else => |t| switch (comptime typeSource(t)) {
+            .stored => return buf[0..0],
+            .lhs, .first_extra => buf[0] = @fromBackingInt(extra[data]),
+            .operand_in_data => buf[0] = @fromBackingInt(data),
+            .second_extra => buf[0] = @fromBackingInt(extra[data + 1]),
+            .third_extra => buf[0] = @fromBackingInt(extra[data + 2]),
+            .gep => {
+                buf[0] = @fromBackingInt(extra[data + 1]);
+                const n = @min(extra[data + 2], buf.len - 1);
+                for (0..n) |k| buf[1 + k] = @fromBackingInt(extra[data + 3 + k]);
+                return buf[0 .. 1 + n];
+            },
+        },
+    }
+    return buf[0..1];
+}
+
 fn labelName(line: []const u8) ?[]const u8 {
     if (line.len < 2) return null;
     var i: usize = 0;
@@ -2288,9 +2555,17 @@ fn trailingAlign(c: *Cursor) Error!Builder.Alignment {
     c.skipWs();
     if (c.eat(",")) {
         c.skipWs();
-        if (c.eatWord("align")) return Builder.Alignment.fromByteUnits(try c.int(u64));
+        if (c.eatWord("align")) return alignValue(c);
     }
     return .default;
+}
+
+/// The integer after `align`: a power of two (Builder.Alignment asserts it),
+/// else a syntax error rather than a crash on hand-written or generated text.
+fn alignValue(c: *Cursor) Error!Builder.Alignment {
+    const v = try c.int(u64);
+    if (v == 0 or !std.math.isPowerOfTwo(v) or v > 1 << 32) return fail(c.line, c.s, "alignment is not a power of two", error.Syntax);
+    return Builder.Alignment.fromByteUnits(v);
 }
 
 /// `syncscope("...")` is ignored: Metal's scopes come from the address
@@ -2478,14 +2753,14 @@ const Cursor = struct {
 
     fn expect(c: *Cursor, lit: []const u8) Error!void {
         if (!c.eat(lit)) {
-            std.debug.print("air-splice: line {d}: expected '{s}' at column {d}\n    {s}\n", .{ c.line, lit, c.i, c.s });
+            std.debug.print("{s}: line {d}: expected '{s}' at column {d}\n    {s}\n", .{ failure_prefix, c.line, lit, c.i, c.s });
             return error.Syntax;
         }
     }
 
     fn expectWord(c: *Cursor, word_lit: []const u8) Error!void {
         if (!c.eatWord(word_lit)) {
-            std.debug.print("air-splice: line {d}: expected '{s}' at column {d}\n    {s}\n", .{ c.line, word_lit, c.i, c.s });
+            std.debug.print("{s}: line {d}: expected '{s}' at column {d}\n    {s}\n", .{ failure_prefix, c.line, word_lit, c.i, c.s });
             return error.Syntax;
         }
     }
@@ -2517,7 +2792,7 @@ const Cursor = struct {
     fn int(c: *Cursor, comptime T: type) Error!T {
         const w = c.numberOrWord();
         return std.fmt.parseInt(T, w, 10) catch {
-            std.debug.print("air-splice: line {d}: expected integer, found '{s}'\n    {s}\n", .{ c.line, w, c.s });
+            std.debug.print("{s}: line {d}: expected integer, found '{s}'\n    {s}\n", .{ failure_prefix, c.line, w, c.s });
             return error.Syntax;
         };
     }
@@ -2918,6 +3193,36 @@ test "D5.8 non-entry defines are registered and lowered when reached; call fastc
     try std.testing.expect(has(text, "tail call fastcc float @calls.lengthSq"));
     // Unreached helpers leave nothing behind, not even a declaration.
     try std.testing.expect(!has(text, "calls.unused"));
+}
+
+test "D5.8 a module of 20 000 helpers assembles in linear time (functions and globals found by name in hash maps)" {
+    // Review round 2: findDefine, findGlobal, calleeInfo and attributesFor
+    // scanned every define and global per reference, so F helpers cost
+    // O(F^2) (20 000 took 113 s through spirv-splice); the uniformity
+    // analysis found callees the same way. With the maps this runs in well
+    // under a second.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const gpa = arena.allocator();
+    const n = 20000;
+    var text: std.Io.Writer.Allocating = .init(gpa);
+    const w = &text.writer;
+    try w.writeAll(test_header);
+    for (0..n) |i| try w.print("@g{d} = internal addrspace(3) global float undef, align 4\n", .{i});
+    try w.writeAll("define <4 x float> @fragmentShader(<3 x float> %__0, <3 x float> %__1) {\n  %v0 = extractelement <3 x float> %__0, i64 0\n");
+    for (0..n) |i| try w.print("  %v{d} = tail call fastcc float @h{d}(float %v{d})\n", .{ i + 1, i, i });
+    try w.print("  %r = insertelement <4 x float> zeroinitializer, float %v{d}, i64 0\n  ret <4 x float> %r\n}}\n", .{n});
+    // Defined after their caller, in reverse, so a scan from the front
+    // would walk the whole list for every early call.
+    var i: usize = n;
+    while (i > 0) {
+        i -= 1;
+        try w.print("define private fastcc float @h{d}(float %__0) {{\n  store float %__0, ptr addrspace(3) @g{d}, align 4\n  %__2 = fadd float %__0, 1.0\n  ret float %__2\n}}\n", .{ i, i });
+    }
+    const out = try testRoundTrip(gpa, text.written());
+    try std.testing.expect(has(out, "@h0("));
+    try std.testing.expect(has(out, "@h19999("));
+    try std.testing.expect(has(out, "@g19999"));
 }
 
 test "D5.8 quoted identifiers: `@\"q.Vec(4).sum\"` defines and calls resolve, `\\XX` escapes decode" {
@@ -3500,6 +3805,182 @@ test "D5.13 diagnostics: a barrier hidden in a noinline helper is checked at the
         \\
     );
     try std.testing.expect(has(text, "call fastcc void @my_shader.syncTg()"));
+}
+
+test "convergent: barriers, SIMD-group calls and the helpers that reach them carry Apple's attribute sets" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const gpa = arena.allocator();
+    // Apple's front end marks every barrier / SIMD-group declaration
+    // `convergent mustprogress nounwind willreturn` and every call to one
+    // `convergent nounwind willreturn` (`xcrun metal -S -emit-llvm` of an
+    // MSL kernel); without the attribute Metal jump-threads a barrier
+    // between two branches on the same condition (exec tests
+    // barrier_workgroup_counter / barrier_shared_flag, metallib-check's
+    // barrierJoinKernel in a Debug shader build). `air.atomic.fence` is not
+    // convergent in Apple's output and stays bare.
+    const text = try testRoundTrip(gpa, test_header ++
+        \\@tg = internal unnamed_addr addrspace(3) global i32 undef, align 4
+        \\declare void @air.wg.barrier(i32, i32)
+        \\declare float @air.simd_sum.f32(float)
+        \\declare void @air.atomic.fence(i32, i32, i32)
+        \\
+        \\define private fastcc void @my_shader.syncTg() {
+        \\  tail call void @air.wg.barrier(i32 2, i32 1)
+        \\  ret void
+        \\}
+        \\
+        \\define private fastcc void @my_shader.plain() {
+        \\  store i32 1, ptr addrspace(3) @tg, align 4
+        \\  ret void
+        \\}
+        \\
+        \\define void @fragmentShader(ptr addrspace(1) %__0, i32 %__1) {
+        \\  tail call fastcc void @my_shader.plain()
+        \\  tail call void @air.wg.barrier(i32 2, i32 1)
+        \\  %__2 = tail call float @air.simd_sum.f32(float 1.0)
+        \\  tail call void @air.atomic.fence(i32 1, i32 5, i32 2)
+        \\  tail call fastcc void @my_shader.syncTg()
+        \\  ret void
+        \\}
+        \\
+    );
+    const groups = [_]struct { attrs: []const u8, lines: []const []const u8 }{
+        // The Builder prints a set in its own kind order.
+        .{ .attrs = "{ nounwind convergent willreturn mustprogress }", .lines = &.{
+            "declare void @air.wg.barrier(i32 %0, i32 %1) #",
+            "declare float @air.simd_sum.f32(float %0) #",
+        } },
+        .{ .attrs = "{ nounwind convergent willreturn }", .lines = &.{
+            "  tail call void @air.wg.barrier(i32 2, i32 1) #",
+            "call float @air.simd_sum.f32(float 0x3FF0000000000000) #",
+        } },
+        .{ .attrs = "{ convergent }", .lines = &.{
+            "define private fastcc void @my_shader.syncTg() #",
+            "  tail call fastcc void @my_shader.syncTg() #",
+            "define void @fragmentShader(ptr addrspace(1) %0, i32 %1) #",
+        } },
+    };
+    for (groups) |g| for (g.lines) |prefix| {
+        // `<prefix>N`, and `attributes #N = <attrs>`.
+        const at = findPos(text, 0, prefix) orelse {
+            std.debug.print("missing `{s}` in\n{s}\n", .{ prefix, text });
+            return error.TestUnexpectedResult;
+        };
+        var end = at + prefix.len;
+        while (end < text.len and std.ascii.isDigit(text[end])) end += 1;
+        const want = try std.fmt.allocPrint(gpa, "attributes #{s} = {s}", .{ text[at + prefix.len .. end], g.attrs });
+        if (!has(text, want)) {
+            std.debug.print("missing `{s}` for `{s}` in\n{s}\n", .{ want, prefix, text });
+            return error.TestUnexpectedResult;
+        }
+    };
+    // No attributes on what Apple does not mark convergent.
+    try std.testing.expect(has(text, "declare void @air.atomic.fence(i32 %0, i32 %1, i32 %2)\n"));
+    try std.testing.expect(has(text, "call void @air.atomic.fence(i32 1, i32 5, i32 2)\n"));
+    try std.testing.expect(has(text, "define private fastcc void @my_shader.plain() {"));
+    try std.testing.expect(has(text, "call fastcc void @my_shader.plain()\n"));
+}
+
+test "type depth: long operand chains are bound through anchors, short ones are untouched" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const gpa = arena.allocator();
+    // A chain of N dependent instructions of each kind whose type the
+    // Builder recomputes from an operand (add, select of pointers,
+    // getelementptr, insertvalue): with N = 3000 the Builder's typeOfWip
+    // walked 3000 levels per query before (quadratic time; 40 000 levels
+    // overflowed the stack in spirv-splice); now every 257th value is
+    // re-bound through `extractvalue (insertvalue { T } undef, v, 0), 0`.
+    const n = 3000;
+    const kinds = [_]struct { first: []const u8, step: []const u8, use: []const u8 }{
+        .{ .first = "  %c0 = add i32 %__1, 1\n", .step = "  %c{d} = add i32 %c{d}, 1\n", .use = "  store i32 %c{d}, ptr addrspace(3) @tg, align 4\n" },
+        .{ .first = "  %c0 = getelementptr i32, ptr addrspace(3) @tg, i64 1\n", .step = "  %c{d} = select i1 true, ptr addrspace(3) %c{d}, ptr addrspace(3) @tg\n", .use = "  store i32 7, ptr addrspace(3) %c{d}, align 4\n" },
+        .{ .first = "  %c0 = getelementptr i32, ptr addrspace(3) @tg, i64 0\n", .step = "  %c{d} = getelementptr i32, ptr addrspace(3) %c{d}, i64 0\n", .use = "  store i32 7, ptr addrspace(3) %c{d}, align 4\n" },
+        .{ .first = "  %c0 = insertvalue { i32, i32 } undef, i32 %__1, 0\n", .step = "  %c{d} = insertvalue {{ i32, i32 }} %c{d}, i32 %__1, 1\n", .use = "  %u = extractvalue {{ i32, i32 }} %c{d}, 1\n  store i32 %u, ptr addrspace(3) @tg, align 4\n" },
+    };
+    inline for (kinds) |k| {
+        for ([_]usize{ 10, n }) |len| {
+            var body: std.ArrayList(u8) = .empty;
+            try body.appendSlice(gpa, test_header ++ "@tg = internal unnamed_addr addrspace(3) global i32 undef, align 4\n" ++
+                "define void @fragmentShader(ptr addrspace(1) %__0, i32 %__1) {\n");
+            try body.appendSlice(gpa, k.first);
+            for (1..len) |i| try body.print(gpa, k.step, .{ i, i - 1 });
+            try body.print(gpa, k.use, .{len - 1});
+            try body.appendSlice(gpa, "  ret void\n}\n");
+            const text = try testRoundTrip(gpa, body.items);
+            // An anchor is `insertvalue { T } undef, T %v, 0`.
+            var anchors: usize = 0;
+            var lines = std.mem.splitScalar(u8, text, '\n');
+            while (lines.next()) |line| {
+                const iv = findPos(line, 0, "insertvalue ") orelse continue;
+                const un = findPos(line, iv, " undef, ") orelse continue;
+                const wrapper = line[iv + "insertvalue ".len .. un];
+                const elem_end = std.mem.findScalarLast(u8, line, '%') orelse continue;
+                const elem = std.mem.trim(u8, line[un + " undef, ".len .. elem_end], " ");
+                if (wrapper.len == elem.len + 4 and std.mem.startsWith(u8, wrapper, "{ ") and std.mem.endsWith(u8, wrapper, " }") and std.mem.eql(u8, wrapper[2 .. wrapper.len - 2], elem)) anchors += 1;
+            }
+            if (len == 10) {
+                try std.testing.expectEqual(0, anchors);
+            } else {
+                if (anchors < len / (max_type_depth + 1) or anchors > len / max_type_depth + 1) {
+                    std.debug.print("{s}: {d} anchors for a chain of {d}\n", .{ k.step, anchors, len });
+                    return error.TestUnexpectedResult;
+                }
+            }
+        }
+    }
+}
+
+test "type operands follow the Builder's typeOfWip" {
+    const gpa = std.testing.allocator;
+    var b = try Builder.init(.{ .allocator = gpa, .strip = true, .name = "t" });
+    defer b.deinit();
+    const v4 = try b.vectorType(.normal, 4, .i32);
+    const agg = try b.structType(.normal, &.{ .i32, .i32 });
+    const p3 = try b.ptrType(@fromBackingInt(3));
+    const fn_ty = try b.fnType(.void, &.{ .i32, v4, agg, p3, .float }, .normal);
+    const func = try b.addFunction(fn_ty, try b.strtabString("f"), .default);
+    var wip = try WipFunction.init(&b, .{ .function = func, .strip = true });
+    defer wip.deinit();
+    wip.cursor = .{ .block = try wip.block(0, "entry") };
+    const x = wip.arg(0);
+    const v = wip.arg(1);
+    const s = wip.arg(2);
+    const p = wip.arg(3);
+    const fl = wip.arg(4);
+    const one = try b.intValue(.i32, 1);
+    const cases = [_]struct { got: Value, want: Value }{
+        .{ .got = try wip.bin(.add, x, one, ""), .want = x },
+        .{ .got = try wip.icmp(.eq, x, one, ""), .want = x },
+        .{ .got = try wip.un(.fneg, fl, ""), .want = fl },
+        .{ .got = try wip.select(.normal, try b.intValue(.i1, 1), p, p, ""), .want = p },
+        .{ .got = try wip.extractElement(v, one, ""), .want = v },
+        .{ .got = try wip.insertElement(v, x, one, ""), .want = v },
+        .{ .got = try wip.extractValue(s, &.{0}, ""), .want = s },
+        .{ .got = try wip.insertValue(s, x, &.{1}, ""), .want = s },
+        .{ .got = try wip.shuffleVector(v, v, try b.splatValue(v4, try b.intConst(.i32, 0)), ""), .want = v },
+        .{ .got = try wip.gep(.inbounds, .i32, p, &.{x}, ""), .want = p },
+        .{ .got = try wip.atomicrmw(.normal, .add, p, x, .system, .monotonic, .default, ""), .want = x },
+        .{ .got = try wip.cmpxchg(.strong, .normal, p, x, one, .system, .monotonic, .monotonic, .default, ""), .want = x },
+    };
+    var buf: [8]Value = undefined;
+    for (cases, 0..) |cs, i| {
+        const ops = typeOperands(&wip, cs.got, &buf);
+        if (ops.len == 0 or ops[0] != cs.want) {
+            std.debug.print("case {d}: typeOperands does not name the operand typeOfWip follows\n", .{i});
+            return error.TestUnexpectedResult;
+        }
+    }
+    // The gep's index is followed too; stored types and constants end it.
+    const g = try wip.gep(.inbounds, .i32, p, &.{x}, "");
+    try std.testing.expectEqual(2, typeOperands(&wip, g, &buf).len);
+    try std.testing.expectEqual(0, typeOperands(&wip, try wip.load(.normal, .i32, p, .default, ""), &buf).len);
+    try std.testing.expectEqual(0, typeOperands(&wip, try wip.cast(.zext, x, .i64, ""), &buf).len);
+    try std.testing.expectEqual(0, typeOperands(&wip, x, &buf).len);
+    try std.testing.expectEqual(0, typeOperands(&wip, one, &buf).len);
+    _ = try wip.retVoid();
+    try wip.finish();
 }
 
 test "D5.13 diagnostics: SIMD-group collectives are convergent too (jump-threaded simd_sum)" {

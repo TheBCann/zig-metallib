@@ -3,6 +3,7 @@
 #
 #   tools/crosscheck/sweep.sh FROM TO
 #   CROSSCHECK_ARGS="-Dcrosscheck-floats=true" tools/crosscheck/sweep.sh FROM TO
+#   CROSSCHECK_ARGS="-Dcrosscheck-spirv=true" tools/crosscheck/sweep.sh FROM TO   # the SPIR-V path (docs/spirv.md)
 #
 # CROSSCHECK_ARGS is appended to every `zig build crosscheck` (float mode,
 # `-Dcrosscheck-known=true`, ...) and mirrored into the reproducer's generation.
@@ -16,7 +17,8 @@
 #
 #   match     GPU and CPU agree on every element
 #   MISMATCH  they disagree: a codegen bug (the most valuable finding)
-#   REFUSED   this project's assembler refused a construct (a feature gap)
+#   REFUSED   this project's assembler (or spirv-splice's lowering) refused a
+#             construct (a feature gap)
 #   METAL     Metal's compiler rejected or failed on our library
 #   SKIP      no Metal device (e.g. a CI runner without a GPU)
 #   ERROR     anything else, e.g. the generator emitted invalid Zig
@@ -49,7 +51,7 @@ for seed in $(seq "$from" "$to"); do
     bucket=SKIP
   elif grep -qE '^FAIL (newLibraryWithData|newFunctionWithName|newComputePipelineState|command buffer)' <<<"$log"; then
     bucket=METAL
-  elif grep -qE '^air-splice: (line [0-9]+|.*Unsupported)' <<<"$log"; then
+  elif grep -qE '^air-splice: (line [0-9]+|.*Unsupported)' <<<"$log" || grep -E '^spirv-splice: ' <<<"$log" | grep -qv '^spirv-splice: warning:'; then
     bucket=REFUSED
   else
     bucket=ERROR
@@ -66,11 +68,12 @@ for seed in $(seq "$from" "$to"); do
       case "$tok" in
         -Dcrosscheck-floats|-Dcrosscheck-floats=true) gen_args="$gen_args --floats";;
         -Dcrosscheck-known|-Dcrosscheck-known=true) gen_args="$gen_args --include-known-findings";;
+        -Dcrosscheck-spirv|-Dcrosscheck-spirv=true) gen_args="$gen_args --spirv";;
       esac
     done
     # shellcheck disable=SC2086
     zig run tools/crosscheck/gen.zig -- --seed="$seed" $gen_args "$out_dir/$seed/body.zig" >/dev/null 2>&1
-    reason=$(grep -m1 -E '^(FAIL|air-splice:|error:)' <<<"$log" | cut -c1-140)
+    reason=$(grep -m1 -E '^(FAIL|air-splice:|spirv-splice:|error:)' <<<"$log" | cut -c1-140)
     printf 'seed %-6s %-9s %s\n' "$seed" "$bucket" "$reason"
   fi
 done

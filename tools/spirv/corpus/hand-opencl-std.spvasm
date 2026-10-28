@@ -1,0 +1,1084 @@
+; hand-opencl-std.spvasm: one Kernel entry point per OpenCL.std instruction the lowering maps
+; (SPIRV-DESIGN section 4: 'OpenCL.std: the same table by name'), OpenCL flavour as Zig's
+; spirv64-opencl target emits it: Kernel/Addresses/Int64 capabilities, Physical64 OpenCL,
+; CrossWorkgroup pointer parameters, OpInBoundsPtrAccessChain, GlobalInvocationId as a vec3<u64>.
+; Parameters: (in0, in1, out) as CrossWorkgroup f32 pointers for float kernels, i32 for integer
+; kernels (unsigned ones bitcast), vec4<f32> for the vector kernels; every kernel handles gid.x.
+; Hand-written for this project's corpus in tools/spirv/asm.zig syntax (spirv-as compatible).
+; SPIR-V
+; Version: 1.3
+; Generator: 0x00000000
+OpCapability Kernel
+OpCapability Addresses
+OpCapability Int64
+%ocl = OpExtInstImport "OpenCL.std"
+OpMemoryModel Physical64 OpenCL
+OpEntryPoint Kernel %k_fabs "fabs" %gid
+OpEntryPoint Kernel %k_sqrt "sqrt" %gid
+OpEntryPoint Kernel %k_rsqrt "rsqrt" %gid
+OpEntryPoint Kernel %k_floor "floor" %gid
+OpEntryPoint Kernel %k_ceil "ceil" %gid
+OpEntryPoint Kernel %k_trunc "trunc" %gid
+OpEntryPoint Kernel %k_rint "rint" %gid
+OpEntryPoint Kernel %k_round "round" %gid
+OpEntryPoint Kernel %k_sin "sin" %gid
+OpEntryPoint Kernel %k_cos "cos" %gid
+OpEntryPoint Kernel %k_tan "tan" %gid
+OpEntryPoint Kernel %k_asin "asin" %gid
+OpEntryPoint Kernel %k_acos "acos" %gid
+OpEntryPoint Kernel %k_atan "atan" %gid
+OpEntryPoint Kernel %k_sinh "sinh" %gid
+OpEntryPoint Kernel %k_cosh "cosh" %gid
+OpEntryPoint Kernel %k_tanh "tanh" %gid
+OpEntryPoint Kernel %k_exp "exp" %gid
+OpEntryPoint Kernel %k_exp2 "exp2" %gid
+OpEntryPoint Kernel %k_log "log" %gid
+OpEntryPoint Kernel %k_log2 "log2" %gid
+OpEntryPoint Kernel %k_sign "sign" %gid
+OpEntryPoint Kernel %k_atan2 "atan2" %gid
+OpEntryPoint Kernel %k_pow "pow" %gid
+OpEntryPoint Kernel %k_fmin "fmin" %gid
+OpEntryPoint Kernel %k_fmax "fmax" %gid
+OpEntryPoint Kernel %k_step "step" %gid
+OpEntryPoint Kernel %k_copysign "copysign" %gid
+OpEntryPoint Kernel %k_fmod "fmod" %gid
+OpEntryPoint Kernel %k_fma "fma" %gid
+OpEntryPoint Kernel %k_mad "mad" %gid
+OpEntryPoint Kernel %k_fclamp "fclamp" %gid
+OpEntryPoint Kernel %k_mix "mix" %gid
+OpEntryPoint Kernel %k_smoothstep "smoothstep" %gid
+OpEntryPoint Kernel %k_ldexp "ldexp" %gid
+OpEntryPoint Kernel %k_s_abs "s_abs" %gid
+OpEntryPoint Kernel %k_popcount "popcount" %gid
+OpEntryPoint Kernel %k_clz "clz" %gid
+OpEntryPoint Kernel %k_ctz "ctz" %gid
+OpEntryPoint Kernel %k_s_min "s_min" %gid
+OpEntryPoint Kernel %k_s_max "s_max" %gid
+OpEntryPoint Kernel %k_s_mul_hi "s_mul_hi" %gid
+OpEntryPoint Kernel %k_u_min "u_min" %gid
+OpEntryPoint Kernel %k_u_max "u_max" %gid
+OpEntryPoint Kernel %k_u_mul_hi "u_mul_hi" %gid
+OpEntryPoint Kernel %k_s_clamp "s_clamp" %gid
+OpEntryPoint Kernel %k_u_clamp "u_clamp" %gid
+OpEntryPoint Kernel %k_normalize "normalize" %gid
+OpEntryPoint Kernel %k_length "length" %gid
+OpEntryPoint Kernel %k_distance "distance" %gid
+OpEntryPoint Kernel %k_cross "cross" %gid
+OpExecutionMode %k_fabs LocalSize 64 1 1
+OpExecutionMode %k_sqrt LocalSize 64 1 1
+OpExecutionMode %k_rsqrt LocalSize 64 1 1
+OpExecutionMode %k_floor LocalSize 64 1 1
+OpExecutionMode %k_ceil LocalSize 64 1 1
+OpExecutionMode %k_trunc LocalSize 64 1 1
+OpExecutionMode %k_rint LocalSize 64 1 1
+OpExecutionMode %k_round LocalSize 64 1 1
+OpExecutionMode %k_sin LocalSize 64 1 1
+OpExecutionMode %k_cos LocalSize 64 1 1
+OpExecutionMode %k_tan LocalSize 64 1 1
+OpExecutionMode %k_asin LocalSize 64 1 1
+OpExecutionMode %k_acos LocalSize 64 1 1
+OpExecutionMode %k_atan LocalSize 64 1 1
+OpExecutionMode %k_sinh LocalSize 64 1 1
+OpExecutionMode %k_cosh LocalSize 64 1 1
+OpExecutionMode %k_tanh LocalSize 64 1 1
+OpExecutionMode %k_exp LocalSize 64 1 1
+OpExecutionMode %k_exp2 LocalSize 64 1 1
+OpExecutionMode %k_log LocalSize 64 1 1
+OpExecutionMode %k_log2 LocalSize 64 1 1
+OpExecutionMode %k_sign LocalSize 64 1 1
+OpExecutionMode %k_atan2 LocalSize 64 1 1
+OpExecutionMode %k_pow LocalSize 64 1 1
+OpExecutionMode %k_fmin LocalSize 64 1 1
+OpExecutionMode %k_fmax LocalSize 64 1 1
+OpExecutionMode %k_step LocalSize 64 1 1
+OpExecutionMode %k_copysign LocalSize 64 1 1
+OpExecutionMode %k_fmod LocalSize 64 1 1
+OpExecutionMode %k_fma LocalSize 64 1 1
+OpExecutionMode %k_mad LocalSize 64 1 1
+OpExecutionMode %k_fclamp LocalSize 64 1 1
+OpExecutionMode %k_mix LocalSize 64 1 1
+OpExecutionMode %k_smoothstep LocalSize 64 1 1
+OpExecutionMode %k_ldexp LocalSize 64 1 1
+OpExecutionMode %k_s_abs LocalSize 64 1 1
+OpExecutionMode %k_popcount LocalSize 64 1 1
+OpExecutionMode %k_clz LocalSize 64 1 1
+OpExecutionMode %k_ctz LocalSize 64 1 1
+OpExecutionMode %k_s_min LocalSize 64 1 1
+OpExecutionMode %k_s_max LocalSize 64 1 1
+OpExecutionMode %k_s_mul_hi LocalSize 64 1 1
+OpExecutionMode %k_u_min LocalSize 64 1 1
+OpExecutionMode %k_u_max LocalSize 64 1 1
+OpExecutionMode %k_u_mul_hi LocalSize 64 1 1
+OpExecutionMode %k_s_clamp LocalSize 64 1 1
+OpExecutionMode %k_u_clamp LocalSize 64 1 1
+OpExecutionMode %k_normalize LocalSize 64 1 1
+OpExecutionMode %k_length LocalSize 64 1 1
+OpExecutionMode %k_distance LocalSize 64 1 1
+OpExecutionMode %k_cross LocalSize 64 1 1
+OpName %k_fabs "fabs"
+OpName %k_sqrt "sqrt"
+OpName %k_rsqrt "rsqrt"
+OpName %k_floor "floor"
+OpName %k_ceil "ceil"
+OpName %k_trunc "trunc"
+OpName %k_rint "rint"
+OpName %k_round "round"
+OpName %k_sin "sin"
+OpName %k_cos "cos"
+OpName %k_tan "tan"
+OpName %k_asin "asin"
+OpName %k_acos "acos"
+OpName %k_atan "atan"
+OpName %k_sinh "sinh"
+OpName %k_cosh "cosh"
+OpName %k_tanh "tanh"
+OpName %k_exp "exp"
+OpName %k_exp2 "exp2"
+OpName %k_log "log"
+OpName %k_log2 "log2"
+OpName %k_sign "sign"
+OpName %k_atan2 "atan2"
+OpName %k_pow "pow"
+OpName %k_fmin "fmin"
+OpName %k_fmax "fmax"
+OpName %k_step "step"
+OpName %k_copysign "copysign"
+OpName %k_fmod "fmod"
+OpName %k_fma "fma"
+OpName %k_mad "mad"
+OpName %k_fclamp "fclamp"
+OpName %k_mix "mix"
+OpName %k_smoothstep "smoothstep"
+OpName %k_ldexp "ldexp"
+OpName %k_s_abs "s_abs"
+OpName %k_popcount "popcount"
+OpName %k_clz "clz"
+OpName %k_ctz "ctz"
+OpName %k_s_min "s_min"
+OpName %k_s_max "s_max"
+OpName %k_s_mul_hi "s_mul_hi"
+OpName %k_u_min "u_min"
+OpName %k_u_max "u_max"
+OpName %k_u_mul_hi "u_mul_hi"
+OpName %k_s_clamp "s_clamp"
+OpName %k_u_clamp "u_clamp"
+OpName %k_normalize "normalize"
+OpName %k_length "length"
+OpName %k_distance "distance"
+OpName %k_cross "cross"
+OpName %gid "gid"
+OpDecorate %gid BuiltIn GlobalInvocationId
+%void = OpTypeVoid
+%f32 = OpTypeFloat 32
+%u32 = OpTypeInt 32 0
+%i32 = OpTypeInt 32 1
+%u64 = OpTypeInt 64 0
+%v3u64 = OpTypeVector %u64 3
+%v4f32 = OpTypeVector %f32 4
+%v3f32 = OpTypeVector %f32 3
+%f0 = OpConstant %f32 0
+%p_cw_f32 = OpTypePointer CrossWorkgroup %f32
+%p_cw_i32 = OpTypePointer CrossWorkgroup %i32
+%p_cw_v4 = OpTypePointer CrossWorkgroup %v4f32
+%fn_f = OpTypeFunction %void %p_cw_f32 %p_cw_f32 %p_cw_f32
+%fn_i = OpTypeFunction %void %p_cw_i32 %p_cw_i32 %p_cw_i32
+%fn_fi = OpTypeFunction %void %p_cw_f32 %p_cw_i32 %p_cw_f32
+%fn_v = OpTypeFunction %void %p_cw_v4 %p_cw_v4 %p_cw_v4
+%fn_vs = OpTypeFunction %void %p_cw_v4 %p_cw_v4 %p_cw_f32
+%p_in_v3u64 = OpTypePointer Input %v3u64
+%gid = OpVariable %p_in_v3u64 Input
+%k_fabs = OpFunction %void None %fn_f
+%fabs_in0 = OpFunctionParameter %p_cw_f32
+%fabs_in1 = OpFunctionParameter %p_cw_f32
+%fabs_out = OpFunctionParameter %p_cw_f32
+%fabs_entry = OpLabel
+%fabs_g = OpLoad %v3u64 %gid
+%fabs_i = OpCompositeExtract %u64 %fabs_g 0
+%fabs_pa = OpInBoundsPtrAccessChain %p_cw_f32 %fabs_in0 %fabs_i
+%fabs_a0 = OpLoad %f32 %fabs_pa
+%fabs_a = OpCopyObject %f32 %fabs_a0
+%fabs_r = OpExtInst %f32 %ocl fabs %fabs_a
+%fabs_r1 = OpCopyObject %f32 %fabs_r
+%fabs_po = OpInBoundsPtrAccessChain %p_cw_f32 %fabs_out %fabs_i
+OpStore %fabs_po %fabs_r1
+OpReturn
+OpFunctionEnd
+%k_sqrt = OpFunction %void None %fn_f
+%sqrt_in0 = OpFunctionParameter %p_cw_f32
+%sqrt_in1 = OpFunctionParameter %p_cw_f32
+%sqrt_out = OpFunctionParameter %p_cw_f32
+%sqrt_entry = OpLabel
+%sqrt_g = OpLoad %v3u64 %gid
+%sqrt_i = OpCompositeExtract %u64 %sqrt_g 0
+%sqrt_pa = OpInBoundsPtrAccessChain %p_cw_f32 %sqrt_in0 %sqrt_i
+%sqrt_a0 = OpLoad %f32 %sqrt_pa
+%sqrt_a = OpCopyObject %f32 %sqrt_a0
+%sqrt_r = OpExtInst %f32 %ocl sqrt %sqrt_a
+%sqrt_r1 = OpCopyObject %f32 %sqrt_r
+%sqrt_po = OpInBoundsPtrAccessChain %p_cw_f32 %sqrt_out %sqrt_i
+OpStore %sqrt_po %sqrt_r1
+OpReturn
+OpFunctionEnd
+%k_rsqrt = OpFunction %void None %fn_f
+%rsqrt_in0 = OpFunctionParameter %p_cw_f32
+%rsqrt_in1 = OpFunctionParameter %p_cw_f32
+%rsqrt_out = OpFunctionParameter %p_cw_f32
+%rsqrt_entry = OpLabel
+%rsqrt_g = OpLoad %v3u64 %gid
+%rsqrt_i = OpCompositeExtract %u64 %rsqrt_g 0
+%rsqrt_pa = OpInBoundsPtrAccessChain %p_cw_f32 %rsqrt_in0 %rsqrt_i
+%rsqrt_a0 = OpLoad %f32 %rsqrt_pa
+%rsqrt_a = OpCopyObject %f32 %rsqrt_a0
+%rsqrt_r = OpExtInst %f32 %ocl rsqrt %rsqrt_a
+%rsqrt_r1 = OpCopyObject %f32 %rsqrt_r
+%rsqrt_po = OpInBoundsPtrAccessChain %p_cw_f32 %rsqrt_out %rsqrt_i
+OpStore %rsqrt_po %rsqrt_r1
+OpReturn
+OpFunctionEnd
+%k_floor = OpFunction %void None %fn_f
+%floor_in0 = OpFunctionParameter %p_cw_f32
+%floor_in1 = OpFunctionParameter %p_cw_f32
+%floor_out = OpFunctionParameter %p_cw_f32
+%floor_entry = OpLabel
+%floor_g = OpLoad %v3u64 %gid
+%floor_i = OpCompositeExtract %u64 %floor_g 0
+%floor_pa = OpInBoundsPtrAccessChain %p_cw_f32 %floor_in0 %floor_i
+%floor_a0 = OpLoad %f32 %floor_pa
+%floor_a = OpCopyObject %f32 %floor_a0
+%floor_r = OpExtInst %f32 %ocl floor %floor_a
+%floor_r1 = OpCopyObject %f32 %floor_r
+%floor_po = OpInBoundsPtrAccessChain %p_cw_f32 %floor_out %floor_i
+OpStore %floor_po %floor_r1
+OpReturn
+OpFunctionEnd
+%k_ceil = OpFunction %void None %fn_f
+%ceil_in0 = OpFunctionParameter %p_cw_f32
+%ceil_in1 = OpFunctionParameter %p_cw_f32
+%ceil_out = OpFunctionParameter %p_cw_f32
+%ceil_entry = OpLabel
+%ceil_g = OpLoad %v3u64 %gid
+%ceil_i = OpCompositeExtract %u64 %ceil_g 0
+%ceil_pa = OpInBoundsPtrAccessChain %p_cw_f32 %ceil_in0 %ceil_i
+%ceil_a0 = OpLoad %f32 %ceil_pa
+%ceil_a = OpCopyObject %f32 %ceil_a0
+%ceil_r = OpExtInst %f32 %ocl ceil %ceil_a
+%ceil_r1 = OpCopyObject %f32 %ceil_r
+%ceil_po = OpInBoundsPtrAccessChain %p_cw_f32 %ceil_out %ceil_i
+OpStore %ceil_po %ceil_r1
+OpReturn
+OpFunctionEnd
+%k_trunc = OpFunction %void None %fn_f
+%trunc_in0 = OpFunctionParameter %p_cw_f32
+%trunc_in1 = OpFunctionParameter %p_cw_f32
+%trunc_out = OpFunctionParameter %p_cw_f32
+%trunc_entry = OpLabel
+%trunc_g = OpLoad %v3u64 %gid
+%trunc_i = OpCompositeExtract %u64 %trunc_g 0
+%trunc_pa = OpInBoundsPtrAccessChain %p_cw_f32 %trunc_in0 %trunc_i
+%trunc_a0 = OpLoad %f32 %trunc_pa
+%trunc_a = OpCopyObject %f32 %trunc_a0
+%trunc_r = OpExtInst %f32 %ocl trunc %trunc_a
+%trunc_r1 = OpCopyObject %f32 %trunc_r
+%trunc_po = OpInBoundsPtrAccessChain %p_cw_f32 %trunc_out %trunc_i
+OpStore %trunc_po %trunc_r1
+OpReturn
+OpFunctionEnd
+%k_rint = OpFunction %void None %fn_f
+%rint_in0 = OpFunctionParameter %p_cw_f32
+%rint_in1 = OpFunctionParameter %p_cw_f32
+%rint_out = OpFunctionParameter %p_cw_f32
+%rint_entry = OpLabel
+%rint_g = OpLoad %v3u64 %gid
+%rint_i = OpCompositeExtract %u64 %rint_g 0
+%rint_pa = OpInBoundsPtrAccessChain %p_cw_f32 %rint_in0 %rint_i
+%rint_a0 = OpLoad %f32 %rint_pa
+%rint_a = OpCopyObject %f32 %rint_a0
+%rint_r = OpExtInst %f32 %ocl rint %rint_a
+%rint_r1 = OpCopyObject %f32 %rint_r
+%rint_po = OpInBoundsPtrAccessChain %p_cw_f32 %rint_out %rint_i
+OpStore %rint_po %rint_r1
+OpReturn
+OpFunctionEnd
+%k_round = OpFunction %void None %fn_f
+%round_in0 = OpFunctionParameter %p_cw_f32
+%round_in1 = OpFunctionParameter %p_cw_f32
+%round_out = OpFunctionParameter %p_cw_f32
+%round_entry = OpLabel
+%round_g = OpLoad %v3u64 %gid
+%round_i = OpCompositeExtract %u64 %round_g 0
+%round_pa = OpInBoundsPtrAccessChain %p_cw_f32 %round_in0 %round_i
+%round_a0 = OpLoad %f32 %round_pa
+%round_a = OpCopyObject %f32 %round_a0
+%round_r = OpExtInst %f32 %ocl round %round_a
+%round_r1 = OpCopyObject %f32 %round_r
+%round_po = OpInBoundsPtrAccessChain %p_cw_f32 %round_out %round_i
+OpStore %round_po %round_r1
+OpReturn
+OpFunctionEnd
+%k_sin = OpFunction %void None %fn_f
+%sin_in0 = OpFunctionParameter %p_cw_f32
+%sin_in1 = OpFunctionParameter %p_cw_f32
+%sin_out = OpFunctionParameter %p_cw_f32
+%sin_entry = OpLabel
+%sin_g = OpLoad %v3u64 %gid
+%sin_i = OpCompositeExtract %u64 %sin_g 0
+%sin_pa = OpInBoundsPtrAccessChain %p_cw_f32 %sin_in0 %sin_i
+%sin_a0 = OpLoad %f32 %sin_pa
+%sin_a = OpCopyObject %f32 %sin_a0
+%sin_r = OpExtInst %f32 %ocl sin %sin_a
+%sin_r1 = OpCopyObject %f32 %sin_r
+%sin_po = OpInBoundsPtrAccessChain %p_cw_f32 %sin_out %sin_i
+OpStore %sin_po %sin_r1
+OpReturn
+OpFunctionEnd
+%k_cos = OpFunction %void None %fn_f
+%cos_in0 = OpFunctionParameter %p_cw_f32
+%cos_in1 = OpFunctionParameter %p_cw_f32
+%cos_out = OpFunctionParameter %p_cw_f32
+%cos_entry = OpLabel
+%cos_g = OpLoad %v3u64 %gid
+%cos_i = OpCompositeExtract %u64 %cos_g 0
+%cos_pa = OpInBoundsPtrAccessChain %p_cw_f32 %cos_in0 %cos_i
+%cos_a0 = OpLoad %f32 %cos_pa
+%cos_a = OpCopyObject %f32 %cos_a0
+%cos_r = OpExtInst %f32 %ocl cos %cos_a
+%cos_r1 = OpCopyObject %f32 %cos_r
+%cos_po = OpInBoundsPtrAccessChain %p_cw_f32 %cos_out %cos_i
+OpStore %cos_po %cos_r1
+OpReturn
+OpFunctionEnd
+%k_tan = OpFunction %void None %fn_f
+%tan_in0 = OpFunctionParameter %p_cw_f32
+%tan_in1 = OpFunctionParameter %p_cw_f32
+%tan_out = OpFunctionParameter %p_cw_f32
+%tan_entry = OpLabel
+%tan_g = OpLoad %v3u64 %gid
+%tan_i = OpCompositeExtract %u64 %tan_g 0
+%tan_pa = OpInBoundsPtrAccessChain %p_cw_f32 %tan_in0 %tan_i
+%tan_a0 = OpLoad %f32 %tan_pa
+%tan_a = OpCopyObject %f32 %tan_a0
+%tan_r = OpExtInst %f32 %ocl tan %tan_a
+%tan_r1 = OpCopyObject %f32 %tan_r
+%tan_po = OpInBoundsPtrAccessChain %p_cw_f32 %tan_out %tan_i
+OpStore %tan_po %tan_r1
+OpReturn
+OpFunctionEnd
+%k_asin = OpFunction %void None %fn_f
+%asin_in0 = OpFunctionParameter %p_cw_f32
+%asin_in1 = OpFunctionParameter %p_cw_f32
+%asin_out = OpFunctionParameter %p_cw_f32
+%asin_entry = OpLabel
+%asin_g = OpLoad %v3u64 %gid
+%asin_i = OpCompositeExtract %u64 %asin_g 0
+%asin_pa = OpInBoundsPtrAccessChain %p_cw_f32 %asin_in0 %asin_i
+%asin_a0 = OpLoad %f32 %asin_pa
+%asin_a = OpCopyObject %f32 %asin_a0
+%asin_r = OpExtInst %f32 %ocl asin %asin_a
+%asin_r1 = OpCopyObject %f32 %asin_r
+%asin_po = OpInBoundsPtrAccessChain %p_cw_f32 %asin_out %asin_i
+OpStore %asin_po %asin_r1
+OpReturn
+OpFunctionEnd
+%k_acos = OpFunction %void None %fn_f
+%acos_in0 = OpFunctionParameter %p_cw_f32
+%acos_in1 = OpFunctionParameter %p_cw_f32
+%acos_out = OpFunctionParameter %p_cw_f32
+%acos_entry = OpLabel
+%acos_g = OpLoad %v3u64 %gid
+%acos_i = OpCompositeExtract %u64 %acos_g 0
+%acos_pa = OpInBoundsPtrAccessChain %p_cw_f32 %acos_in0 %acos_i
+%acos_a0 = OpLoad %f32 %acos_pa
+%acos_a = OpCopyObject %f32 %acos_a0
+%acos_r = OpExtInst %f32 %ocl acos %acos_a
+%acos_r1 = OpCopyObject %f32 %acos_r
+%acos_po = OpInBoundsPtrAccessChain %p_cw_f32 %acos_out %acos_i
+OpStore %acos_po %acos_r1
+OpReturn
+OpFunctionEnd
+%k_atan = OpFunction %void None %fn_f
+%atan_in0 = OpFunctionParameter %p_cw_f32
+%atan_in1 = OpFunctionParameter %p_cw_f32
+%atan_out = OpFunctionParameter %p_cw_f32
+%atan_entry = OpLabel
+%atan_g = OpLoad %v3u64 %gid
+%atan_i = OpCompositeExtract %u64 %atan_g 0
+%atan_pa = OpInBoundsPtrAccessChain %p_cw_f32 %atan_in0 %atan_i
+%atan_a0 = OpLoad %f32 %atan_pa
+%atan_a = OpCopyObject %f32 %atan_a0
+%atan_r = OpExtInst %f32 %ocl atan %atan_a
+%atan_r1 = OpCopyObject %f32 %atan_r
+%atan_po = OpInBoundsPtrAccessChain %p_cw_f32 %atan_out %atan_i
+OpStore %atan_po %atan_r1
+OpReturn
+OpFunctionEnd
+%k_sinh = OpFunction %void None %fn_f
+%sinh_in0 = OpFunctionParameter %p_cw_f32
+%sinh_in1 = OpFunctionParameter %p_cw_f32
+%sinh_out = OpFunctionParameter %p_cw_f32
+%sinh_entry = OpLabel
+%sinh_g = OpLoad %v3u64 %gid
+%sinh_i = OpCompositeExtract %u64 %sinh_g 0
+%sinh_pa = OpInBoundsPtrAccessChain %p_cw_f32 %sinh_in0 %sinh_i
+%sinh_a0 = OpLoad %f32 %sinh_pa
+%sinh_a = OpCopyObject %f32 %sinh_a0
+%sinh_r = OpExtInst %f32 %ocl sinh %sinh_a
+%sinh_r1 = OpCopyObject %f32 %sinh_r
+%sinh_po = OpInBoundsPtrAccessChain %p_cw_f32 %sinh_out %sinh_i
+OpStore %sinh_po %sinh_r1
+OpReturn
+OpFunctionEnd
+%k_cosh = OpFunction %void None %fn_f
+%cosh_in0 = OpFunctionParameter %p_cw_f32
+%cosh_in1 = OpFunctionParameter %p_cw_f32
+%cosh_out = OpFunctionParameter %p_cw_f32
+%cosh_entry = OpLabel
+%cosh_g = OpLoad %v3u64 %gid
+%cosh_i = OpCompositeExtract %u64 %cosh_g 0
+%cosh_pa = OpInBoundsPtrAccessChain %p_cw_f32 %cosh_in0 %cosh_i
+%cosh_a0 = OpLoad %f32 %cosh_pa
+%cosh_a = OpCopyObject %f32 %cosh_a0
+%cosh_r = OpExtInst %f32 %ocl cosh %cosh_a
+%cosh_r1 = OpCopyObject %f32 %cosh_r
+%cosh_po = OpInBoundsPtrAccessChain %p_cw_f32 %cosh_out %cosh_i
+OpStore %cosh_po %cosh_r1
+OpReturn
+OpFunctionEnd
+%k_tanh = OpFunction %void None %fn_f
+%tanh_in0 = OpFunctionParameter %p_cw_f32
+%tanh_in1 = OpFunctionParameter %p_cw_f32
+%tanh_out = OpFunctionParameter %p_cw_f32
+%tanh_entry = OpLabel
+%tanh_g = OpLoad %v3u64 %gid
+%tanh_i = OpCompositeExtract %u64 %tanh_g 0
+%tanh_pa = OpInBoundsPtrAccessChain %p_cw_f32 %tanh_in0 %tanh_i
+%tanh_a0 = OpLoad %f32 %tanh_pa
+%tanh_a = OpCopyObject %f32 %tanh_a0
+%tanh_r = OpExtInst %f32 %ocl tanh %tanh_a
+%tanh_r1 = OpCopyObject %f32 %tanh_r
+%tanh_po = OpInBoundsPtrAccessChain %p_cw_f32 %tanh_out %tanh_i
+OpStore %tanh_po %tanh_r1
+OpReturn
+OpFunctionEnd
+%k_exp = OpFunction %void None %fn_f
+%exp_in0 = OpFunctionParameter %p_cw_f32
+%exp_in1 = OpFunctionParameter %p_cw_f32
+%exp_out = OpFunctionParameter %p_cw_f32
+%exp_entry = OpLabel
+%exp_g = OpLoad %v3u64 %gid
+%exp_i = OpCompositeExtract %u64 %exp_g 0
+%exp_pa = OpInBoundsPtrAccessChain %p_cw_f32 %exp_in0 %exp_i
+%exp_a0 = OpLoad %f32 %exp_pa
+%exp_a = OpCopyObject %f32 %exp_a0
+%exp_r = OpExtInst %f32 %ocl exp %exp_a
+%exp_r1 = OpCopyObject %f32 %exp_r
+%exp_po = OpInBoundsPtrAccessChain %p_cw_f32 %exp_out %exp_i
+OpStore %exp_po %exp_r1
+OpReturn
+OpFunctionEnd
+%k_exp2 = OpFunction %void None %fn_f
+%exp2_in0 = OpFunctionParameter %p_cw_f32
+%exp2_in1 = OpFunctionParameter %p_cw_f32
+%exp2_out = OpFunctionParameter %p_cw_f32
+%exp2_entry = OpLabel
+%exp2_g = OpLoad %v3u64 %gid
+%exp2_i = OpCompositeExtract %u64 %exp2_g 0
+%exp2_pa = OpInBoundsPtrAccessChain %p_cw_f32 %exp2_in0 %exp2_i
+%exp2_a0 = OpLoad %f32 %exp2_pa
+%exp2_a = OpCopyObject %f32 %exp2_a0
+%exp2_r = OpExtInst %f32 %ocl exp2 %exp2_a
+%exp2_r1 = OpCopyObject %f32 %exp2_r
+%exp2_po = OpInBoundsPtrAccessChain %p_cw_f32 %exp2_out %exp2_i
+OpStore %exp2_po %exp2_r1
+OpReturn
+OpFunctionEnd
+%k_log = OpFunction %void None %fn_f
+%log_in0 = OpFunctionParameter %p_cw_f32
+%log_in1 = OpFunctionParameter %p_cw_f32
+%log_out = OpFunctionParameter %p_cw_f32
+%log_entry = OpLabel
+%log_g = OpLoad %v3u64 %gid
+%log_i = OpCompositeExtract %u64 %log_g 0
+%log_pa = OpInBoundsPtrAccessChain %p_cw_f32 %log_in0 %log_i
+%log_a0 = OpLoad %f32 %log_pa
+%log_a = OpCopyObject %f32 %log_a0
+%log_r = OpExtInst %f32 %ocl log %log_a
+%log_r1 = OpCopyObject %f32 %log_r
+%log_po = OpInBoundsPtrAccessChain %p_cw_f32 %log_out %log_i
+OpStore %log_po %log_r1
+OpReturn
+OpFunctionEnd
+%k_log2 = OpFunction %void None %fn_f
+%log2_in0 = OpFunctionParameter %p_cw_f32
+%log2_in1 = OpFunctionParameter %p_cw_f32
+%log2_out = OpFunctionParameter %p_cw_f32
+%log2_entry = OpLabel
+%log2_g = OpLoad %v3u64 %gid
+%log2_i = OpCompositeExtract %u64 %log2_g 0
+%log2_pa = OpInBoundsPtrAccessChain %p_cw_f32 %log2_in0 %log2_i
+%log2_a0 = OpLoad %f32 %log2_pa
+%log2_a = OpCopyObject %f32 %log2_a0
+%log2_r = OpExtInst %f32 %ocl log2 %log2_a
+%log2_r1 = OpCopyObject %f32 %log2_r
+%log2_po = OpInBoundsPtrAccessChain %p_cw_f32 %log2_out %log2_i
+OpStore %log2_po %log2_r1
+OpReturn
+OpFunctionEnd
+%k_sign = OpFunction %void None %fn_f
+%sign_in0 = OpFunctionParameter %p_cw_f32
+%sign_in1 = OpFunctionParameter %p_cw_f32
+%sign_out = OpFunctionParameter %p_cw_f32
+%sign_entry = OpLabel
+%sign_g = OpLoad %v3u64 %gid
+%sign_i = OpCompositeExtract %u64 %sign_g 0
+%sign_pa = OpInBoundsPtrAccessChain %p_cw_f32 %sign_in0 %sign_i
+%sign_a0 = OpLoad %f32 %sign_pa
+%sign_a = OpCopyObject %f32 %sign_a0
+%sign_r = OpExtInst %f32 %ocl sign %sign_a
+%sign_r1 = OpCopyObject %f32 %sign_r
+%sign_po = OpInBoundsPtrAccessChain %p_cw_f32 %sign_out %sign_i
+OpStore %sign_po %sign_r1
+OpReturn
+OpFunctionEnd
+%k_atan2 = OpFunction %void None %fn_f
+%atan2_in0 = OpFunctionParameter %p_cw_f32
+%atan2_in1 = OpFunctionParameter %p_cw_f32
+%atan2_out = OpFunctionParameter %p_cw_f32
+%atan2_entry = OpLabel
+%atan2_g = OpLoad %v3u64 %gid
+%atan2_i = OpCompositeExtract %u64 %atan2_g 0
+%atan2_pa = OpInBoundsPtrAccessChain %p_cw_f32 %atan2_in0 %atan2_i
+%atan2_a0 = OpLoad %f32 %atan2_pa
+%atan2_a = OpCopyObject %f32 %atan2_a0
+%atan2_pb = OpInBoundsPtrAccessChain %p_cw_f32 %atan2_in1 %atan2_i
+%atan2_b0 = OpLoad %f32 %atan2_pb
+%atan2_b = OpCopyObject %f32 %atan2_b0
+%atan2_r = OpExtInst %f32 %ocl atan2 %atan2_a %atan2_b
+%atan2_r1 = OpCopyObject %f32 %atan2_r
+%atan2_po = OpInBoundsPtrAccessChain %p_cw_f32 %atan2_out %atan2_i
+OpStore %atan2_po %atan2_r1
+OpReturn
+OpFunctionEnd
+%k_pow = OpFunction %void None %fn_f
+%pow_in0 = OpFunctionParameter %p_cw_f32
+%pow_in1 = OpFunctionParameter %p_cw_f32
+%pow_out = OpFunctionParameter %p_cw_f32
+%pow_entry = OpLabel
+%pow_g = OpLoad %v3u64 %gid
+%pow_i = OpCompositeExtract %u64 %pow_g 0
+%pow_pa = OpInBoundsPtrAccessChain %p_cw_f32 %pow_in0 %pow_i
+%pow_a0 = OpLoad %f32 %pow_pa
+%pow_a = OpCopyObject %f32 %pow_a0
+%pow_pb = OpInBoundsPtrAccessChain %p_cw_f32 %pow_in1 %pow_i
+%pow_b0 = OpLoad %f32 %pow_pb
+%pow_b = OpCopyObject %f32 %pow_b0
+%pow_r = OpExtInst %f32 %ocl pow %pow_a %pow_b
+%pow_r1 = OpCopyObject %f32 %pow_r
+%pow_po = OpInBoundsPtrAccessChain %p_cw_f32 %pow_out %pow_i
+OpStore %pow_po %pow_r1
+OpReturn
+OpFunctionEnd
+%k_fmin = OpFunction %void None %fn_f
+%fmin_in0 = OpFunctionParameter %p_cw_f32
+%fmin_in1 = OpFunctionParameter %p_cw_f32
+%fmin_out = OpFunctionParameter %p_cw_f32
+%fmin_entry = OpLabel
+%fmin_g = OpLoad %v3u64 %gid
+%fmin_i = OpCompositeExtract %u64 %fmin_g 0
+%fmin_pa = OpInBoundsPtrAccessChain %p_cw_f32 %fmin_in0 %fmin_i
+%fmin_a0 = OpLoad %f32 %fmin_pa
+%fmin_a = OpCopyObject %f32 %fmin_a0
+%fmin_pb = OpInBoundsPtrAccessChain %p_cw_f32 %fmin_in1 %fmin_i
+%fmin_b0 = OpLoad %f32 %fmin_pb
+%fmin_b = OpCopyObject %f32 %fmin_b0
+%fmin_r = OpExtInst %f32 %ocl fmin %fmin_a %fmin_b
+%fmin_r1 = OpCopyObject %f32 %fmin_r
+%fmin_po = OpInBoundsPtrAccessChain %p_cw_f32 %fmin_out %fmin_i
+OpStore %fmin_po %fmin_r1
+OpReturn
+OpFunctionEnd
+%k_fmax = OpFunction %void None %fn_f
+%fmax_in0 = OpFunctionParameter %p_cw_f32
+%fmax_in1 = OpFunctionParameter %p_cw_f32
+%fmax_out = OpFunctionParameter %p_cw_f32
+%fmax_entry = OpLabel
+%fmax_g = OpLoad %v3u64 %gid
+%fmax_i = OpCompositeExtract %u64 %fmax_g 0
+%fmax_pa = OpInBoundsPtrAccessChain %p_cw_f32 %fmax_in0 %fmax_i
+%fmax_a0 = OpLoad %f32 %fmax_pa
+%fmax_a = OpCopyObject %f32 %fmax_a0
+%fmax_pb = OpInBoundsPtrAccessChain %p_cw_f32 %fmax_in1 %fmax_i
+%fmax_b0 = OpLoad %f32 %fmax_pb
+%fmax_b = OpCopyObject %f32 %fmax_b0
+%fmax_r = OpExtInst %f32 %ocl fmax %fmax_a %fmax_b
+%fmax_r1 = OpCopyObject %f32 %fmax_r
+%fmax_po = OpInBoundsPtrAccessChain %p_cw_f32 %fmax_out %fmax_i
+OpStore %fmax_po %fmax_r1
+OpReturn
+OpFunctionEnd
+%k_step = OpFunction %void None %fn_f
+%step_in0 = OpFunctionParameter %p_cw_f32
+%step_in1 = OpFunctionParameter %p_cw_f32
+%step_out = OpFunctionParameter %p_cw_f32
+%step_entry = OpLabel
+%step_g = OpLoad %v3u64 %gid
+%step_i = OpCompositeExtract %u64 %step_g 0
+%step_pa = OpInBoundsPtrAccessChain %p_cw_f32 %step_in0 %step_i
+%step_a0 = OpLoad %f32 %step_pa
+%step_a = OpCopyObject %f32 %step_a0
+%step_pb = OpInBoundsPtrAccessChain %p_cw_f32 %step_in1 %step_i
+%step_b0 = OpLoad %f32 %step_pb
+%step_b = OpCopyObject %f32 %step_b0
+%step_r = OpExtInst %f32 %ocl step %step_a %step_b
+%step_r1 = OpCopyObject %f32 %step_r
+%step_po = OpInBoundsPtrAccessChain %p_cw_f32 %step_out %step_i
+OpStore %step_po %step_r1
+OpReturn
+OpFunctionEnd
+%k_copysign = OpFunction %void None %fn_f
+%copysign_in0 = OpFunctionParameter %p_cw_f32
+%copysign_in1 = OpFunctionParameter %p_cw_f32
+%copysign_out = OpFunctionParameter %p_cw_f32
+%copysign_entry = OpLabel
+%copysign_g = OpLoad %v3u64 %gid
+%copysign_i = OpCompositeExtract %u64 %copysign_g 0
+%copysign_pa = OpInBoundsPtrAccessChain %p_cw_f32 %copysign_in0 %copysign_i
+%copysign_a0 = OpLoad %f32 %copysign_pa
+%copysign_a = OpCopyObject %f32 %copysign_a0
+%copysign_pb = OpInBoundsPtrAccessChain %p_cw_f32 %copysign_in1 %copysign_i
+%copysign_b0 = OpLoad %f32 %copysign_pb
+%copysign_b = OpCopyObject %f32 %copysign_b0
+%copysign_r = OpExtInst %f32 %ocl copysign %copysign_a %copysign_b
+%copysign_r1 = OpCopyObject %f32 %copysign_r
+%copysign_po = OpInBoundsPtrAccessChain %p_cw_f32 %copysign_out %copysign_i
+OpStore %copysign_po %copysign_r1
+OpReturn
+OpFunctionEnd
+%k_fmod = OpFunction %void None %fn_f
+%fmod_in0 = OpFunctionParameter %p_cw_f32
+%fmod_in1 = OpFunctionParameter %p_cw_f32
+%fmod_out = OpFunctionParameter %p_cw_f32
+%fmod_entry = OpLabel
+%fmod_g = OpLoad %v3u64 %gid
+%fmod_i = OpCompositeExtract %u64 %fmod_g 0
+%fmod_pa = OpInBoundsPtrAccessChain %p_cw_f32 %fmod_in0 %fmod_i
+%fmod_a0 = OpLoad %f32 %fmod_pa
+%fmod_a = OpCopyObject %f32 %fmod_a0
+%fmod_pb = OpInBoundsPtrAccessChain %p_cw_f32 %fmod_in1 %fmod_i
+%fmod_b0 = OpLoad %f32 %fmod_pb
+%fmod_b = OpCopyObject %f32 %fmod_b0
+%fmod_r = OpExtInst %f32 %ocl fmod %fmod_a %fmod_b
+%fmod_r1 = OpCopyObject %f32 %fmod_r
+%fmod_po = OpInBoundsPtrAccessChain %p_cw_f32 %fmod_out %fmod_i
+OpStore %fmod_po %fmod_r1
+OpReturn
+OpFunctionEnd
+%k_fma = OpFunction %void None %fn_f
+%fma_in0 = OpFunctionParameter %p_cw_f32
+%fma_in1 = OpFunctionParameter %p_cw_f32
+%fma_out = OpFunctionParameter %p_cw_f32
+%fma_entry = OpLabel
+%fma_g = OpLoad %v3u64 %gid
+%fma_i = OpCompositeExtract %u64 %fma_g 0
+%fma_pa = OpInBoundsPtrAccessChain %p_cw_f32 %fma_in0 %fma_i
+%fma_a0 = OpLoad %f32 %fma_pa
+%fma_a = OpCopyObject %f32 %fma_a0
+%fma_pb = OpInBoundsPtrAccessChain %p_cw_f32 %fma_in1 %fma_i
+%fma_b0 = OpLoad %f32 %fma_pb
+%fma_b = OpCopyObject %f32 %fma_b0
+%fma_c = OpFAdd %f32 %fma_a %fma_b
+%fma_r = OpExtInst %f32 %ocl fma %fma_a %fma_b %fma_c
+%fma_r1 = OpCopyObject %f32 %fma_r
+%fma_po = OpInBoundsPtrAccessChain %p_cw_f32 %fma_out %fma_i
+OpStore %fma_po %fma_r1
+OpReturn
+OpFunctionEnd
+%k_mad = OpFunction %void None %fn_f
+%mad_in0 = OpFunctionParameter %p_cw_f32
+%mad_in1 = OpFunctionParameter %p_cw_f32
+%mad_out = OpFunctionParameter %p_cw_f32
+%mad_entry = OpLabel
+%mad_g = OpLoad %v3u64 %gid
+%mad_i = OpCompositeExtract %u64 %mad_g 0
+%mad_pa = OpInBoundsPtrAccessChain %p_cw_f32 %mad_in0 %mad_i
+%mad_a0 = OpLoad %f32 %mad_pa
+%mad_a = OpCopyObject %f32 %mad_a0
+%mad_pb = OpInBoundsPtrAccessChain %p_cw_f32 %mad_in1 %mad_i
+%mad_b0 = OpLoad %f32 %mad_pb
+%mad_b = OpCopyObject %f32 %mad_b0
+%mad_c = OpFAdd %f32 %mad_a %mad_b
+%mad_r = OpExtInst %f32 %ocl mad %mad_a %mad_b %mad_c
+%mad_r1 = OpCopyObject %f32 %mad_r
+%mad_po = OpInBoundsPtrAccessChain %p_cw_f32 %mad_out %mad_i
+OpStore %mad_po %mad_r1
+OpReturn
+OpFunctionEnd
+%k_fclamp = OpFunction %void None %fn_f
+%fclamp_in0 = OpFunctionParameter %p_cw_f32
+%fclamp_in1 = OpFunctionParameter %p_cw_f32
+%fclamp_out = OpFunctionParameter %p_cw_f32
+%fclamp_entry = OpLabel
+%fclamp_g = OpLoad %v3u64 %gid
+%fclamp_i = OpCompositeExtract %u64 %fclamp_g 0
+%fclamp_pa = OpInBoundsPtrAccessChain %p_cw_f32 %fclamp_in0 %fclamp_i
+%fclamp_a0 = OpLoad %f32 %fclamp_pa
+%fclamp_a = OpCopyObject %f32 %fclamp_a0
+%fclamp_pb = OpInBoundsPtrAccessChain %p_cw_f32 %fclamp_in1 %fclamp_i
+%fclamp_b0 = OpLoad %f32 %fclamp_pb
+%fclamp_b = OpCopyObject %f32 %fclamp_b0
+%fclamp_c = OpFAdd %f32 %fclamp_a %fclamp_b
+%fclamp_r = OpExtInst %f32 %ocl fclamp %fclamp_a %fclamp_b %fclamp_c
+%fclamp_r1 = OpCopyObject %f32 %fclamp_r
+%fclamp_po = OpInBoundsPtrAccessChain %p_cw_f32 %fclamp_out %fclamp_i
+OpStore %fclamp_po %fclamp_r1
+OpReturn
+OpFunctionEnd
+%k_mix = OpFunction %void None %fn_f
+%mix_in0 = OpFunctionParameter %p_cw_f32
+%mix_in1 = OpFunctionParameter %p_cw_f32
+%mix_out = OpFunctionParameter %p_cw_f32
+%mix_entry = OpLabel
+%mix_g = OpLoad %v3u64 %gid
+%mix_i = OpCompositeExtract %u64 %mix_g 0
+%mix_pa = OpInBoundsPtrAccessChain %p_cw_f32 %mix_in0 %mix_i
+%mix_a0 = OpLoad %f32 %mix_pa
+%mix_a = OpCopyObject %f32 %mix_a0
+%mix_pb = OpInBoundsPtrAccessChain %p_cw_f32 %mix_in1 %mix_i
+%mix_b0 = OpLoad %f32 %mix_pb
+%mix_b = OpCopyObject %f32 %mix_b0
+%mix_c = OpFAdd %f32 %mix_a %mix_b
+%mix_r = OpExtInst %f32 %ocl mix %mix_a %mix_b %mix_c
+%mix_r1 = OpCopyObject %f32 %mix_r
+%mix_po = OpInBoundsPtrAccessChain %p_cw_f32 %mix_out %mix_i
+OpStore %mix_po %mix_r1
+OpReturn
+OpFunctionEnd
+%k_smoothstep = OpFunction %void None %fn_f
+%smoothstep_in0 = OpFunctionParameter %p_cw_f32
+%smoothstep_in1 = OpFunctionParameter %p_cw_f32
+%smoothstep_out = OpFunctionParameter %p_cw_f32
+%smoothstep_entry = OpLabel
+%smoothstep_g = OpLoad %v3u64 %gid
+%smoothstep_i = OpCompositeExtract %u64 %smoothstep_g 0
+%smoothstep_pa = OpInBoundsPtrAccessChain %p_cw_f32 %smoothstep_in0 %smoothstep_i
+%smoothstep_a0 = OpLoad %f32 %smoothstep_pa
+%smoothstep_a = OpCopyObject %f32 %smoothstep_a0
+%smoothstep_pb = OpInBoundsPtrAccessChain %p_cw_f32 %smoothstep_in1 %smoothstep_i
+%smoothstep_b0 = OpLoad %f32 %smoothstep_pb
+%smoothstep_b = OpCopyObject %f32 %smoothstep_b0
+%smoothstep_c = OpFAdd %f32 %smoothstep_a %smoothstep_b
+%smoothstep_r = OpExtInst %f32 %ocl smoothstep %smoothstep_a %smoothstep_b %smoothstep_c
+%smoothstep_r1 = OpCopyObject %f32 %smoothstep_r
+%smoothstep_po = OpInBoundsPtrAccessChain %p_cw_f32 %smoothstep_out %smoothstep_i
+OpStore %smoothstep_po %smoothstep_r1
+OpReturn
+OpFunctionEnd
+%k_ldexp = OpFunction %void None %fn_fi
+%ldexp_in0 = OpFunctionParameter %p_cw_f32
+%ldexp_in1 = OpFunctionParameter %p_cw_i32
+%ldexp_out = OpFunctionParameter %p_cw_f32
+%ldexp_entry = OpLabel
+%ldexp_g = OpLoad %v3u64 %gid
+%ldexp_i = OpCompositeExtract %u64 %ldexp_g 0
+%ldexp_pa = OpInBoundsPtrAccessChain %p_cw_f32 %ldexp_in0 %ldexp_i
+%ldexp_a0 = OpLoad %f32 %ldexp_pa
+%ldexp_a = OpCopyObject %f32 %ldexp_a0
+%ldexp_pb = OpInBoundsPtrAccessChain %p_cw_i32 %ldexp_in1 %ldexp_i
+%ldexp_b0 = OpLoad %i32 %ldexp_pb
+%ldexp_b = OpCopyObject %i32 %ldexp_b0
+%ldexp_r = OpExtInst %f32 %ocl ldexp %ldexp_a %ldexp_b
+%ldexp_r1 = OpCopyObject %f32 %ldexp_r
+%ldexp_po = OpInBoundsPtrAccessChain %p_cw_f32 %ldexp_out %ldexp_i
+OpStore %ldexp_po %ldexp_r1
+OpReturn
+OpFunctionEnd
+%k_s_abs = OpFunction %void None %fn_i
+%s_abs_in0 = OpFunctionParameter %p_cw_i32
+%s_abs_in1 = OpFunctionParameter %p_cw_i32
+%s_abs_out = OpFunctionParameter %p_cw_i32
+%s_abs_entry = OpLabel
+%s_abs_g = OpLoad %v3u64 %gid
+%s_abs_i = OpCompositeExtract %u64 %s_abs_g 0
+%s_abs_pa = OpInBoundsPtrAccessChain %p_cw_i32 %s_abs_in0 %s_abs_i
+%s_abs_a0 = OpLoad %i32 %s_abs_pa
+%s_abs_a = OpCopyObject %i32 %s_abs_a0
+%s_abs_r = OpExtInst %i32 %ocl s_abs %s_abs_a
+%s_abs_r1 = OpCopyObject %i32 %s_abs_r
+%s_abs_po = OpInBoundsPtrAccessChain %p_cw_i32 %s_abs_out %s_abs_i
+OpStore %s_abs_po %s_abs_r1
+OpReturn
+OpFunctionEnd
+%k_popcount = OpFunction %void None %fn_i
+%popcount_in0 = OpFunctionParameter %p_cw_i32
+%popcount_in1 = OpFunctionParameter %p_cw_i32
+%popcount_out = OpFunctionParameter %p_cw_i32
+%popcount_entry = OpLabel
+%popcount_g = OpLoad %v3u64 %gid
+%popcount_i = OpCompositeExtract %u64 %popcount_g 0
+%popcount_pa = OpInBoundsPtrAccessChain %p_cw_i32 %popcount_in0 %popcount_i
+%popcount_a0 = OpLoad %i32 %popcount_pa
+%popcount_a = OpCopyObject %i32 %popcount_a0
+%popcount_r = OpExtInst %i32 %ocl popcount %popcount_a
+%popcount_r1 = OpCopyObject %i32 %popcount_r
+%popcount_po = OpInBoundsPtrAccessChain %p_cw_i32 %popcount_out %popcount_i
+OpStore %popcount_po %popcount_r1
+OpReturn
+OpFunctionEnd
+%k_clz = OpFunction %void None %fn_i
+%clz_in0 = OpFunctionParameter %p_cw_i32
+%clz_in1 = OpFunctionParameter %p_cw_i32
+%clz_out = OpFunctionParameter %p_cw_i32
+%clz_entry = OpLabel
+%clz_g = OpLoad %v3u64 %gid
+%clz_i = OpCompositeExtract %u64 %clz_g 0
+%clz_pa = OpInBoundsPtrAccessChain %p_cw_i32 %clz_in0 %clz_i
+%clz_a0 = OpLoad %i32 %clz_pa
+%clz_a = OpCopyObject %i32 %clz_a0
+%clz_r = OpExtInst %i32 %ocl clz %clz_a
+%clz_r1 = OpCopyObject %i32 %clz_r
+%clz_po = OpInBoundsPtrAccessChain %p_cw_i32 %clz_out %clz_i
+OpStore %clz_po %clz_r1
+OpReturn
+OpFunctionEnd
+%k_ctz = OpFunction %void None %fn_i
+%ctz_in0 = OpFunctionParameter %p_cw_i32
+%ctz_in1 = OpFunctionParameter %p_cw_i32
+%ctz_out = OpFunctionParameter %p_cw_i32
+%ctz_entry = OpLabel
+%ctz_g = OpLoad %v3u64 %gid
+%ctz_i = OpCompositeExtract %u64 %ctz_g 0
+%ctz_pa = OpInBoundsPtrAccessChain %p_cw_i32 %ctz_in0 %ctz_i
+%ctz_a0 = OpLoad %i32 %ctz_pa
+%ctz_a = OpCopyObject %i32 %ctz_a0
+%ctz_r = OpExtInst %i32 %ocl ctz %ctz_a
+%ctz_r1 = OpCopyObject %i32 %ctz_r
+%ctz_po = OpInBoundsPtrAccessChain %p_cw_i32 %ctz_out %ctz_i
+OpStore %ctz_po %ctz_r1
+OpReturn
+OpFunctionEnd
+%k_s_min = OpFunction %void None %fn_i
+%s_min_in0 = OpFunctionParameter %p_cw_i32
+%s_min_in1 = OpFunctionParameter %p_cw_i32
+%s_min_out = OpFunctionParameter %p_cw_i32
+%s_min_entry = OpLabel
+%s_min_g = OpLoad %v3u64 %gid
+%s_min_i = OpCompositeExtract %u64 %s_min_g 0
+%s_min_pa = OpInBoundsPtrAccessChain %p_cw_i32 %s_min_in0 %s_min_i
+%s_min_a0 = OpLoad %i32 %s_min_pa
+%s_min_a = OpCopyObject %i32 %s_min_a0
+%s_min_pb = OpInBoundsPtrAccessChain %p_cw_i32 %s_min_in1 %s_min_i
+%s_min_b0 = OpLoad %i32 %s_min_pb
+%s_min_b = OpCopyObject %i32 %s_min_b0
+%s_min_r = OpExtInst %i32 %ocl s_min %s_min_a %s_min_b
+%s_min_r1 = OpCopyObject %i32 %s_min_r
+%s_min_po = OpInBoundsPtrAccessChain %p_cw_i32 %s_min_out %s_min_i
+OpStore %s_min_po %s_min_r1
+OpReturn
+OpFunctionEnd
+%k_s_max = OpFunction %void None %fn_i
+%s_max_in0 = OpFunctionParameter %p_cw_i32
+%s_max_in1 = OpFunctionParameter %p_cw_i32
+%s_max_out = OpFunctionParameter %p_cw_i32
+%s_max_entry = OpLabel
+%s_max_g = OpLoad %v3u64 %gid
+%s_max_i = OpCompositeExtract %u64 %s_max_g 0
+%s_max_pa = OpInBoundsPtrAccessChain %p_cw_i32 %s_max_in0 %s_max_i
+%s_max_a0 = OpLoad %i32 %s_max_pa
+%s_max_a = OpCopyObject %i32 %s_max_a0
+%s_max_pb = OpInBoundsPtrAccessChain %p_cw_i32 %s_max_in1 %s_max_i
+%s_max_b0 = OpLoad %i32 %s_max_pb
+%s_max_b = OpCopyObject %i32 %s_max_b0
+%s_max_r = OpExtInst %i32 %ocl s_max %s_max_a %s_max_b
+%s_max_r1 = OpCopyObject %i32 %s_max_r
+%s_max_po = OpInBoundsPtrAccessChain %p_cw_i32 %s_max_out %s_max_i
+OpStore %s_max_po %s_max_r1
+OpReturn
+OpFunctionEnd
+%k_s_mul_hi = OpFunction %void None %fn_i
+%s_mul_hi_in0 = OpFunctionParameter %p_cw_i32
+%s_mul_hi_in1 = OpFunctionParameter %p_cw_i32
+%s_mul_hi_out = OpFunctionParameter %p_cw_i32
+%s_mul_hi_entry = OpLabel
+%s_mul_hi_g = OpLoad %v3u64 %gid
+%s_mul_hi_i = OpCompositeExtract %u64 %s_mul_hi_g 0
+%s_mul_hi_pa = OpInBoundsPtrAccessChain %p_cw_i32 %s_mul_hi_in0 %s_mul_hi_i
+%s_mul_hi_a0 = OpLoad %i32 %s_mul_hi_pa
+%s_mul_hi_a = OpCopyObject %i32 %s_mul_hi_a0
+%s_mul_hi_pb = OpInBoundsPtrAccessChain %p_cw_i32 %s_mul_hi_in1 %s_mul_hi_i
+%s_mul_hi_b0 = OpLoad %i32 %s_mul_hi_pb
+%s_mul_hi_b = OpCopyObject %i32 %s_mul_hi_b0
+%s_mul_hi_r = OpExtInst %i32 %ocl s_mul_hi %s_mul_hi_a %s_mul_hi_b
+%s_mul_hi_r1 = OpCopyObject %i32 %s_mul_hi_r
+%s_mul_hi_po = OpInBoundsPtrAccessChain %p_cw_i32 %s_mul_hi_out %s_mul_hi_i
+OpStore %s_mul_hi_po %s_mul_hi_r1
+OpReturn
+OpFunctionEnd
+%k_u_min = OpFunction %void None %fn_i
+%u_min_in0 = OpFunctionParameter %p_cw_i32
+%u_min_in1 = OpFunctionParameter %p_cw_i32
+%u_min_out = OpFunctionParameter %p_cw_i32
+%u_min_entry = OpLabel
+%u_min_g = OpLoad %v3u64 %gid
+%u_min_i = OpCompositeExtract %u64 %u_min_g 0
+%u_min_pa = OpInBoundsPtrAccessChain %p_cw_i32 %u_min_in0 %u_min_i
+%u_min_a0 = OpLoad %i32 %u_min_pa
+%u_min_a = OpBitcast %u32 %u_min_a0
+%u_min_pb = OpInBoundsPtrAccessChain %p_cw_i32 %u_min_in1 %u_min_i
+%u_min_b0 = OpLoad %i32 %u_min_pb
+%u_min_b = OpBitcast %u32 %u_min_b0
+%u_min_r = OpExtInst %u32 %ocl u_min %u_min_a %u_min_b
+%u_min_r1 = OpBitcast %i32 %u_min_r
+%u_min_po = OpInBoundsPtrAccessChain %p_cw_i32 %u_min_out %u_min_i
+OpStore %u_min_po %u_min_r1
+OpReturn
+OpFunctionEnd
+%k_u_max = OpFunction %void None %fn_i
+%u_max_in0 = OpFunctionParameter %p_cw_i32
+%u_max_in1 = OpFunctionParameter %p_cw_i32
+%u_max_out = OpFunctionParameter %p_cw_i32
+%u_max_entry = OpLabel
+%u_max_g = OpLoad %v3u64 %gid
+%u_max_i = OpCompositeExtract %u64 %u_max_g 0
+%u_max_pa = OpInBoundsPtrAccessChain %p_cw_i32 %u_max_in0 %u_max_i
+%u_max_a0 = OpLoad %i32 %u_max_pa
+%u_max_a = OpBitcast %u32 %u_max_a0
+%u_max_pb = OpInBoundsPtrAccessChain %p_cw_i32 %u_max_in1 %u_max_i
+%u_max_b0 = OpLoad %i32 %u_max_pb
+%u_max_b = OpBitcast %u32 %u_max_b0
+%u_max_r = OpExtInst %u32 %ocl u_max %u_max_a %u_max_b
+%u_max_r1 = OpBitcast %i32 %u_max_r
+%u_max_po = OpInBoundsPtrAccessChain %p_cw_i32 %u_max_out %u_max_i
+OpStore %u_max_po %u_max_r1
+OpReturn
+OpFunctionEnd
+%k_u_mul_hi = OpFunction %void None %fn_i
+%u_mul_hi_in0 = OpFunctionParameter %p_cw_i32
+%u_mul_hi_in1 = OpFunctionParameter %p_cw_i32
+%u_mul_hi_out = OpFunctionParameter %p_cw_i32
+%u_mul_hi_entry = OpLabel
+%u_mul_hi_g = OpLoad %v3u64 %gid
+%u_mul_hi_i = OpCompositeExtract %u64 %u_mul_hi_g 0
+%u_mul_hi_pa = OpInBoundsPtrAccessChain %p_cw_i32 %u_mul_hi_in0 %u_mul_hi_i
+%u_mul_hi_a0 = OpLoad %i32 %u_mul_hi_pa
+%u_mul_hi_a = OpBitcast %u32 %u_mul_hi_a0
+%u_mul_hi_pb = OpInBoundsPtrAccessChain %p_cw_i32 %u_mul_hi_in1 %u_mul_hi_i
+%u_mul_hi_b0 = OpLoad %i32 %u_mul_hi_pb
+%u_mul_hi_b = OpBitcast %u32 %u_mul_hi_b0
+%u_mul_hi_r = OpExtInst %u32 %ocl u_mul_hi %u_mul_hi_a %u_mul_hi_b
+%u_mul_hi_r1 = OpBitcast %i32 %u_mul_hi_r
+%u_mul_hi_po = OpInBoundsPtrAccessChain %p_cw_i32 %u_mul_hi_out %u_mul_hi_i
+OpStore %u_mul_hi_po %u_mul_hi_r1
+OpReturn
+OpFunctionEnd
+%k_s_clamp = OpFunction %void None %fn_i
+%s_clamp_in0 = OpFunctionParameter %p_cw_i32
+%s_clamp_in1 = OpFunctionParameter %p_cw_i32
+%s_clamp_out = OpFunctionParameter %p_cw_i32
+%s_clamp_entry = OpLabel
+%s_clamp_g = OpLoad %v3u64 %gid
+%s_clamp_i = OpCompositeExtract %u64 %s_clamp_g 0
+%s_clamp_pa = OpInBoundsPtrAccessChain %p_cw_i32 %s_clamp_in0 %s_clamp_i
+%s_clamp_a0 = OpLoad %i32 %s_clamp_pa
+%s_clamp_a = OpCopyObject %i32 %s_clamp_a0
+%s_clamp_pb = OpInBoundsPtrAccessChain %p_cw_i32 %s_clamp_in1 %s_clamp_i
+%s_clamp_b0 = OpLoad %i32 %s_clamp_pb
+%s_clamp_b = OpCopyObject %i32 %s_clamp_b0
+%s_clamp_c = OpBitwiseOr %i32 %s_clamp_a %s_clamp_b
+%s_clamp_r = OpExtInst %i32 %ocl s_clamp %s_clamp_a %s_clamp_b %s_clamp_c
+%s_clamp_r1 = OpCopyObject %i32 %s_clamp_r
+%s_clamp_po = OpInBoundsPtrAccessChain %p_cw_i32 %s_clamp_out %s_clamp_i
+OpStore %s_clamp_po %s_clamp_r1
+OpReturn
+OpFunctionEnd
+%k_u_clamp = OpFunction %void None %fn_i
+%u_clamp_in0 = OpFunctionParameter %p_cw_i32
+%u_clamp_in1 = OpFunctionParameter %p_cw_i32
+%u_clamp_out = OpFunctionParameter %p_cw_i32
+%u_clamp_entry = OpLabel
+%u_clamp_g = OpLoad %v3u64 %gid
+%u_clamp_i = OpCompositeExtract %u64 %u_clamp_g 0
+%u_clamp_pa = OpInBoundsPtrAccessChain %p_cw_i32 %u_clamp_in0 %u_clamp_i
+%u_clamp_a0 = OpLoad %i32 %u_clamp_pa
+%u_clamp_a = OpBitcast %u32 %u_clamp_a0
+%u_clamp_pb = OpInBoundsPtrAccessChain %p_cw_i32 %u_clamp_in1 %u_clamp_i
+%u_clamp_b0 = OpLoad %i32 %u_clamp_pb
+%u_clamp_b = OpBitcast %u32 %u_clamp_b0
+%u_clamp_c = OpBitwiseOr %u32 %u_clamp_a %u_clamp_b
+%u_clamp_r = OpExtInst %u32 %ocl u_clamp %u_clamp_a %u_clamp_b %u_clamp_c
+%u_clamp_r1 = OpBitcast %i32 %u_clamp_r
+%u_clamp_po = OpInBoundsPtrAccessChain %p_cw_i32 %u_clamp_out %u_clamp_i
+OpStore %u_clamp_po %u_clamp_r1
+OpReturn
+OpFunctionEnd
+%k_normalize = OpFunction %void None %fn_v
+%normalize_in0 = OpFunctionParameter %p_cw_v4
+%normalize_in1 = OpFunctionParameter %p_cw_v4
+%normalize_out = OpFunctionParameter %p_cw_v4
+%normalize_entry = OpLabel
+%normalize_g = OpLoad %v3u64 %gid
+%normalize_i = OpCompositeExtract %u64 %normalize_g 0
+%normalize_pa = OpInBoundsPtrAccessChain %p_cw_v4 %normalize_in0 %normalize_i
+%normalize_a0 = OpLoad %v4f32 %normalize_pa
+%normalize_a = OpCopyObject %v4f32 %normalize_a0
+%normalize_r = OpExtInst %v4f32 %ocl normalize %normalize_a
+%normalize_r1 = OpCopyObject %v4f32 %normalize_r
+%normalize_po = OpInBoundsPtrAccessChain %p_cw_v4 %normalize_out %normalize_i
+OpStore %normalize_po %normalize_r1
+OpReturn
+OpFunctionEnd
+%k_length = OpFunction %void None %fn_vs
+%length_in0 = OpFunctionParameter %p_cw_v4
+%length_in1 = OpFunctionParameter %p_cw_v4
+%length_out = OpFunctionParameter %p_cw_f32
+%length_entry = OpLabel
+%length_g = OpLoad %v3u64 %gid
+%length_i = OpCompositeExtract %u64 %length_g 0
+%length_pa = OpInBoundsPtrAccessChain %p_cw_v4 %length_in0 %length_i
+%length_a0 = OpLoad %v4f32 %length_pa
+%length_a = OpCopyObject %v4f32 %length_a0
+%length_r = OpExtInst %f32 %ocl length %length_a
+%length_r1 = OpCopyObject %f32 %length_r
+%length_po = OpInBoundsPtrAccessChain %p_cw_f32 %length_out %length_i
+OpStore %length_po %length_r1
+OpReturn
+OpFunctionEnd
+%k_distance = OpFunction %void None %fn_vs
+%distance_in0 = OpFunctionParameter %p_cw_v4
+%distance_in1 = OpFunctionParameter %p_cw_v4
+%distance_out = OpFunctionParameter %p_cw_f32
+%distance_entry = OpLabel
+%distance_g = OpLoad %v3u64 %gid
+%distance_i = OpCompositeExtract %u64 %distance_g 0
+%distance_pa = OpInBoundsPtrAccessChain %p_cw_v4 %distance_in0 %distance_i
+%distance_a0 = OpLoad %v4f32 %distance_pa
+%distance_a = OpCopyObject %v4f32 %distance_a0
+%distance_pb = OpInBoundsPtrAccessChain %p_cw_v4 %distance_in1 %distance_i
+%distance_b0 = OpLoad %v4f32 %distance_pb
+%distance_b = OpCopyObject %v4f32 %distance_b0
+%distance_r = OpExtInst %f32 %ocl distance %distance_a %distance_b
+%distance_r1 = OpCopyObject %f32 %distance_r
+%distance_po = OpInBoundsPtrAccessChain %p_cw_f32 %distance_out %distance_i
+OpStore %distance_po %distance_r1
+OpReturn
+OpFunctionEnd
+%k_cross = OpFunction %void None %fn_v
+%cross_in0 = OpFunctionParameter %p_cw_v4
+%cross_in1 = OpFunctionParameter %p_cw_v4
+%cross_out = OpFunctionParameter %p_cw_v4
+%cross_entry = OpLabel
+%cross_g = OpLoad %v3u64 %gid
+%cross_i = OpCompositeExtract %u64 %cross_g 0
+%cross_pa = OpInBoundsPtrAccessChain %p_cw_v4 %cross_in0 %cross_i
+%cross_a0 = OpLoad %v4f32 %cross_pa
+%cross_a = OpCopyObject %v4f32 %cross_a0
+%cross_pb = OpInBoundsPtrAccessChain %p_cw_v4 %cross_in1 %cross_i
+%cross_b0 = OpLoad %v4f32 %cross_pb
+%cross_b = OpCopyObject %v4f32 %cross_b0
+%cross_a3 = OpVectorShuffle %v3f32 %cross_a %cross_a 0 1 2
+%cross_b3 = OpVectorShuffle %v3f32 %cross_b %cross_b 0 1 2
+%cross_r3 = OpExtInst %v3f32 %ocl cross %cross_a3 %cross_b3
+%cross_r = OpCompositeConstruct %v4f32 %cross_r3 %f0
+%cross_r1 = OpCopyObject %v4f32 %cross_r
+%cross_po = OpInBoundsPtrAccessChain %p_cw_v4 %cross_out %cross_i
+OpStore %cross_po %cross_r1
+OpReturn
+OpFunctionEnd

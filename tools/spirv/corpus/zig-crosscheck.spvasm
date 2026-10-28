@@ -1,0 +1,143 @@
+; zig-crosscheck.spvasm: the crosscheck kernel in standard Vulkan compute form (Block structs with DescriptorSet/Binding, GlobalInvocationId).
+; Zig 0.18.0-dev.253+16d31ceed, self-hosted SPIR-V backend (Zig generator id 41, 0x00290900):
+;   zig build-obj desc.zig -target spirv64-vulkan -fno-llvm -O ReleaseFast -mcpu=generic+float16 -femit-bin=desc.spv
+; Source: tools/spirv/testdata/desc.zig; binary: tools/spirv/testdata/desc.spv (byte-identical to the
+; command above). Disassembled by tools/spirv/dis.zig; cross-checked token by token against the
+; grammar-driven reference disassembler used in the design (the only differences: ids whose
+; OpName is not unique print numerically here, so the text re-assembles).
+; SPIR-V
+; Version: 1.0
+; Generator: 0x00290900
+; Bound: 155
+; Schema: 0
+OpCapability Shader
+OpCapability Int64
+OpCapability PhysicalStorageBufferAddresses
+OpCapability Float16
+OpExtension "SPV_KHR_physical_storage_buffer"
+OpMemoryModel PhysicalStorageBuffer64 GLSL450
+OpEntryPoint GLCompute %desc.crosscheckKernel "crosscheckKernel" %global_invocation_id
+OpExecutionMode %desc.crosscheckKernel LocalSize 64 1 1
+%5 = OpString "desc.zig"
+OpSourceExtension "zig_errors:"
+OpSource Zig 2304
+OpName %void "void"
+OpName %u32 "u32"
+OpName %u64 "u64"
+OpName %i32 "i32"
+OpName %desc.crosscheckKernel "desc.crosscheckKernel"
+OpName %gid "gid"
+OpName %desc.body "desc.body"
+OpName %global_invocation_id "global_invocation_id"
+OpName %params "params"
+OpName %out "out"
+OpName %in0 "in0"
+OpName %in1 "in1"
+OpDecorate %51 ArrayStride 4
+OpDecorate %global_invocation_id BuiltIn GlobalInvocationId
+OpDecorate %131 Block
+OpMemberDecorate %131 0 Offset 0
+OpDecorate %133 ArrayStride 4
+OpDecorate %params Binding 3
+OpDecorate %params DescriptorSet 0
+OpDecorate %135 Block
+OpMemberDecorate %135 0 Offset 0
+OpDecorate %140 ArrayStride 16384
+OpDecorate %out Binding 2
+OpDecorate %out DescriptorSet 0
+OpDecorate %in0 NonWritable
+OpDecorate %in0 Binding 0
+OpDecorate %in0 DescriptorSet 0
+OpDecorate %in1 NonWritable
+OpDecorate %in1 Binding 1
+OpDecorate %in1 DescriptorSet 0
+%void = OpTypeVoid
+%u32 = OpTypeInt 32 0
+%8 = OpTypePointer Input %u32
+%10 = OpConstant %u32 0
+%17 = OpTypePointer Uniform %u32
+%25 = OpTypeBool
+%32 = OpUndef %u32
+%34 = OpConstant %u32 4
+%u64 = OpTypeInt 64 0
+%i32 = OpTypeInt 32 1
+%50 = OpConstant %u32 4096
+%51 = OpTypeArray %i32 %50
+%52 = OpTypePointer StorageBuffer %51
+%58 = OpTypePointer StorageBuffer %i32
+%99 = OpTypeFunction %void
+%116 = OpConstant %i32 3
+%125 = OpTypeFunction %i32 %i32 %i32
+%128 = OpTypeVector %u32 3
+%129 = OpTypePointer Input %128
+%global_invocation_id = OpVariable %129 Input
+%131 = OpTypeStruct %u32
+%133 = OpTypePointer Uniform %131
+%params = OpVariable %133 Uniform
+%135 = OpTypeStruct %51
+%140 = OpTypePointer StorageBuffer %135
+%out = OpVariable %140 StorageBuffer
+%in0 = OpVariable %140 StorageBuffer
+%in1 = OpVariable %140 StorageBuffer
+%desc.crosscheckKernel = OpFunction %void None %99
+%4 = OpLabel
+OpLine %5 13 43
+%11 = OpInBoundsAccessChain %8 %global_invocation_id %10
+%gid = OpLoad %u32 %11 Aligned 4
+OpLine %5 14 9
+OpLine %5 14 22
+%21 = OpInBoundsAccessChain %17 %params %10
+%23 = OpLoad %u32 %21 Aligned 4
+%24 = OpUGreaterThanEqual %25 %gid %23
+OpSelectionMerge %28 None
+OpBranchConditional %24 %26 %27
+%26 = OpLabel
+OpLine %5 14 30
+OpReturn
+%30 = OpLabel
+OpBranch %28
+%27 = OpLabel
+OpBranch %35
+%35 = OpLabel
+OpBranch %28
+%28 = OpLabel
+%36 = OpPhi %u32 %32 %30 %34 %35
+OpBranch %38
+%38 = OpLabel
+%41 = OpIEqual %25 %36 %34
+OpSelectionMerge %43 None
+OpBranchConditional %41 %44 %43
+%44 = OpLabel
+OpLine %5 15 13
+%46 = OpUConvert %u64 %gid
+%56 = OpInBoundsAccessChain %52 %out %10
+%59 = OpInBoundsAccessChain %58 %56 %46
+OpLine %5 15 34
+%61 = OpUConvert %u64 %gid
+%71 = OpInBoundsAccessChain %52 %in0 %10
+%74 = OpInBoundsAccessChain %58 %71 %61
+%76 = OpLoad %i32 %74 Aligned 4
+OpLine %5 15 49
+%78 = OpUConvert %u64 %gid
+%88 = OpInBoundsAccessChain %52 %in1 %10
+%91 = OpInBoundsAccessChain %58 %88 %78
+%93 = OpLoad %i32 %91 Aligned 4
+OpLine %5 15 25
+%96 = OpFunctionCall %i32 %desc.body %76 %93
+OpStore %59 %96 Aligned 4
+OpReturn
+%43 = OpLabel
+OpUnreachable
+OpFunctionEnd
+%desc.body = OpFunction %i32 None %125
+%109 = OpFunctionParameter %i32
+%111 = OpFunctionParameter %i32
+%112 = OpLabel
+OpLine %5 10 5
+%117 = OpIMul %i32 %111 %116
+%119 = OpIAdd %i32 %109 %117
+OpLine %5 10 5
+OpReturnValue %119
+%122 = OpLabel
+OpUnreachable
+OpFunctionEnd

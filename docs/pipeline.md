@@ -107,7 +107,14 @@ AIR-shaped. The rewrite is pure text and does:
 The optional third CLI argument writes this text plus the metadata to a `.ll` file
 (`zig build metallib` puts it in `zig-out/bin/shader.air.ll`). It is a debugging aid
 *and* a cross-check: `xcrun metal -Xclang -opaque-pointers shader.air.ll` must accept
-it, and the library Apple builds from it must pass `zig build check` too.
+it, and the library Apple builds from it must pass `zig build check` too. So that it
+means to Apple's front end what it means to our assembler, the printed text spells the
+assembler's intrinsic renames (`llvm.sin.f32` → `air.sin.f32` or `air.fast_sin.f32`,
+`llvm.ldexp.f32.i32` → `air.ldexp.f32`, `llvm.powi` → `air.pow` of a converted
+exponent, ...; passed through, several crash `MTLCompilerService` or fail with
+"Undefined symbols") and its `convergent` attributes (`intrinsics.printForApple`), but
+keeps the forms the assembler rewrites to avoid a recorded Metal finding (`frem`,
+`llvm.round`, `llvm.smul/umul.fix.sat`), so that Apple's build still shows the finding.
 
 ---
 
@@ -150,12 +157,29 @@ ways and is expanded with shifts. `sqrt exp exp2 log log2 fabs floor ceil trunc 
 rint fma fmuladd minnum maxnum copysign ctlz cttz ctpop bswap bitreverse` and the
 saturating/overflow families pass unchanged.
 
-**Convergent calls are checked** (`tools/air/divergence.zig`). Apple marks the barriers
-and every SIMD-group collective `convergent`; Zig cannot put that attribute on an
-`extern fn`, so LLVM happily duplicates such a call into both arms of a branch. Metal
-compiles the result and the threadgroup silently desynchronises. A uniformity analysis
-over three levels (`threadgroup` < `simdgroup` < `thread`), seeded from
-`BuiltinKind.uniformity`, decides which threads reach a block together:
+**Convergent calls are marked and checked.** Apple marks the barriers and every
+SIMD-group collective `convergent`, and the duplication that attribute forbids happens in
+two places:
+
+- **in Metal**, which optimizes the bitcode again: without the attribute its jump
+  threading duplicates the block between two branches on the same per-thread condition
+  (`if (lid == 0) x = 0; barrier; ...; barrier; if (lid == 0) ...`) into both arms, and
+  the threadgroup desynchronises although every barrier sits in uniform control flow.
+  The assembler therefore writes Apple's attribute sets: `convergent mustprogress
+  nounwind willreturn` on the declaration of every barrier and SIMD-group collective,
+  `convergent nounwind willreturn` on every call to one, and `convergent` on every
+  helper that reaches one and on the calls to it ([air-format.md
+  §2.3](air-format.md#23-intrinsics)). The SPIR-V front end's IR and a Debug Zig shader reach Metal
+  unoptimized and hit this (exec tests barrier_workgroup_counter / barrier_shared_flag,
+  `barrierJoinKernel` under `zig build check -Dshader-optimize=debug`: wrong totals
+  without the attribute, right with it).
+- **in Zig's LLVM**, before the assembler sees the IR: Zig cannot put the attribute on
+  an `extern fn`, so LLVM happily duplicates such a call into both arms of a branch,
+  and nothing in the IR records it. Metal compiles the result and the threadgroup
+  silently desynchronises. That is what the uniformity analysis
+  (`tools/air/divergence.zig`) catches. Over three levels (`threadgroup` < `simdgroup`
+  < `thread`), seeded from `BuiltinKind.uniformity`, it decides which threads reach a
+  block together:
 
 - accepted: barriers in straight-line code, in the join block after a per-thread
   branch, in a loop whose trip count is uniform (`threads_per_threadgroup / 2`, a
@@ -165,7 +189,37 @@ over three levels (`threadgroup` < `simdgroup` < `thread`), seeded from
   `break` out of on a per-thread condition, a threadgroup barrier under
   `if (sgid == 0)`, a `simd_sum` under `if (lane == 0)`.
 
-The error message names the offending line and says how to restructure the code.
+Locals kept in memory are followed rather than given up on: an `alloca` (Zig's Debug
+locals, every SPIR-V Function variable) holds what was stored into it, also through a
+`getelementptr` to a member, element or lane, and through a helper it is passed to by
+pointer, which reads it and may store into it (glslang -V copies every helper argument
+into such a variable). So a loop bounded by a push constant that passed through
+`ceilDiv(pc.n, 64u)`, a local struct or a `uvec2` holds a barrier legally, and the same
+loop bounded by a value stored from the thread id is refused. A variable whose address
+escapes (stored, compared, passed to `llvm.memcpy` or another declaration) is
+per-thread. ([spirv.md](spirv.md#barriers-and-atomics); exec tests
+`uniform_bound_*`.)
+
+The error message names the offending line and says how to restructure the code; it
+starts `air-splice:` or, when the SPIR-V front end drives the assembler, `spirv-splice:`
+(`assembler.failure_prefix`), with the line number of the lowered IR that `spirv-splice
+... out.ll` prints.
+
+The analysis is near-linear in the module: post-dominance and loop membership are
+answered in O(1) from the post-dominator and dominator trees (Cooper, Harvey and
+Kennedy's algorithm) rather than from n x n tables, a divergent branch visits only the
+blocks it makes divergent, and functions are re-analysed from a worklist when an input
+or a callee's result changes, not in rounds over the whole module. (The tables and
+rounds took 17 s for a 1000-block chain behind one divergent branch, 111 s for 1600
+sequential divergent ifs and 113 s for 20 000 helpers; a Debug spirv-splice now takes 0.04 s, 0.3 s and 2.6 s.)
+
+The assembler also keeps its own cost linear in the size of the module: functions and
+globals are found by name in hash maps, values,
+blocks and phis too, and a value whose operand chain the
+Builder would walk more than 256 deep to find its type (an unrolled accumulation of
+thousands of adds) is bound through an `insertvalue`/`extractvalue` pair that LLVM folds
+away, so a 40 000-long chain assembles in a few seconds instead of overflowing the
+stack.
 
 ---
 
@@ -283,6 +337,8 @@ host build.
 | `zig build metallib` | installs `zig-out/bin/default.metallib` and `shader.air.ll` |
 | `zig build check -- <lib>` | loads any `.metallib` into Metal, builds every pipeline, runs the dispatch and render self-tests |
 | `zig build check -- --kernel=<name> <lib>` | builds one compute pipeline from *any* library, no manifest: the control CI uses on an Apple-compiled kernel |
+| `zig build check -- --kernels=<a,b,...> <lib>` | the same for each named kernel, one `ok kernel`/`FAIL kernel` line each: libraries whose interface is known only at runtime (SPIR-V, [spirv.md](spirv.md)) |
+| `zig build spirv-splice` | installs `spirv-splice` (SPIR-V compute module → `.metallib`), `spirv-probe`, `spirv-probe-run` and `metallib-check` ([spirv.md](spirv.md)) |
 | `-Dshader-optimize=<mode>` | optimize mode of the GPU module (`fast` default; `safe` keeps Zig's safety checks) |
 | `-Dmetal-target=<profile>` | the macOS the library targets: `macos26` (default), `macos15`, `macos14`, `macos13` ([air-format.md §1.7](air-format.md#17-deployment-targets)) |
 | `-Dallow-unverified-target=true` | build a profile other than `macos26` anyway (they are refused by default; see below) |
@@ -358,7 +414,7 @@ downloadable.
 | `FAIL newLibraryWithData: …` | the container is malformed — packer territory |
 | `FAIL newRenderPipelineState / newComputePipelineState: …` | the bitcode or metadata is wrong; Metal's message is usually specific (`Undefined symbols: …`) |
 | `Compilation failed due to an interrupted connection: XPC_ERROR_CONNECTION_INTERRUPTED` | `MTLCompilerService` **crashed**. Something in the IR is unsupported in a way Apple does not diagnose; check `~/Library/Logs/DiagnosticReports/MTLCompilerService*.ips` for the failing instruction, and compare against the intrinsic table |
-| `FAIL dispatch …: N mismatches` | it compiled and ran, and computed the wrong thing — the most interesting failure; suspect the convergent-call rules or an intrinsic mapping |
+| `FAIL dispatch …: N mismatches` | it compiled and ran, and computed the wrong thing — the most interesting failure; suspect the convergent-call rules (and that the barrier still carries `convergent`, `xcrun metal-objdump -d`) or an intrinsic mapping |
 | `metal-objdump: unknown magic` | a bitcode blob is not padded to 16 bytes |
 | `air-splice: refusing --target=…` | that deployment target is not verified; the message says why (see *Deployment targets*) |
 | `note library targets macOS N.n but this is macOS M.m` (then `Unsupported target triple`) | the library targets a newer macOS *major* than the one running, which Metal refuses. A newer minor of the same major loads fine. Rebuild for this macOS with `-Dmetal-target` |

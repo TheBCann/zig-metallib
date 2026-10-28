@@ -55,7 +55,8 @@ the pin moves to a current nightly. For a toolchain that stays downloadable, che
 **`zig-0.17.0`** tag, which pins the Zig 0.17.0 release. Zig 0.17.0 also builds this
 commit. Zig 0.18 changed the IR the shader compiles to, and master now declares
 `fast_math_disable` in the library, so `default.metallib` differs between the two
-(`1969ef4d…` on the tag, `5a179469…` on master), and both pass all 42 checks.
+(`1969ef4d…` on the tag, `83798793…` on master, which also marks barriers `convergent`
+and adds a barrier kernel), and both pass all their checks (42 on the tag, 45 on master).
 
 ## What is verified, and how
 
@@ -69,25 +70,27 @@ are read back and compared.
 | --- | --- | --- |
 | `zig build test` | rewriter, assembler, metadata, packer, uniformity analysis, target profiles | 91 tests pass |
 | `zig build` | Zig → IR → container, end to end | builds |
-| `zig build check -- …` | Metal loads it, compiles every pipeline, and the GPU computes the right answers | **42 ok, 0 fail** |
+| `zig build check -- …` | Metal loads it, compiles every pipeline, and the GPU computes the right answers | **45 ok, 0 fail** |
 | `tools/crosscheck/sweep.sh` | randomly generated integer and float kernels compute the same on the GPU as on the CPU ([docs/crosscheck.md](docs/crosscheck.md)) | 100 seeds in each mode, all match; 9 Metal compiler [findings](docs/crosscheck.md#findings) recorded with reproducers, 6 of them reproduced from Metal Shading Language through Apple's own front end, 5 worked around in the assembler; bug reports drafted in [docs/apple-reports](docs/apple-reports/README.md) |
 | `zig build survey` | the transcendental functions' error on the GPU against an f64 reference ([table](docs/crosscheck-float-policy.md#precision-survey)) | precise `air.*` within 1.4 ulp (exp), 2.6 (sin, cos up to FLT_MAX), 3.9 (tan); sqrt correctly rounded; Zig's builtins now get these |
 | `xcrun metal-objdump -d` | our container is readable by Apple's own tooling | passes |
-| `xcrun metal` on `shader.air.ll` | Apple's assembler accepts our printed IR; the library *it* builds also passes `zig build check` | **42 ok, 0 fail** |
+| `xcrun metal` on `shader.air.ll` | Apple's assembler accepts our printed IR; the library *it* builds also passes `zig build check` | **45 ok, 0 fail** |
 
 The last row is the strongest cross-check available without Apple's source: from the
 same IR text, Apple's assembler and ours produce libraries that both run correctly.
 
-The 42 checks cover 15 entry points — 2 vertex, 3 fragment, 10 kernels — including:
+The 45 checks cover 16 entry points — 2 vertex, 3 fragment, 11 kernels — including:
 
 - pixel-exact textured renders (all 64 pixels of an 8×8 target), once through a
   `constexpr` sampler baked into the shader and once through a host-bound
   `[[sampler(0)]]`;
 - an MRT render (two colour attachments of different formats + depth) with
   `discard_fragment`, instancing, `base_instance`, `front_facing` and `point_coord`;
-- 10 compute dispatches: threadgroup memory, barriers, SIMD-group reductions,
+- 11 compute dispatches: threadgroup memory, barriers, SIMD-group reductions,
   shuffles and prefix sums, device and threadgroup atomics, a two-stage tree
-  reduction, and a texture read/write kernel.
+  reduction, a workgroup counter whose barriers Metal would jump-thread without the
+  `convergent` attribute (a Debug shader build fails it without the attribute), and a
+  texture read/write kernel.
 
 ## Scope and honest limits
 
@@ -124,6 +127,30 @@ The 42 checks cover 15 entry points — 2 vertex, 3 fragment, 10 kernels — inc
   `error.Unsupported` with the offending line, never silently dropped.
 - **Not a general Metal binding.** `src/objc.zig` is the minimum `msgSend` surface the
   example needs.
+
+## SPIR-V compute shaders
+
+`spirv-splice` takes a SPIR-V compute module to a Metal library through the same
+assembler and packer, without Apple's toolchain: buffers, uniforms, push constants and
+builtins become AIR kernel parameters described by a runtime manifest; threadgroup
+memory, barriers and atomics are supported; graphics stages and images are not yet
+([docs/spirv.md](docs/spirv.md), plan in [docs/spirv-plan.md](docs/spirv-plan.md)).
+The engine output it has been run on is naga's (16 snapshots) and Zig's own `-fno-llvm`
+SPIR-V backend's; glslang's and DXC's shapes are covered only by hand-written modules
+(neither tool is installed here, so no real glslang or DXC output has been tested).
+
+```sh
+zig build spirv-splice
+zig-out/bin/spirv-splice --manifest=k.txt shader.spv shader.metallib [shader.ll]
+zig build spirv-corpus      # the corpus on Metal, thirteen kernels run with known answers
+```
+
+| gate | result (Apple M3, macOS 26.3) |
+| --- | --- |
+| 821 one-instruction probes + 153 corpus entry points, each built into a pipeline | 933 ok, 41 refused by name as expected, 0 Metal errors |
+| the 703 computational probes executed against a CPU reference | all match, strict and fast math |
+| `zig build spirv-corpus`: naga's Collatz, threadgroup and SIMD-group reverse, atomic counters, 64-bit min/max, device float atomic add, threadgroup float exchange, tree reduction and atomics in glslang's shape, DXC's reflection shape, Zig's control flow | all 13 match; threadgroup float add, a Metal miscompile refused by name, still reproduces |
+| the crosscheck bench compiled by Zig's SPIR-V backend (`-Dcrosscheck-spirv=true`) | 20 integer + 20 float seeds match |
 
 ## Prior art
 
@@ -167,10 +194,13 @@ tools/air/target.zig        deployment-target profiles: triple, versions, header
 tools/metallib_check.zig    loads a library into Metal and runs every entry point
 tools/crosscheck/           differential test bench: program model, generator, reducer, GPU/CPU driver, sweep
 src/engine/crosscheck_harness.zig  fixed GPU kernel wrapper for the bench
+src/engine/crosscheck_harness_spirv.zig  the same kernel in Vulkan compute form, for the SPIR-V path
+tools/spirv/, tools/spirv_splice.zig  SPIR-V front end: reader, lowering, spirv-splice (docs/spirv.md)
 docs/apple-reports/         drafted Metal compiler bug reports: standalone reproducers and a Swift runner
 docs/pipeline.md            how the pipeline works, and how to add a shader
 docs/air-format.md          the container, bitcode dialect and metadata reference
 docs/crosscheck.md          the differential test bench
+docs/spirv.md               SPIR-V compute modules on Metal: usage, mappings, verification
 .github/workflows/ci.yml    build, test and runtime checks on GitHub's macOS runners
 ```
 
@@ -183,3 +213,9 @@ docs/crosscheck.md          the differential test bench
 - **[docs/crosscheck.md](docs/crosscheck.md)** — the differential test bench: random
   kernels run on the GPU and the CPU and compared, how outcomes are sorted, and what is
   verified so far.
+- **[docs/spirv.md](docs/spirv.md)** — `spirv-splice`: SPIR-V compute modules to Metal
+  libraries through the same assembler and packer; what is supported, the mapping
+  tables, and how it is verified, including the crosscheck bench through Zig's SPIR-V
+  backend (`-Dcrosscheck-spirv=true`).
+- **[docs/spirv-plan.md](docs/spirv-plan.md)** — the plan for a SPIR-V front end through
+  the same assembler and packer, tested by the bench.

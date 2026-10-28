@@ -99,6 +99,15 @@ pub const unary = [_]Op{ .bnot, .neg, .popcount, .clz, .ctz, .bswap, .bitrev, .a
 pub const binary_inline = [_]Op{ .add, .sub, .mul, .band, .bor, .bxor, .add_sat, .sub_sat, .mul_sat, .min_s, .max_s };
 pub const binary_helper = [_]Op{ .shl, .ashr, .lshr, .div_trunc, .div_floor, .rem_s, .mod_s, .div_u, .rem_u, .min_u, .max_u, .ov_mul, .add8, .mul16, .mulhi_s, .mulhi_u, .avg64, .shl64hi };
 
+/// What `--spirv` leaves out (docs/spirv.md, "The crosscheck bench"): the
+/// operators Zig's self-hosted SPIR-V backend cannot compile yet. It stops
+/// with `TODO (SPIR-V): implement AIR tag add_sat` (sub_sat, mul_sat,
+/// popcount, byte_swap, bit_reverse) and `implement unary operation 'clz'
+/// for vulkan os` (ctz), for i32 and for `@Vector(4, i32)` alike, so the
+/// vector forms go too (`spirv_unsupported_vops`). Everything else stays, so the
+/// SPIR-V bench covers the same ground as the nvptx one.
+pub const spirv_unsupported = [_]Op{ .popcount, .clz, .ctz, .bswap, .bitrev, .add_sat, .sub_sat, .mul_sat };
+
 /// Constants that tend to expose codegen edge cases: identities, sign
 /// boundaries, single bits, all-ones masks, and shift amounts near 31/32.
 pub const constants = [_]i32{
@@ -497,6 +506,8 @@ pub const VOp = enum { add, sub, mul, band, bor, bxor, add_sat, sub_sat, mul_sat
 pub const vops = [_]VOp{ .add, .sub, .mul, .band, .bor, .bxor, .add_sat, .sub_sat, .mul_sat, .min, .max, .abs, .popcount, .select };
 /// The same on f32 vectors (`vf<op>`); the lanes are flushed as scalars are.
 pub const VFOp = enum { add, sub, mul, div, min, max, fma, sqrt, abs, neg, floor, ceil, trunc, round, rem, select };
+/// The vector forms of `spirv_unsupported`.
+pub const spirv_unsupported_vops = [_]VOp{ .add_sat, .sub_sat, .mul_sat, .popcount };
 pub const vfops = [_]VFOp{ .add, .sub, .mul, .div, .min, .max, .fma, .sqrt, .abs, .neg, .floor, .ceil, .trunc, .round, .rem, .select };
 
 /// The static type of an expression node.
@@ -616,6 +627,10 @@ pub const Program = struct {
     inits: []*Expr,
     stmts: []Stmt,
     ret: *Expr,
+    /// With `--spirv`: how many operator draws landed on an excluded
+    /// operator and were drawn again (0: the program is the one the seed
+    /// gives without the flag).
+    spirv_redraws: u32 = 0,
 };
 
 /// What a tree references: which inputs, and which locals are assigned / read.
@@ -766,14 +781,29 @@ pub const Gen = struct {
     /// random draws are exactly those of the integer generator, so every
     /// integer seed keeps its program.
     floats: bool = false,
+    /// Leave out the operators Zig's SPIR-V backend cannot compile
+    /// (`spirv_unsupported`). A draw that lands on one is drawn again from
+    /// the same menu, so a program that never lands on one makes exactly the
+    /// draws, and prints exactly the text, it does without the flag.
+    spirv: bool = false,
+    /// Draws `spirv` rejected (Program.spirv_redraws).
+    spirv_redraws: u32 = 0,
 
     pub fn pick(g: *Gen, comptime set: []const Op) Op {
-        return set[g.r.uintLessThan(usize, set.len)];
+        while (true) {
+            const op = set[g.r.uintLessThan(usize, set.len)];
+            if (!(g.spirv and std.mem.findScalar(Op, &spirv_unsupported, op) != null)) return op;
+            g.spirv_redraws += 1;
+        }
     }
 
-    /// An integer vector operator.
+    /// An integer vector operator, with `--spirv`'s redraw as in `pick`.
     pub fn pickV(g: *Gen) VOp {
-        return vops[g.r.uintLessThan(usize, vops.len)];
+        while (true) {
+            const op = vops[g.r.uintLessThan(usize, vops.len)];
+            if (!(g.spirv and std.mem.findScalar(VOp, &spirv_unsupported_vops, op) != null)) return op;
+            g.spirv_redraws += 1;
+        }
     }
 
     const binary_inline_known = binary_inline;
@@ -1443,6 +1473,8 @@ pub fn countStmts(list: []const Stmt) u32 {
 pub const Options = struct {
     include_known: bool = false,
     floats: bool = false,
+    /// `--spirv`: leave out `spirv_unsupported` (see `Gen.spirv`).
+    spirv: bool = false,
 };
 
 /// The program a seed denotes. Everything about it, including the number of
@@ -1460,8 +1492,11 @@ pub fn generate(gpa: std.mem.Allocator, seed: u64, opts: Options) !Program {
         .stmt_budget = 40,
         .include_known = opts.include_known,
         .floats = opts.floats,
+        .spirv = opts.spirv,
     };
-    return g.program();
+    var p = try g.program();
+    p.spirv_redraws = g.spirv_redraws;
+    return p;
 }
 
 /// The complete body file: `header` (comment lines and `pub const seed`),
@@ -1534,4 +1569,162 @@ pub fn countNodes(prog: *const Program) u32 {
     var n: u32 = 0;
     for (prog.inits) |e| n += exprNodes(e);
     return n + stmtNodes(prog.stmts) + exprNodes(prog.ret);
+}
+
+// ── Tests ────────────────────────────────────────────────────────────────────
+
+/// Operator occurrences in a program: the scalar `Op`s of `un`/`bin` nodes
+/// and the integer vector `VOp`s.
+const OpCounts = struct {
+    ops: std.EnumArray(Op, u32) = .initFill(0),
+    vops: std.EnumArray(VOp, u32) = .initFill(0),
+
+    fn expr(c: *OpCounts, e: *const Expr) void {
+        switch (e.*) {
+            .a, .b, .v, .constant, .fconst => {},
+            .un => |n| {
+                c.ops.getPtr(n.op).* += 1;
+                c.expr(n.x);
+            },
+            .bin => |n| {
+                c.ops.getPtr(n.op).* += 1;
+                c.expr(n.x);
+                c.expr(n.y);
+            },
+            .vbin => |n| {
+                c.vops.getPtr(n.op).* += 1;
+                c.expr(n.x);
+                c.expr(n.y);
+            },
+            .fun => |n| c.expr(n.x),
+            .hun => |n| c.expr(n.x),
+            .fbin => |n| {
+                c.expr(n.x);
+                c.expr(n.y);
+            },
+            .hbin => |n| {
+                c.expr(n.x);
+                c.expr(n.y);
+            },
+            .vfbin => |n| {
+                c.expr(n.x);
+                c.expr(n.y);
+            },
+            .ffma => |n| {
+                c.expr(n.x);
+                c.expr(n.y);
+                c.expr(n.z);
+            },
+            .hfma => |n| {
+                c.expr(n.x);
+                c.expr(n.y);
+                c.expr(n.z);
+            },
+            .select => |n| {
+                c.cond(n.c);
+                c.expr(n.x);
+                c.expr(n.y);
+            },
+            .fsel => |n| {
+                c.cond(n.c);
+                c.expr(n.x);
+                c.expr(n.y);
+            },
+            .fin, .fromint, .fbits, .ftoi => |x| c.expr(x),
+        }
+    }
+
+    fn cond(c: *OpCounts, k: *const Cond) void {
+        c.expr(k.x);
+        c.expr(k.y);
+        if (k.rest) |r| c.cond(r.c);
+    }
+
+    fn stmts(c: *OpCounts, list: []const Stmt) void {
+        for (list) |*st| switch (st.*) {
+            .assign => |n| c.expr(n.e),
+            .if_ => |n| {
+                c.cond(n.c);
+                c.stmts(n.then);
+                if (n.els) |e| c.stmts(e);
+            },
+            .for_ => |n| {
+                switch (n.bound) {
+                    .constant => {},
+                    .runtime => |e| c.expr(e),
+                }
+                c.stmts(n.body);
+            },
+            .switch_ => |n| {
+                c.expr(n.sel);
+                for (n.arms) |arm| c.stmts(arm);
+            },
+            .brk, .cont => |k| c.cond(k),
+        };
+    }
+
+    fn program(c: *OpCounts, p: *const Program) void {
+        for (p.inits) |e| c.expr(e);
+        c.stmts(p.stmts);
+        c.expr(p.ret);
+    }
+
+    fn excluded(c: *const OpCounts) u32 {
+        var n: u32 = 0;
+        for (spirv_unsupported) |op| n += c.ops.get(op);
+        for (spirv_unsupported_vops) |op| n += c.vops.get(op);
+        return n;
+    }
+};
+
+test "--spirv leaves out exactly the SPIR-V backend's unsupported operators and changes nothing else" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const gpa = arena.allocator();
+    const header = "pub const seed: u64 = 0;\n\n";
+    // Integer programs are long enough that few seeds avoid every excluded
+    // operator (39 of seeds 1-5000: the first are 340, 525, 709 and 774);
+    // float programs spend part of their budget on float nodes (214 of 5000).
+    for ([_]bool{ false, true }, [_]u64{ 800, 300 }) |floats, last| {
+        var seen: OpCounts = .{};
+        var identical: u32 = 0;
+        var changed: u32 = 0;
+        for (1..last + 1) |seed| {
+            const plain = try generate(gpa, seed, .{ .floats = floats });
+            const spv = try generate(gpa, seed, .{ .floats = floats, .spirv = true });
+            var plain_ops: OpCounts = .{};
+            plain_ops.program(&plain);
+            var spv_ops: OpCounts = .{};
+            spv_ops.program(&spv);
+            // No excluded operator is ever drawn with the flag.
+            try std.testing.expectEqual(0, spv_ops.excluded());
+            try std.testing.expectEqual(0, plain.spirv_redraws);
+            const plain_text = try render(gpa, &plain, header);
+            const spv_text = try render(gpa, &spv, header);
+            if (plain_ops.excluded() == 0) {
+                // A seed that never draws one prints the same file, byte for byte.
+                try std.testing.expectEqual(0, spv.spirv_redraws);
+                try std.testing.expectEqualStrings(plain_text, spv_text);
+                identical += 1;
+            } else {
+                try std.testing.expect(spv.spirv_redraws > 0);
+                changed += 1;
+            }
+            for (std.enums.values(Op)) |op| seen.ops.getPtr(op).* += spv_ops.ops.get(op);
+            for (std.enums.values(VOp)) |op| seen.vops.getPtr(op).* += spv_ops.vops.get(op);
+        }
+        // Both kinds of seed occur, so both branches above were exercised.
+        try std.testing.expect(identical > 0 and changed > 0);
+        // Everything else is still drawn: every other operator of the
+        // unary, inline, helper and vector menus appears in some program.
+        for (unary ++ binary_inline ++ binary_helper) |op| {
+            if (std.mem.findScalar(Op, &spirv_unsupported, op) != null) continue;
+            if (seen.ops.get(op) == 0) std.debug.print("operator {t} never drawn with --spirv\n", .{op});
+            try std.testing.expect(seen.ops.get(op) > 0);
+        }
+        for (vops) |op| {
+            if (std.mem.findScalar(VOp, &spirv_unsupported_vops, op) != null) continue;
+            try std.testing.expect(seen.vops.get(op) > 0);
+        }
+    }
 }

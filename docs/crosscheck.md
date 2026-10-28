@@ -5,7 +5,7 @@ the CPU, and compares the results. The two sides are **one Zig function** compil
 so they must agree. A mismatch is a codegen bug: in this project's rewriter or assembler,
 in Apple's GPU compiler, or in our understanding of the IR.
 
-This complements `zig build check`, which runs 42 hand-written checks against one
+This complements `zig build check`, which runs 45 hand-written checks against one
 shader. Random programs reach IR shapes nobody wrote by hand.
 
 ## Running it
@@ -189,6 +189,38 @@ half-precision nodes apply the same operators in f16 between exact conversions. 
 driver's edge inputs gain float and f16 bit patterns, and the reducer handles float
 programs. Float mode is opt-in so that every integer seed keeps its program.
 
+## Through SPIR-V
+
+`-Dcrosscheck-spirv=true` runs the same bench through the SPIR-V front end
+([spirv.md](spirv.md#the-crosscheck-bench-through-spir-v)): the body is compiled by Zig's
+self-hosted SPIR-V backend (`spirv64-vulkan`, `-fno-llvm`) inside
+`src/engine/crosscheck_harness_spirv.zig`, the standard Vulkan compute shape of the same
+kernel (Block buffers at bindings 0-2, a Uniform block at 3, GlobalInvocationId,
+LocalSize 64), and the library is built by `spirv-splice` instead of `air-splice`. The
+driver, its inputs and its verdicts are unchanged, and every other option combines with
+it:
+
+```sh
+zig build crosscheck -Dseed=7 -Dcrosscheck-spirv=true
+zig build crosscheck -Dseed=7 -Dcrosscheck-spirv=true -Dcrosscheck-floats=true
+zig build crosscheck-apple -Dseed=7 -Dcrosscheck-spirv=true   # Apple's assembler on spirv-splice's IR
+zig build reduce -Dseed=7 -Dcrosscheck-spirv=true
+CROSSCHECK_ARGS="-Dcrosscheck-spirv=true" tools/crosscheck/sweep.sh 1 20
+```
+
+Zig's SPIR-V backend cannot compile `+| -| *|`, `@popCount`, `@clz`, `@ctz`,
+`@byteSwap` and `@bitReverse` yet, so the generator leaves exactly those out in this
+mode (`--spirv`, scalar and vector forms). A draw that lands on one is drawn again, so a
+seed that never draws one prints the same file as without the flag; most integer seeds
+do draw one, so a SPIR-V seed is usually a different program from the nvptx seed of the
+same number, and `--spirv` bodies are compared through both front ends with
+`-Dcrosscheck-body`. `sweep.sh` sorts `spirv-splice:` refusals as `REFUSED`. The first
+SPIR-V sweep found a bug in Zig's SPIR-V backend (unsigned-to-signed widening
+sign-extends; a review then found its mirror: a signed value widened into an i128
+zero-extends), which
+spirv-splice undoes for Zig modules; `-Dspirv-zig-workarounds=false`
+measures it ([spirv.md](spirv.md#a-bug-in-zigs-spir-v-backend)).
+
 ## Findings
 
 Found on an Apple M3, macOS 26.3, with Zig 0.18.0-dev.253. Each has a one-line reproducer
@@ -248,7 +280,10 @@ sign of an exact zero remainder; and `llvm.round` is expanded to
 and keeps the sign of a zero result (`copysign(round(x), x)` would not do: Apple's optimizer
 folds it back to `round(x)`). The three reproducers now match through `zig build
 crosscheck` and still fail through `crosscheck-apple`, which assembles the un-worked-around
-IR with Apple's tool, so the findings stay measurable. The generator emits `*|`, `@round`
+IR with Apple's tool, so the findings stay measurable. (The printed IR spells every other
+intrinsic rename as the assembler applies it, `llvm.sin` → `air.sin` and the rest, and
+carries the assembler's `convergent` attributes, so Apple's build differs from ours only
+in these three forms; `intrinsics.printForApple`, 2026-10-21.) The generator emits `*|`, `@round`
 and `@rem` again, so the integer programs changed with the menu.
 
 **In this project.** The first sweep with control flow produced the bench's first
@@ -389,6 +424,16 @@ On an Apple M3 (macOS 26.3, Zig 0.18.0-dev.253):
   `hdiv(fin(a), fromInt(33))`, the ninth finding; with f16 divisors kept input-dependent, a
   fresh 100-seed float sweep is 100 match; 128 unit tests; the default library is
   byte-identical.
+- **Through SPIR-V** (2026-10-21, [spirv.md](spirv.md#the-crosscheck-bench-through-spir-v)):
+  20 integer and 20 float seeds match with `-Dcrosscheck-spirv=true`, and their `--spirv`
+  bodies match through nvptx too; the first sweep's one failure was a bug in Zig's SPIR-V
+  backend (unsigned-to-signed widening emitted as OpSConvert; a review then found the mirror
+  for i128 limbs, OpUConvert of a signed value), which spirv-splice undoes
+  for Zig modules. The fma and f16-division findings reproduce through SPIR-V with the
+  nvptx counts (223, 15), the worked-around `round` and `frem` ones through
+  `crosscheck-apple` (949, 1,067); the overflow bits match there, because Zig's SPIR-V
+  backend computes them without `llvm.s*.with.overflow`. `*|` and the two regress bodies
+  do not compile on that backend.
 - The default build is untouched: `default.metallib` is byte-identical with and without
   the bench.
 

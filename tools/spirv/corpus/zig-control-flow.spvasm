@@ -1,0 +1,479 @@
+; zig-control-flow.spvasm: loop, switch, phi dispatch, GLSL.std.450 math, a Uniform block and a Workgroup array.
+; Zig 0.18.0-dev.253+16d31ceed, self-hosted SPIR-V backend (Zig generator id 41, 0x00290900):
+;   zig build-obj cf.zig -target spirv64-vulkan -fno-llvm -O ReleaseFast -femit-bin=cf.spv
+; Source: tools/spirv/testdata/cf.zig; binary: tools/spirv/testdata/cf.spv (byte-identical to the
+; command above). Disassembled by tools/spirv/dis.zig; cross-checked token by token against the
+; grammar-driven reference disassembler used in the design (the only differences: ids whose
+; OpName is not unique print numerically here, so the text re-assembles).
+; SPIR-V
+; Version: 1.0
+; Generator: 0x00290900
+; Bound: 568
+; Schema: 0
+OpCapability Shader
+OpCapability Int64
+OpCapability PhysicalStorageBufferAddresses
+OpExtension "SPV_KHR_physical_storage_buffer"
+%224 = OpExtInstImport "GLSL.std.450"
+OpMemoryModel PhysicalStorageBuffer64 GLSL450
+OpEntryPoint GLCompute %cf.kernel "kernel" %17 %9
+OpExecutionMode %cf.kernel LocalSize 64 1 1
+%5 = OpString "cf.zig"
+OpSourceExtension "zig_errors:"
+OpSource Zig 2304
+OpName %void "void"
+OpName %u32 "u32"
+OpName %u64 "u64"
+OpName %i32 "i32"
+OpName %cf.kernel "cf.kernel"
+OpName %lid "lid"
+OpName %gid "gid"
+OpName %f32 "f32"
+OpName %cf.body "cf.body"
+OpName %123 "x"
+OpName %123 "x"
+OpName %125 "x"
+OpName %s "s"
+OpName %i "i"
+OpName %201 "x"
+OpName %238 "x"
+OpName %270 "x"
+OpName %340 "x"
+OpName %456 "x"
+OpName %t "t"
+OpName %params "params"
+OpName %tile "tile"
+OpName %in0 "in0"
+OpName %out "out"
+OpName %in1 "in1"
+OpDecorate %9 BuiltIn LocalInvocationId
+OpDecorate %17 BuiltIn WorkgroupId
+OpDecorate %540 Block
+OpMemberDecorate %540 0 Offset 0
+OpMemberDecorate %540 1 Offset 4
+OpDecorate %543 ArrayStride 8
+OpDecorate %555 ArrayStride 16384
+%void = OpTypeVoid
+%u32 = OpTypeInt 32 0
+%7 = OpTypeVector %u32 3
+%8 = OpTypePointer Input %7
+%9 = OpVariable %8 Input
+%17 = OpVariable %8 Input
+%24 = OpConstant %u32 64
+%33 = OpTypePointer Uniform %u32
+%36 = OpConstant %u32 0
+%41 = OpTypeBool
+%48 = OpUndef %u32
+%50 = OpConstant %u32 11
+%u64 = OpTypeInt 64 0
+%i32 = OpTypeInt 32 1
+%66 = OpTypePointer Workgroup %i32
+%73 = OpTypePointer StorageBuffer %i32
+%88 = OpConstant %u32 63
+%113 = OpTypeFunction %void
+%129 = OpTypePointer Function %i32
+%134 = OpTypePointer Function %u32
+%152 = OpConstant %u32 7
+%165 = OpConstant %i32 3
+%186 = OpConstant %u32 24
+%f32 = OpTypeFloat 32
+%204 = OpTypePointer Function %f32
+%212 = OpConstant %u32 37
+%230 = OpTypePointer Uniform %f32
+%233 = OpConstant %u32 1
+%250 = OpConstant %u32 50
+%281 = OpConstant %u32 60
+%304 = OpConstant %u32 68
+%324 = OpConstant %u32 75
+%335 = OpConstant %f32 1.5
+%352 = OpConstant %u32 85
+%391 = OpConstant %i32 7
+%398 = OpConstant %u32 10
+%401 = OpConstant %u32 95
+%424 = OpConstant %u32 12
+%467 = OpConstant %u32 118
+%487 = OpConstant %u32 125
+%509 = OpConstant %u32 114
+%538 = OpTypeFunction %i32 %i32 %i32
+%540 = OpTypeStruct %u32 %f32
+%543 = OpTypePointer Uniform %540
+%params = OpVariable %543 Uniform
+%548 = OpTypeArray %i32 %24
+%549 = OpTypePointer Workgroup %548
+%tile = OpVariable %549 Workgroup
+%553 = OpConstant %u32 4096
+%554 = OpTypeArray %i32 %553
+%555 = OpTypePointer StorageBuffer %554
+%in0 = OpVariable %555 StorageBuffer
+%out = OpVariable %555 StorageBuffer
+%in1 = OpVariable %555 StorageBuffer
+%cf.kernel = OpFunction %void None %113
+%4 = OpLabel
+OpLine %5 28 5
+%10 = OpLoad %7 %9
+%lid = OpCompositeExtract %u32 %10 0
+OpLine %5 29 5
+%18 = OpLoad %7 %17
+%20 = OpCompositeExtract %u32 %18 0
+OpLine %5 29 33
+%25 = OpIMul %u32 %20 %24
+OpLine %5 29 38
+%gid = OpIAdd %u32 %25 %lid
+OpLine %5 30 9
+OpLine %5 30 22
+%37 = OpInBoundsAccessChain %33 %params %36
+%39 = OpLoad %u32 %37 Aligned 4
+%40 = OpUGreaterThanEqual %41 %gid %39
+OpSelectionMerge %44 None
+OpBranchConditional %40 %42 %43
+%42 = OpLabel
+OpLine %5 30 30
+OpReturn
+%46 = OpLabel
+OpBranch %44
+%43 = OpLabel
+OpBranch %51
+%51 = OpLabel
+OpBranch %44
+%44 = OpLabel
+%52 = OpPhi %u32 %48 %46 %50 %51
+OpBranch %54
+%54 = OpLabel
+%57 = OpIEqual %41 %52 %50
+OpSelectionMerge %59 None
+OpBranchConditional %57 %60 %59
+%60 = OpLabel
+OpLine %5 31 9
+%62 = OpUConvert %u64 %lid
+%67 = OpInBoundsAccessChain %66 %tile %62
+OpLine %5 31 20
+%69 = OpUConvert %u64 %gid
+%74 = OpInBoundsAccessChain %73 %in0 %69
+%76 = OpLoad %i32 %74 Aligned 4
+OpStore %67 %76 Aligned 4
+OpLine %5 32 8
+%79 = OpUConvert %u64 %gid
+%84 = OpInBoundsAccessChain %73 %out %79
+OpLine %5 32 29
+%89 = OpISub %u32 %88 %lid
+OpLine %5 32 25
+%92 = OpUConvert %u64 %89
+%96 = OpInBoundsAccessChain %66 %tile %92
+%98 = OpLoad %i32 %96 Aligned 4
+OpLine %5 32 40
+%100 = OpUConvert %u64 %gid
+%105 = OpInBoundsAccessChain %73 %in1 %100
+%107 = OpLoad %i32 %105 Aligned 4
+OpLine %5 32 20
+%110 = OpFunctionCall %i32 %cf.body %98 %107
+OpStore %84 %110 Aligned 4
+OpReturn
+%59 = OpLabel
+OpUnreachable
+OpFunctionEnd
+%cf.body = OpFunction %i32 None %538
+%123 = OpFunctionParameter %i32
+%125 = OpFunctionParameter %i32
+%126 = OpLabel
+%s = OpVariable %129 Function
+%i = OpVariable %134 Function
+%171 = OpVariable %129 Function
+%205 = OpVariable %204 Function
+%243 = OpVariable %129 Function
+%274 = OpVariable %204 Function
+%297 = OpVariable %204 Function
+%317 = OpVariable %204 Function
+%345 = OpVariable %129 Function
+%453 = OpVariable %129 Function
+%460 = OpVariable %204 Function
+%480 = OpVariable %204 Function
+OpLine %5 13 5
+OpStore %s %123 Aligned 4
+OpLine %5 14 5
+OpStore %i %36 Aligned 4
+OpBranch %141
+%141 = OpLabel
+OpLoopMerge %142 %143 None
+OpBranch %140
+%140 = OpLabel
+OpLine %5 15 12
+%146 = OpLoad %u32 %i Aligned 4
+OpLine %5 15 26
+%149 = OpBitcast %u32 %125
+%153 = OpBitwiseAnd %u32 %149 %152
+%155 = OpULessThan %41 %146 %153
+OpSelectionMerge %159 None
+OpBranchConditional %155 %157 %158
+%157 = OpLabel
+OpLine %5 16 9
+%162 = OpLoad %i32 %s Aligned 4
+%166 = OpBitwiseAnd %i32 %162 %165
+OpLine %5 16 21
+OpSelectionMerge %176 None
+OpSwitch %166 %175 0 %172 1 %173 2 %174
+%172 = OpLabel
+%178 = OpLoad %i32 %s Aligned 4
+%182 = OpIMul %i32 %178 %165
+OpStore %171 %182 Aligned 4
+OpBranch %187
+%187 = OpLabel
+OpBranch %176
+%173 = OpLabel
+%189 = OpLoad %i32 %s Aligned 4
+%191 = OpLoad %u32 %i Aligned 4
+OpLine %5 18 32
+%193 = OpIAdd %i32 %189 %191
+OpStore %171 %193 Aligned 4
+OpBranch %198
+%198 = OpLabel
+OpBranch %176
+%174 = OpLabel
+OpLine %5 19 33
+%201 = OpLoad %i32 %s Aligned 4
+OpLine %5 19 33
+OpLine %5 7 12
+%208 = OpBitcast %f32 %201
+OpLine %5 7 5
+OpStore %205 %208 Aligned 4
+OpBranch %213
+%213 = OpLabel
+%216 = OpIEqual %41 %212 %212
+OpSelectionMerge %218 None
+OpBranchConditional %216 %219 %218
+%219 = OpLabel
+%221 = OpLoad %f32 %205 Aligned 4
+%222 = OpExtInst %f32 %224 FAbs %221
+%225 = OpExtInst %f32 %224 Sqrt %222
+OpLine %5 19 47
+%234 = OpInBoundsAccessChain %230 %params %233
+%236 = OpLoad %f32 %234 Aligned 4
+OpLine %5 19 39
+%238 = OpFMul %f32 %225 %236
+OpLine %5 19 20
+OpLine %5 10 12
+%246 = OpBitcast %i32 %238
+OpLine %5 10 5
+OpStore %243 %246 Aligned 4
+OpBranch %251
+%251 = OpLabel
+%254 = OpIEqual %41 %250 %250
+OpSelectionMerge %256 None
+OpBranchConditional %254 %257 %256
+%257 = OpLabel
+%259 = OpLoad %i32 %243 Aligned 4
+OpStore %171 %259 Aligned 4
+OpBranch %263
+%263 = OpLabel
+OpBranch %256
+%256 = OpLabel
+%264 = OpPhi %u32 %186 %263 %250 %251
+OpBranch %218
+%218 = OpLabel
+%266 = OpPhi %u32 %264 %256 %212 %213
+OpBranch %176
+%175 = OpLabel
+OpLine %5 20 32
+%270 = OpLoad %i32 %s Aligned 4
+OpLine %5 20 32
+OpLine %5 7 12
+%277 = OpBitcast %f32 %270
+OpLine %5 7 5
+OpStore %274 %277 Aligned 4
+OpBranch %282
+%282 = OpLabel
+%285 = OpIEqual %41 %281 %281
+OpSelectionMerge %287 None
+OpBranchConditional %285 %288 %287
+%288 = OpLabel
+%290 = OpLoad %f32 %274 Aligned 4
+%291 = OpExtInst %f32 %224 Floor %290
+OpLine %5 20 53
+OpLine %5 7 12
+%300 = OpBitcast %f32 %123
+OpLine %5 7 5
+OpStore %297 %300 Aligned 4
+OpBranch %305
+%305 = OpLabel
+%308 = OpIEqual %41 %304 %304
+OpSelectionMerge %310 None
+OpBranchConditional %308 %311 %310
+%311 = OpLabel
+%313 = OpLoad %f32 %297 Aligned 4
+OpLine %5 20 59
+OpLine %5 7 12
+%320 = OpBitcast %f32 %125
+OpLine %5 7 5
+OpStore %317 %320 Aligned 4
+OpBranch %325
+%325 = OpLabel
+%328 = OpIEqual %41 %324 %324
+OpSelectionMerge %330 None
+OpBranchConditional %328 %331 %330
+%331 = OpLabel
+%333 = OpLoad %f32 %317 Aligned 4
+%336 = OpExtInst %f32 %224 Fma %313 %333 %335
+OpLine %5 20 37
+%340 = OpFAdd %f32 %291 %336
+OpLine %5 20 23
+OpLine %5 10 12
+%348 = OpBitcast %i32 %340
+OpLine %5 10 5
+OpStore %345 %348 Aligned 4
+OpBranch %353
+%353 = OpLabel
+%356 = OpIEqual %41 %352 %352
+OpSelectionMerge %358 None
+OpBranchConditional %356 %359 %358
+%359 = OpLabel
+%361 = OpLoad %i32 %345 Aligned 4
+OpStore %171 %361 Aligned 4
+OpBranch %365
+%365 = OpLabel
+OpBranch %358
+%358 = OpLabel
+%366 = OpPhi %u32 %186 %365 %352 %353
+OpBranch %330
+%330 = OpLabel
+%368 = OpPhi %u32 %366 %358 %324 %325
+OpBranch %310
+%310 = OpLabel
+%370 = OpPhi %u32 %368 %330 %304 %305
+OpBranch %287
+%287 = OpLabel
+%372 = OpPhi %u32 %370 %310 %281 %282
+OpBranch %176
+%176 = OpLabel
+%374 = OpPhi %u32 %186 %187 %186 %198 %266 %218 %372 %287
+OpBranch %376
+%376 = OpLabel
+%379 = OpIEqual %41 %374 %186
+OpSelectionMerge %381 None
+OpBranchConditional %379 %382 %381
+%382 = OpLabel
+%384 = OpLoad %i32 %171 Aligned 4
+OpStore %s %384 Aligned 4
+OpLine %5 22 13
+%388 = OpLoad %i32 %s Aligned 4
+%392 = OpIEqual %41 %388 %391
+OpSelectionMerge %396 None
+OpBranchConditional %392 %394 %395
+%394 = OpLabel
+OpBranch %399
+%399 = OpLabel
+OpBranch %396
+%395 = OpLabel
+OpBranch %402
+%402 = OpLabel
+OpBranch %396
+%396 = OpLabel
+%403 = OpPhi %u32 %398 %399 %401 %402
+OpBranch %405
+%405 = OpLabel
+%408 = OpIEqual %41 %403 %401
+OpSelectionMerge %410 None
+OpBranchConditional %408 %411 %410
+%411 = OpLabel
+OpLine %5 23 5
+OpLine %5 15 48
+%415 = OpLoad %u32 %i Aligned 4
+OpLine %5 15 50
+%420 = OpIAdd %u32 %415 %233
+OpStore %i %420 Aligned 4
+OpBranch %425
+%425 = OpLabel
+OpBranch %410
+%410 = OpLabel
+%426 = OpPhi %u32 %424 %425 %403 %405
+OpBranch %381
+%381 = OpLabel
+%428 = OpPhi %u32 %426 %410 %374 %376
+OpBranch %159
+%158 = OpLabel
+OpBranch %432
+%432 = OpLabel
+OpBranch %159
+%159 = OpLabel
+%433 = OpPhi %u32 %428 %381 %398 %432
+OpBranch %435
+%435 = OpLabel
+%438 = OpIEqual %41 %433 %424
+OpBranchConditional %438 %440 %142
+%440 = OpLabel
+OpBranch %143
+%142 = OpLabel
+%441 = OpPhi %u32 %433 %435
+OpBranch %443
+%143 = OpLabel
+OpBranch %141
+%443 = OpLabel
+%446 = OpIEqual %41 %441 %398
+OpSelectionMerge %448 None
+OpBranchConditional %446 %449 %448
+%449 = OpLabel
+OpLine %5 24 19
+OpLine %5 24 20
+%456 = OpLoad %i32 %s Aligned 4
+OpLine %5 24 20
+OpLine %5 7 12
+%463 = OpBitcast %f32 %456
+OpLine %5 7 5
+OpStore %460 %463 Aligned 4
+OpBranch %468
+%468 = OpLabel
+%471 = OpIEqual %41 %467 %467
+OpSelectionMerge %473 None
+OpBranchConditional %471 %474 %473
+%474 = OpLabel
+%476 = OpLoad %f32 %460 Aligned 4
+OpLine %5 24 27
+OpLine %5 7 12
+%483 = OpBitcast %f32 %123
+OpLine %5 7 5
+OpStore %480 %483 Aligned 4
+OpBranch %488
+%488 = OpLabel
+%491 = OpIEqual %41 %487 %487
+OpSelectionMerge %493 None
+OpBranchConditional %491 %494 %493
+%494 = OpLabel
+%496 = OpLoad %f32 %480 Aligned 4
+%497 = OpFOrdLessThan %41 %476 %496
+OpSelectionMerge %501 None
+OpBranchConditional %497 %499 %500
+%499 = OpLabel
+%503 = OpLoad %i32 %s Aligned 4
+%504 = OpExtInst %i32 %224 SMin %503 %125
+OpStore %453 %504 Aligned 4
+OpBranch %510
+%510 = OpLabel
+OpBranch %501
+%500 = OpLabel
+%512 = OpLoad %i32 %s Aligned 4
+%513 = OpExtInst %i32 %224 SMax %512 %125
+OpStore %453 %513 Aligned 4
+OpBranch %519
+%519 = OpLabel
+OpBranch %501
+%501 = OpLabel
+%520 = OpPhi %u32 %509 %510 %509 %519
+OpBranch %522
+%522 = OpLabel
+OpBranch %493
+%493 = OpLabel
+%523 = OpPhi %u32 %520 %522 %487 %488
+OpBranch %473
+%473 = OpLabel
+%525 = OpPhi %u32 %523 %493 %467 %468
+%529 = OpIEqual %41 %525 %509
+OpSelectionMerge %531 None
+OpBranchConditional %529 %532 %531
+%532 = OpLabel
+%t = OpLoad %i32 %453 Aligned 4
+OpLine %5 25 5
+OpReturnValue %t
+%531 = OpLabel
+OpBranch %448
+%448 = OpLabel
+%536 = OpPhi %u32 %525 %531 %441 %443
+OpUnreachable
+OpFunctionEnd

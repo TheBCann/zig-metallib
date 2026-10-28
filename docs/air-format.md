@@ -145,9 +145,9 @@ macOS 15. Two structural differences come on top of the stamps:
 - only macOS 26 (format 2.9) has the `HDYN` tag and the dynamic header (§1.3, §1.6);
 - macOS 13 output has no `frame-pointer` module flag. It also writes `undef` where the
   newer targets write `poison`, drops `noundef` parameter attributes, and uses an older
-  function-attribute set. The profiles reproduce the flag only. This project emits no
-  attribute groups, and its `poison` is one more reason the macOS 13 profile is
-  unverified.
+  function-attribute set. The profiles reproduce the flag only. The only attribute
+  groups this project emits are the `convergent` sets of §2.3 (kinds LLVM 15 already
+  knows), and its `poison` is one more reason the macOS 13 profile is unverified.
 
 No profile reproduces Apple's `SDK Version` module flag or its real reflection list
 (§1.6); the macOS 26 library passes every check without either.
@@ -236,7 +236,9 @@ diagnostic.
 | `llvm.*` | behaviour at pipeline creation | what we emit |
 | --- | --- | --- |
 | `sin cos tan log10 pow` | abort: *unable to legalize instruction* (all widths) | `air.sin` … `air.pow`, Apple's precise functions; `air.fast_*` with `-Dmetal-fast-math=true` |
-| `exp10 ldexp` | `Undefined symbols` | `air.exp10`, `air.ldexp` (or the `fast_` ones) |
+| `exp10 ldexp` | `Undefined symbols` | `air.exp10`, `air.ldexp` (or the `fast_` ones; half ldexp is always `air.ldexp.f16`: `air.fast_ldexp.f16` crashes MTLCompilerService, and Apple's `-ffast-math` output never calls it) |
+| `uadd/usub.with.overflow` on vectors | abort (the scalar forms pass) | not emitted by the SPIR-V lowering (`add` + `icmp ult`) |
+| `mul i128` | abort | not emitted by the SPIR-V lowering (64-bit high products from 32-bit halves) |
 | `exp` | accepted, but lowered as the fast exp: up to 60 ulp ([crosscheck-float-policy.md](crosscheck-float-policy.md#precision-survey)) | `air.exp` (`air.fast_exp` under fast math) |
 | `powi.<T>.i32` | abort | `air.pow.<T>` with the exponent `sitofp`-converted |
 | `minimum maximum` | abort | `air.fast_fmin`, `air.fast_fmax` |
@@ -260,12 +262,50 @@ Native `atomicrmw`, `cmpxchg`, `load atomic` and `store atomic` are accepted;
 `llvm.memcpy/memmove/memset.pX.pY` carry the operand address spaces in their name, so
 the suffix must be rewritten when constant relocation changes one.
 
-`air.wg.barrier`, `air.simdgroup.barrier` and every `air.simd_*` collective are
-**convergent** in Apple's own declarations. Nothing in the bitcode records that, so a
-duplicated call (LLVM jump-threading a barrier into both arms of a branch) compiles
-cleanly and then desynchronises the threadgroup at runtime — which is why the assembler
-runs a uniformity analysis before emitting one. See
-[pipeline.md](pipeline.md#4-the-assembler-toolsairassemblerzig).
+`air.wg.barrier`, `air.simdgroup.barrier` and every `air.simd_*` / `air.quad_*`
+collective are **convergent** in Apple's own output (`xcrun metal -S -emit-llvm` of an
+MSL kernel), and the bitcode must say so. Apple writes the attribute sets
+
+```llvm
+declare void @air.wg.barrier(i32, i32) local_unnamed_addr #3
+tail call void @air.wg.barrier(i32 2, i32 1) #5
+attributes #3 = { convergent mustprogress nounwind willreturn }   ; every such declaration
+attributes #5 = { convergent nounwind willreturn }                ; every call to one
+```
+
+(`air.atomic.fence` gets `mustprogress nounwind willreturn` and `nounwind willreturn`,
+without `convergent`), and marks every function convergent. The assembler writes the
+same two sets on the declarations of and calls to the `intrinsics.isConvergent` names,
+and `{ convergent }` on every define that reaches one through calls and on the calls to
+it. Without the attribute Metal's runtime compiler, which optimizes the bitcode again,
+treats a barrier as an ordinary call and jump-threads the block between two branches on
+the same per-thread condition into both arms, so the lanes of a SIMD-group reach
+different copies of the barrier and the threadgroup silently desynchronises. Measured on
+an M3 (2026-10-21) with the attribute left out:
+
+| kernel | shape | without `convergent` | with it |
+| --- | --- | --- | --- |
+| SPIR-V exec test barrier_workgroup_counter | `if (lid == 0) cell = 0x40000000; barrier; atomicAdd(cell, 1); barrier; if (lid == 0) out = cell` | all 16 totals 0x40000021 (33 of 64 increments) | 0x40000040 |
+| SPIR-V exec test barrier_shared_flag | `if (lid < 16) flag[lid] = 1; barrier; tile[lid] = x; barrier; if (lid < 16) out = tile[lid + 16]` | every lid < 16 word 0 | right |
+| `barrierJoinKernel` (my_shader.zig), `zig build check -Dshader-optimize=debug` | the counter, from a Debug Zig shader, which Zig's LLVM does not optimize | all 32 totals 0x40000021 | 0x40000040 |
+| a glslang workgroup histogram, glslang's array-of-struct counter, 22 of 30 OpAtomic kernels with a seeded counter (review reproducers) | the same shape | lost increments | right |
+
+Apple's assembler on the same text without the attribute fails the same way, and with
+only the attribute added computes right, so the attribute, not the encoder, decides.
+The uniformity analysis (`tools/air/divergence.zig`) still runs: it catches what Zig's
+own LLVM has already duplicated before the assembler sees the IR (Zig cannot mark an
+`extern fn` convergent), and refuses a barrier that only some threads reach, which MSL
+and SPIR-V leave undefined, while the attribute keeps Metal from duplicating what reaches
+it uniform. It follows locals kept in memory (allocas, through `getelementptr` and
+helpers that take them by pointer), so the SPIR-V path's unoptimized IR is judged like
+the Zig path's promoted SSA values. See [pipeline.md](pipeline.md#4-the-assembler-toolsairassemblerzig).
+
+Builder's `Value.typeOfWip` recomputes an add's, select's, getelementptr's or
+insertvalue's type from an operand, recursively, so a long dependence chain made every
+type query walk the whole chain (quadratic time; a 40 000-long chain overflowed the
+stack). The assembler binds a value whose chain would exceed 256 through
+`extractvalue ({ T } insertvalue ({ T } undef, T %v, 0)), 0`, which LLVM folds; no
+shader built here comes near the bound, so their bitcode does not contain one.
 
 ### 2.4 Texture intrinsics
 

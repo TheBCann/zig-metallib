@@ -1,0 +1,314 @@
+; hand-control-flow.spvasm: control flow and the kernel interface of docs/spirv-plan.md stages 2 and 3
+; (SPIRV-DESIGN section 4), one GLCompute kernel per shape:
+;   switch_targets   OpSwitch with several targets (shared target, fall-through merge, default), a signed selector
+;                    with a negative case, a 64-bit selector with a case above 2^32, OpSelectionMerge
+;   phi_loops        a nested OpPhi loop (outer counter, inner accumulator), OpLoopMerge with Unroll/DontUnroll,
+;                    an early exit through a conditional branch out of the inner loop, a two-predecessor phi at the
+;                    exit; OpLoopMerge / OpSelectionMerge immediately precede their branch (SPIR-V 2.11, OpLoopMerge:
+;                    'must immediately precede either an OpBranch or OpBranchConditional')
+;   push_builtins    a PushConstant block, a Uniform block, and every kernel builtin the lowering maps:
+;                    LocalInvocationId, WorkgroupId, WorkgroupSize, NumWorkgroups, LocalInvocationIndex
+;   helpers          OpFunctionCall into a helper that calls another helper (define private chains), OpUnreachable
+;                    after a return, OpCopyObject, OpUndef in a phi
+; Standard Vulkan compute shape: bindings 0 in0 i32[4096] (NonWritable), 1 in1 i32[4096] (NonWritable),
+; 2 out i32[4096], 3 params (Uniform block { count: u32, scale: i32 }); push constants { bias: i32, mask: u32 }.
+; Hand-written for this project's corpus in tools/spirv/asm.zig syntax (spirv-as compatible).
+; SPIR-V
+; Version: 1.3
+; Generator: 0x00000000
+OpCapability Shader
+OpCapability Int64
+OpExtension "SPV_KHR_storage_buffer_storage_class"
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %k_switch_targets "switch_targets" %gid
+OpEntryPoint GLCompute %k_phi_loops "phi_loops" %gid
+OpEntryPoint GLCompute %k_push_builtins "push_builtins" %gid %lid %wgid %wgsize %numwg %lindex
+OpEntryPoint GLCompute %k_helpers "helpers" %gid
+OpExecutionMode %k_switch_targets LocalSize 64 1 1
+OpExecutionMode %k_phi_loops LocalSize 64 1 1
+OpExecutionMode %k_push_builtins LocalSize 64 1 1
+OpExecutionMode %k_helpers LocalSize 64 1 1
+OpName %k_switch_targets "switch_targets"
+OpName %k_phi_loops "phi_loops"
+OpName %k_push_builtins "push_builtins"
+OpName %k_helpers "helpers"
+OpName %in0 "in0"
+OpName %in1 "in1"
+OpName %out "out"
+OpName %params "params"
+OpName %push "push"
+OpName %gid "gid"
+OpName %lid "lid"
+OpName %wgid "wgid"
+OpName %wgsize "wgsize"
+OpName %numwg "numwg"
+OpName %lindex "lindex"
+OpName %IBuf "IBuf"
+OpMemberName %IBuf 0 "data"
+OpName %Params "Params"
+OpMemberName %Params 0 "count"
+OpMemberName %Params 1 "scale"
+OpName %Push "Push"
+OpMemberName %Push 0 "bias"
+OpMemberName %Push 1 "mask"
+OpName %twice "twice"
+OpName %mix3 "mix3"
+OpDecorate %gid BuiltIn GlobalInvocationId
+OpDecorate %lid BuiltIn LocalInvocationId
+OpDecorate %wgid BuiltIn WorkgroupId
+OpDecorate %wgsize BuiltIn WorkgroupSize
+OpDecorate %numwg BuiltIn NumWorkgroups
+OpDecorate %lindex BuiltIn LocalInvocationIndex
+OpDecorate %i32arr ArrayStride 4
+OpDecorate %IBuf Block
+OpMemberDecorate %IBuf 0 Offset 0
+OpDecorate %Params Block
+OpMemberDecorate %Params 0 Offset 0
+OpMemberDecorate %Params 1 Offset 4
+OpDecorate %Push Block
+OpMemberDecorate %Push 0 Offset 0
+OpMemberDecorate %Push 1 Offset 4
+OpDecorate %in0 DescriptorSet 0
+OpDecorate %in0 Binding 0
+OpDecorate %in0 NonWritable
+OpDecorate %in1 DescriptorSet 0
+OpDecorate %in1 Binding 1
+OpDecorate %in1 NonWritable
+OpDecorate %out DescriptorSet 0
+OpDecorate %out Binding 2
+OpDecorate %params DescriptorSet 0
+OpDecorate %params Binding 3
+%void = OpTypeVoid
+%bool = OpTypeBool
+%u32 = OpTypeInt 32 0
+%i32 = OpTypeInt 32 1
+%i64 = OpTypeInt 64 1
+%u64 = OpTypeInt 64 0
+%v3u32 = OpTypeVector %u32 3
+%fn_void = OpTypeFunction %void
+%fn_i32_i32 = OpTypeFunction %i32 %i32
+%fn_i32_i32_i32_i32 = OpTypeFunction %i32 %i32 %i32 %i32
+%c0 = OpConstant %u32 0
+%c1 = OpConstant %u32 1
+%c2 = OpConstant %u32 2
+%c3 = OpConstant %u32 3
+%c4 = OpConstant %u32 4
+%c4096 = OpConstant %u32 4096
+%ci0 = OpConstant %i32 0
+%ci1 = OpConstant %i32 1
+%ci2 = OpConstant %i32 2
+%ci3 = OpConstant %i32 3
+%ci5 = OpConstant %i32 5
+%ci7 = OpConstant %i32 7
+%ci10 = OpConstant %i32 10
+%ci100 = OpConstant %i32 100
+%ci_1 = OpConstant %i32 -1
+%ci64_4 = OpConstant %i64 4
+%ci64_shift = OpConstant %i64 32
+%undef_i32 = OpUndef %i32
+%i32arr = OpTypeArray %i32 %c4096
+%IBuf = OpTypeStruct %i32arr
+%Params = OpTypeStruct %u32 %i32
+%Push = OpTypeStruct %i32 %u32
+%p_IBuf = OpTypePointer StorageBuffer %IBuf
+%p_sb_i32 = OpTypePointer StorageBuffer %i32
+%p_Params = OpTypePointer Uniform %Params
+%p_un_u32 = OpTypePointer Uniform %u32
+%p_un_i32 = OpTypePointer Uniform %i32
+%p_Push = OpTypePointer PushConstant %Push
+%p_pc_i32 = OpTypePointer PushConstant %i32
+%p_pc_u32 = OpTypePointer PushConstant %u32
+%p_in_v3u32 = OpTypePointer Input %v3u32
+%p_in_u32 = OpTypePointer Input %u32
+%gid = OpVariable %p_in_v3u32 Input
+%lid = OpVariable %p_in_v3u32 Input
+%wgid = OpVariable %p_in_v3u32 Input
+%wgsize = OpVariable %p_in_v3u32 Input
+%numwg = OpVariable %p_in_v3u32 Input
+%lindex = OpVariable %p_in_u32 Input
+%in0 = OpVariable %p_IBuf StorageBuffer
+%in1 = OpVariable %p_IBuf StorageBuffer
+%out = OpVariable %p_IBuf StorageBuffer
+%params = OpVariable %p_Params Uniform
+%push = OpVariable %p_Push PushConstant
+; switch_targets
+%k_switch_targets = OpFunction %void None %fn_void
+%st_entry = OpLabel
+%st_g = OpLoad %v3u32 %gid
+%st_i = OpCompositeExtract %u32 %st_g 0
+%st_pa = OpAccessChain %p_sb_i32 %in0 %c0 %st_i
+%st_a = OpLoad %i32 %st_pa
+%st_pb = OpAccessChain %p_sb_i32 %in1 %c0 %st_i
+%st_b = OpLoad %i32 %st_pb
+%st_sel = OpSRem %i32 %st_a %ci5
+OpSelectionMerge %st_merge None
+OpSwitch %st_sel %st_default -1 %st_neg 0 %st_zero 1 %st_one 2 %st_one 3 %st_three
+%st_neg = OpLabel
+%st_v_neg = OpIMul %i32 %st_b %ci_1
+OpBranch %st_merge
+%st_zero = OpLabel
+%st_v_zero = OpIAdd %i32 %st_b %ci100
+OpBranch %st_merge
+%st_one = OpLabel
+%st_v_one = OpISub %i32 %st_b %ci7
+OpBranch %st_three
+%st_three = OpLabel
+%st_v_three = OpPhi %i32 %st_v_one %st_one %ci3 %st_entry
+%st_t = OpIMul %i32 %st_v_three %ci2
+OpBranch %st_merge
+%st_default = OpLabel
+OpBranch %st_merge
+%st_merge = OpLabel
+%st_v = OpPhi %i32 %st_v_neg %st_neg %st_v_zero %st_zero %st_t %st_three %st_b %st_default
+; a 64-bit selector with a case above 2^32
+%st_w = OpSConvert %i64 %st_v
+%st_w2 = OpShiftLeftLogical %i64 %st_w %ci64_shift
+%st_w3 = OpIAdd %i64 %st_w2 %ci64_4
+OpSelectionMerge %st_merge2 None
+OpSwitch %st_w3 %st_d2 4 %st_small 4294967300 %st_big -4294967292 %st_negbig
+%st_small = OpLabel
+OpBranch %st_merge2
+%st_big = OpLabel
+OpBranch %st_merge2
+%st_negbig = OpLabel
+OpBranch %st_merge2
+%st_d2 = OpLabel
+OpBranch %st_merge2
+%st_merge2 = OpLabel
+%st_r = OpPhi %i32 %ci1 %st_small %ci2 %st_big %ci3 %st_negbig %st_v %st_d2
+%st_po = OpAccessChain %p_sb_i32 %out %c0 %st_i
+OpStore %st_po %st_r
+OpReturn
+OpFunctionEnd
+; phi_loops
+%k_phi_loops = OpFunction %void None %fn_void
+%pl_entry = OpLabel
+%pl_g = OpLoad %v3u32 %gid
+%pl_i = OpCompositeExtract %u32 %pl_g 0
+%pl_pa = OpAccessChain %p_sb_i32 %in0 %c0 %pl_i
+%pl_a = OpLoad %i32 %pl_pa
+%pl_pb = OpAccessChain %p_sb_i32 %in1 %c0 %pl_i
+%pl_b = OpLoad %i32 %pl_pb
+%pl_n = OpBitwiseAnd %i32 %pl_b %ci7
+OpBranch %pl_outer
+%pl_outer = OpLabel
+%pl_o = OpPhi %i32 %ci0 %pl_entry %pl_o_next %pl_outer_latch
+%pl_acc = OpPhi %i32 %pl_a %pl_entry %pl_acc_out %pl_outer_latch
+%pl_o_lt = OpSLessThan %bool %pl_o %pl_n
+OpLoopMerge %pl_outer_exit %pl_outer_latch Unroll
+OpBranchConditional %pl_o_lt %pl_inner %pl_outer_exit
+%pl_inner = OpLabel
+%pl_j = OpPhi %i32 %ci0 %pl_outer %pl_j_next %pl_inner_latch
+%pl_acc_in = OpPhi %i32 %pl_acc %pl_outer %pl_acc_next %pl_inner_latch
+%pl_j_lt = OpSLessThan %bool %pl_j %ci3
+OpLoopMerge %pl_inner_exit %pl_inner_latch DontUnroll
+OpBranchConditional %pl_j_lt %pl_inner_body %pl_inner_exit
+%pl_inner_body = OpLabel
+%pl_m = OpIMul %i32 %pl_acc_in %ci3
+%pl_acc_next = OpIAdd %i32 %pl_m %pl_j
+%pl_big = OpSGreaterThan %bool %pl_acc_next %ci100
+; early exit out of the inner loop: the second predecessor of the exit phi. A break (to the loop's
+; merge) paired with a continue (to its continue target) needs no OpSelectionMerge (SPIR-V 2.11); one
+; naming the continue target as its merge would leave the loop construct, which the rules forbid.
+OpBranchConditional %pl_big %pl_inner_exit %pl_inner_latch
+%pl_inner_latch = OpLabel
+%pl_j_next = OpIAdd %i32 %pl_j %ci1
+OpBranch %pl_inner
+%pl_inner_exit = OpLabel
+%pl_acc_out = OpPhi %i32 %pl_acc_in %pl_inner %pl_acc_next %pl_inner_body
+OpBranch %pl_outer_latch
+%pl_outer_latch = OpLabel
+%pl_o_next = OpIAdd %i32 %pl_o %ci1
+OpBranch %pl_outer
+%pl_outer_exit = OpLabel
+%pl_po = OpAccessChain %p_sb_i32 %out %c0 %pl_i
+OpStore %pl_po %pl_acc
+OpReturn
+OpFunctionEnd
+; push_builtins
+%k_push_builtins = OpFunction %void None %fn_void
+%pb_entry = OpLabel
+%pb_g = OpLoad %v3u32 %gid
+%pb_i = OpCompositeExtract %u32 %pb_g 0
+%pb_pcount = OpAccessChain %p_un_u32 %params %c0
+%pb_count = OpLoad %u32 %pb_pcount
+%pb_inb = OpULessThan %bool %pb_i %pb_count
+OpSelectionMerge %pb_merge None
+OpBranchConditional %pb_inb %pb_body %pb_merge
+%pb_body = OpLabel
+%pb_pscale = OpAccessChain %p_un_i32 %params %c1
+%pb_scale = OpLoad %i32 %pb_pscale
+%pb_pbias = OpAccessChain %p_pc_i32 %push %c0
+%pb_bias = OpLoad %i32 %pb_pbias
+%pb_pmask = OpAccessChain %p_pc_u32 %push %c1
+%pb_mask = OpLoad %u32 %pb_pmask
+%pb_l = OpLoad %v3u32 %lid
+%pb_lx = OpCompositeExtract %u32 %pb_l 0
+%pb_wp = OpAccessChain %p_in_u32 %wgid %c0
+%pb_wx = OpLoad %u32 %pb_wp
+%pb_sp = OpAccessChain %p_in_u32 %wgsize %c0
+%pb_sx = OpLoad %u32 %pb_sp
+%pb_np = OpAccessChain %p_in_u32 %numwg %c0
+%pb_nx = OpLoad %u32 %pb_np
+%pb_li = OpLoad %u32 %lindex
+%pb_pa = OpAccessChain %p_sb_i32 %in0 %c0 %pb_i
+%pb_a = OpLoad %i32 %pb_pa
+%pb_s = OpIMul %i32 %pb_a %pb_scale
+%pb_t = OpIAdd %i32 %pb_s %pb_bias
+%pb_tu = OpBitcast %u32 %pb_t
+%pb_m = OpBitwiseAnd %u32 %pb_tu %pb_mask
+%pb_u1 = OpIAdd %u32 %pb_m %pb_lx
+%pb_u2 = OpIMul %u32 %pb_wx %pb_sx
+%pb_u3 = OpIAdd %u32 %pb_u1 %pb_u2
+%pb_u4 = OpIAdd %u32 %pb_u3 %pb_nx
+%pb_u5 = OpBitwiseXor %u32 %pb_u4 %pb_li
+%pb_r = OpBitcast %i32 %pb_u5
+%pb_po = OpAccessChain %p_sb_i32 %out %c0 %pb_i
+OpStore %pb_po %pb_r
+OpBranch %pb_merge
+%pb_merge = OpLabel
+OpReturn
+OpFunctionEnd
+; helpers: twice(x) = x * 2 (via mix3), mix3(a, b, c) = a * 3 + b - c
+%mix3 = OpFunction %i32 None %fn_i32_i32_i32_i32
+%m3_a = OpFunctionParameter %i32
+%m3_b = OpFunctionParameter %i32
+%m3_c = OpFunctionParameter %i32
+%m3_entry = OpLabel
+%m3_t = OpIMul %i32 %m3_a %ci3
+%m3_u = OpIAdd %i32 %m3_t %m3_b
+%m3_v = OpISub %i32 %m3_u %m3_c
+%m3_w = OpCopyObject %i32 %m3_v
+OpReturnValue %m3_w
+%m3_dead = OpLabel
+OpUnreachable
+OpFunctionEnd
+%twice = OpFunction %i32 None %fn_i32_i32
+%tw_x = OpFunctionParameter %i32
+%tw_entry = OpLabel
+%tw_r = OpFunctionCall %i32 %mix3 %tw_x %tw_x %tw_x
+%tw_r2 = OpFunctionCall %i32 %mix3 %tw_r %ci0 %tw_x
+OpReturnValue %tw_r2
+OpFunctionEnd
+%k_helpers = OpFunction %void None %fn_void
+%hl_entry = OpLabel
+%hl_g = OpLoad %v3u32 %gid
+%hl_i = OpCompositeExtract %u32 %hl_g 0
+%hl_pa = OpAccessChain %p_sb_i32 %in0 %c0 %hl_i
+%hl_a = OpLoad %i32 %hl_pa
+%hl_pb = OpAccessChain %p_sb_i32 %in1 %c0 %hl_i
+%hl_b = OpLoad %i32 %hl_pb
+%hl_lt = OpSLessThan %bool %hl_a %hl_b
+OpSelectionMerge %hl_merge None
+OpBranchConditional %hl_lt %hl_then %hl_merge
+%hl_then = OpLabel
+%hl_t = OpFunctionCall %i32 %twice %hl_a
+OpBranch %hl_merge
+%hl_merge = OpLabel
+; the else edge carries an undefined value: the lowering must accept OpUndef in a phi
+%hl_v = OpPhi %i32 %hl_t %hl_then %undef_i32 %hl_entry
+%hl_r = OpSelect %i32 %hl_lt %hl_v %hl_b
+%hl_po = OpAccessChain %p_sb_i32 %out %c0 %hl_i
+OpStore %hl_po %hl_r
+OpReturn
+OpFunctionEnd

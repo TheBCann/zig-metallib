@@ -31,7 +31,12 @@
 //! control that tells "this GPU cannot build pipelines" apart from "this
 //! project's output is rejected" (.github/workflows/ci.yml).
 //!
-//! Usage: metallib-check [--kernel=<name>] <file.metallib>
+//! With `--kernels=a,b,c` it does the same for each named kernel without
+//! the comptime manifest, trying every one and printing one `ok kernel ...`
+//! or `FAIL kernel ...` line each: libraries whose interface is only known at
+//! runtime (spirv-splice output, docs/spirv.md) are checked this way.
+//!
+//! Usage: metallib-check [--kernel=<name> | --kernels=<a,b,...>] <file.metallib>
 
 const std = @import("std");
 const objc = @import("objc");
@@ -86,14 +91,18 @@ pub fn main(init: std.process.Init) !void {
 
     const args = try init.minimal.args.toSlice(arena);
     var kernel_only: ?[:0]const u8 = null;
+    var kernel_list: ?[]const u8 = null;
     var path: []const u8 = undefined;
     if (args.len == 3 and std.mem.startsWith(u8, args[1], "--kernel=") and args[1].len > "--kernel=".len) {
         kernel_only = args[1]["--kernel=".len..];
         path = args[2];
+    } else if (args.len == 3 and std.mem.startsWith(u8, args[1], "--kernels=") and args[1].len > "--kernels=".len and !std.mem.startsWith(u8, args[2], "-")) {
+        kernel_list = args[1]["--kernels=".len..];
+        path = args[2];
     } else if (args.len == 2 and !std.mem.startsWith(u8, args[1], "-")) {
         path = args[1];
     } else {
-        std.debug.print("usage: metallib-check [--kernel=<name>] <file.metallib>\n", .{});
+        std.debug.print("usage: metallib-check [--kernel=<name> | --kernels=<a,b,...>] <file.metallib>\n", .{});
         std.process.exit(2);
     }
     const bytes = try std.Io.Dir.cwd().readFileAlloc(io, path, arena, .unlimited);
@@ -179,6 +188,20 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
 
+    // Runtime-manifest mode: a compute pipeline for every named kernel, each
+    // one reported on its own line, the others still tried after a failure.
+    if (kernel_list) |list| {
+        var any_failed = false;
+        var it = std.mem.splitScalar(u8, list, ',');
+        while (it.next()) |name_raw| {
+            if (name_raw.len == 0) continue;
+            const name = try arena.dupeSentinel(u8, name_raw, 0);
+            if (!checkKernelPipeline(device, library, name)) any_failed = true;
+        }
+        if (any_failed) std.process.exit(1);
+        return;
+    }
+
     // One MTLFunction per manifest entry, and a compute pipeline per kernel.
     var functions: [shader.functions.len]objc.Object = undefined;
     var pipelines: [shader.functions.len]?objc.Object = @splat(null);
@@ -241,9 +264,40 @@ pub fn main(init: std.process.Init) !void {
     if (comptime findFunction("tgBufKernel")) |i| try testTgBufKernel(device, pipelines[i].?);
     if (comptime findFunction("reduceKernel")) |i| try testReduceKernel(device, pipelines[i].?);
     if (comptime findFunction("twoStageKernel")) |i| try testTwoStageKernel(device, pipelines[i].?);
+    if (comptime findFunction("barrierJoinKernel")) |i| try testBarrierJoinKernel(device, pipelines[i].?);
     if (comptime findFunction("copyTextureKernel")) |i| try testCopyTextureKernel(device, pipelines[i].?);
 
     if (failed) std.process.exit(1);
+}
+
+/// `--kernels` mode: the function, that it is a kernel, and its compute
+/// pipeline, printing `ok kernel <name> maxTotalThreadsPerThreadgroup=..
+/// staticThreadgroupMemoryLength=..` or one `FAIL` line naming the step.
+fn checkKernelPipeline(device: objc.Object, library: objc.Object, name: [:0]const u8) bool {
+    const ns_name = objc.createNSString(name) orelse {
+        std.debug.print("FAIL kernel {s}: not a valid UTF-8 function name\n", .{name});
+        return false;
+    };
+    const function = objc.msgSend(?objc.Object, library, "newFunctionWithName:", .{ns_name}) orelse {
+        std.debug.print("FAIL kernel {s}: newFunctionWithName: not found\n", .{name});
+        return false;
+    };
+    const function_type = objc.msgSend(u64, function, "functionType", .{});
+    if (function_type != MTLFunctionTypeKernel) {
+        std.debug.print("FAIL kernel {s}: not a kernel function (MTLFunctionType {d})\n", .{ name, function_type });
+        return false;
+    }
+    var err: ?objc.Object = null;
+    const pso = objc.msgSend(?objc.Object, device, "newComputePipelineStateWithFunction:error:", .{ function, &err }) orelse {
+        std.debug.print("FAIL kernel {s}: newComputePipelineState: {s}\n", .{ name, errorText(err) });
+        return false;
+    };
+    std.debug.print("ok  kernel {s} maxTotalThreadsPerThreadgroup={d} staticThreadgroupMemoryLength={d}\n", .{
+        name,
+        objc.msgSend(u64, pso, "maxTotalThreadsPerThreadgroup", .{}),
+        objc.msgSend(u64, pso, "staticThreadgroupMemoryLength", .{}),
+    });
+    return true;
 }
 
 /// The running macOS version, from `kern.osproductversion` ("26.3"); null
@@ -736,6 +790,31 @@ fn testReduceKernel(device: objc.Object, pso: objc.Object) !void {
     }
     const o = out.items(f32);
     report("reduceKernel", bad == 0, "{d} mismatches (out[0]={d} out[{d}]={d})", .{ bad, o[0], groups - 1, o[groups - 1] });
+}
+
+/// barrierJoinKernel(out, tidx, tg_pos) in 16 threadgroups of 64: thread 0
+/// seeds a threadgroup counter with 0x40000000, every thread adds 1 between
+/// two barriers, threads 0 and 1 store the total at out[2g] and out[2g + 1].
+/// Every total must be 0x40000040. Without `convergent` on the barrier Metal
+/// jump-threads the barriers into the `tidx == 0` arm (measured on an M3,
+/// 2026-10-21, with the attribute left out of the assembler; docs/air-format.md).
+fn testBarrierJoinKernel(device: objc.Object, pso: objc.Object) !void {
+    const tg: u32 = 64;
+    const groups: u32 = 16;
+    const out = try SharedBuffer.create(device, 2 * groups * 4);
+    for (out.items(u32)) |*o| o.* = 0;
+
+    const d = try Dispatch.begin(device, pso);
+    d.setBuffer(out, 0);
+    d.dispatchThreadgroups(groups, tg);
+    try d.finish();
+
+    const words = out.items(u32);
+    var bad: usize = 0;
+    for (words) |total| {
+        if (total != 0x40000040) bad += 1;
+    }
+    report("barrierJoinKernel", bad == 0, "{d} of {d} totals wrong (thread 0 of group 0: 0x{x}, thread 1: 0x{x}; want 0x40000040)", .{ bad, words.len, words[0], words[1] });
 }
 
 /// twoStageKernel(in, out, gid, lane, sgid, nsg, tg_pos): out[g] = sum of

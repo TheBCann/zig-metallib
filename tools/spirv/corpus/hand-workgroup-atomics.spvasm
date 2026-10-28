@@ -1,0 +1,397 @@
+; hand-workgroup-atomics.spvasm: Workgroup memory, barriers and atomics (docs/spirv-plan.md stage 4,
+; SPIRV-DESIGN section 4 "Stage 4"), one GLCompute kernel per shape:
+;   tg_reverse        a threadgroup reverse: tile[lid] = in0[gid]; OpControlBarrier Workgroup; out[gid] = tile[63 - lid]
+;                     (the corpus driver's known-answer kernel for barriers)
+;   atomic_counter    OpAtomicIAdd on out[0] from every thread, the old value stored to out[gid + 1]
+;                     (the corpus driver's known-answer kernel for atomics)
+;   atomic_device     every atomic on a StorageBuffer pointer: IAdd ISub SMin SMax UMin UMax And Or Xor Exchange
+;                     CompareExchange Load Store, with Relaxed, Acquire, Release and AcquireRelease semantics
+;   atomic_workgroup  the same atomics on a Workgroup pointer, plus OpMemoryBarrier
+;   atomic_minmax64   OpAtomicSMax / SMin / UMax / UMin on 64-bit device slots m64[0..3] with the results unused
+;                     (Metal's only 64-bit read-modify-write atomics; the corpus driver checks the signed and
+;                     unsigned extremes of v = (in0 << 32) | in1 over every thread)
+;   atomic_fadd       OpAtomicFAddEXT of 0.5 on facc[0] from every thread, the old value stored to out[gid]
+;                     (the driver checks the old values are 0, 0.5, ..., in some order, and the sum)
+;   atomic_fxchg_tg   float atomics on a Workgroup float: OpAtomicStore 0.0, barrier, OpAtomicExchange of lid + 1,
+;                     barrier, OpAtomicLoad; out[gid] = old * 128 + final (the driver checks per workgroup that the
+;                     final value is one of 1..64 and the old values are the other 64 of 0..64)
+;   atomic_fadd_tg    the same with OpAtomicFAddEXT of 1.0: the final value must be 64 and the old values 0..63.
+;                     Metal builds `atomicrmw fadd ptr addrspace(3)` but computes a wrong answer (the final value
+;                     is 0.0, the old values 0..31 twice), so the lowering refuses it; the driver builds it anyway
+;                     (lower.Options.allow_metal_miscompiles) and expects the wrong answer, so a fix is noticed
+;   sg_reverse        a SIMD-group reverse through threadgroup memory: tile[lid] = in0[gid]; OpControlBarrier
+;                     Subgroup with memory scope Workgroup (a threadgroup fence, then air.simdgroup.barrier);
+;                     out[gid] = tile[lid - sglid + sgsize - 1 - sglid]
+; Standard Vulkan compute shape: bindings 0 in0 i32[4096] (NonWritable), 1 in1 i32[4096] (NonWritable),
+; 2 out i32[4096], 3 m64 u64[4], 4 facc f32[1]; LocalSize 64 1 1; Workgroup array tile: i32[64], Workgroup
+; float ftg.
+; Hand-written for this project's corpus in tools/spirv/asm.zig syntax (spirv-as compatible).
+; SPIR-V
+; Version: 1.3
+; Generator: 0x00000000
+OpCapability Shader
+OpCapability Int64
+OpCapability Int64Atomics
+OpCapability AtomicFloat32AddEXT
+OpCapability GroupNonUniform
+OpExtension "SPV_KHR_storage_buffer_storage_class"
+OpExtension "SPV_EXT_shader_atomic_float_add"
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %k_tg_reverse "tg_reverse" %gid %lid
+OpEntryPoint GLCompute %k_atomic_counter "atomic_counter" %gid
+OpEntryPoint GLCompute %k_atomic_device "atomic_device" %gid
+OpEntryPoint GLCompute %k_atomic_workgroup "atomic_workgroup" %gid %lid
+OpEntryPoint GLCompute %k_atomic_minmax64 "atomic_minmax64" %gid
+OpEntryPoint GLCompute %k_atomic_fadd "atomic_fadd" %gid
+OpEntryPoint GLCompute %k_atomic_fxchg_tg "atomic_fxchg_tg" %gid %lid
+OpEntryPoint GLCompute %k_atomic_fadd_tg "atomic_fadd_tg" %gid %lid
+OpEntryPoint GLCompute %k_sg_reverse "sg_reverse" %gid %lid %sglid %sgsize
+OpExecutionMode %k_tg_reverse LocalSize 64 1 1
+OpExecutionMode %k_atomic_counter LocalSize 64 1 1
+OpExecutionMode %k_atomic_device LocalSize 64 1 1
+OpExecutionMode %k_atomic_workgroup LocalSize 64 1 1
+OpExecutionMode %k_atomic_minmax64 LocalSize 64 1 1
+OpExecutionMode %k_atomic_fadd LocalSize 64 1 1
+OpExecutionMode %k_atomic_fxchg_tg LocalSize 64 1 1
+OpExecutionMode %k_atomic_fadd_tg LocalSize 64 1 1
+OpExecutionMode %k_sg_reverse LocalSize 64 1 1
+OpName %k_tg_reverse "tg_reverse"
+OpName %k_atomic_counter "atomic_counter"
+OpName %k_atomic_device "atomic_device"
+OpName %k_atomic_workgroup "atomic_workgroup"
+OpName %k_atomic_minmax64 "atomic_minmax64"
+OpName %k_atomic_fadd "atomic_fadd"
+OpName %k_atomic_fxchg_tg "atomic_fxchg_tg"
+OpName %k_atomic_fadd_tg "atomic_fadd_tg"
+OpName %k_sg_reverse "sg_reverse"
+OpName %ftg "ftg"
+OpName %sglid "sglid"
+OpName %sgsize "sgsize"
+OpName %m64 "m64"
+OpName %facc "facc"
+OpName %U64Buf "U64Buf"
+OpMemberName %U64Buf 0 "data"
+OpName %FBuf "FBuf"
+OpMemberName %FBuf 0 "data"
+OpName %in0 "in0"
+OpName %in1 "in1"
+OpName %out "out"
+OpName %tile "tile"
+OpName %counter "counter"
+OpName %gid "gid"
+OpName %lid "lid"
+OpName %IBuf "IBuf"
+OpMemberName %IBuf 0 "data"
+OpDecorate %gid BuiltIn GlobalInvocationId
+OpDecorate %lid BuiltIn LocalInvocationId
+OpDecorate %sglid BuiltIn SubgroupLocalInvocationId
+OpDecorate %sgsize BuiltIn SubgroupSize
+OpDecorate %i32arr ArrayStride 4
+OpDecorate %IBuf Block
+OpMemberDecorate %IBuf 0 Offset 0
+OpDecorate %in0 DescriptorSet 0
+OpDecorate %in0 Binding 0
+OpDecorate %in0 NonWritable
+OpDecorate %in1 DescriptorSet 0
+OpDecorate %in1 Binding 1
+OpDecorate %in1 NonWritable
+OpDecorate %out DescriptorSet 0
+OpDecorate %out Binding 2
+OpDecorate %u64arr ArrayStride 8
+OpDecorate %U64Buf Block
+OpMemberDecorate %U64Buf 0 Offset 0
+OpDecorate %m64 DescriptorSet 0
+OpDecorate %m64 Binding 3
+OpDecorate %f32arr ArrayStride 4
+OpDecorate %FBuf Block
+OpMemberDecorate %FBuf 0 Offset 0
+OpDecorate %facc DescriptorSet 0
+OpDecorate %facc Binding 4
+%void = OpTypeVoid
+%bool = OpTypeBool
+%u32 = OpTypeInt 32 0
+%i32 = OpTypeInt 32 1
+%v3u32 = OpTypeVector %u32 3
+%u64 = OpTypeInt 64 0
+%i64 = OpTypeInt 64 1
+%f32 = OpTypeFloat 32
+%fn_void = OpTypeFunction %void
+%c0 = OpConstant %u32 0
+%c1 = OpConstant %u32 1
+%c63 = OpConstant %u32 63
+%c64 = OpConstant %u32 64
+%c4096 = OpConstant %u32 4096
+%c2 = OpConstant %u32 2
+%c3 = OpConstant %u32 3
+%c4 = OpConstant %u32 4
+%c32_64 = OpConstant %u64 32
+%f_half = OpConstant %f32 0.5
+%f_zero = OpConstant %f32 0
+%f_one = OpConstant %f32 1
+%c128 = OpConstant %u32 128
+%scope_sg = OpConstant %u32 3
+%ci0 = OpConstant %i32 0
+%ci1 = OpConstant %i32 1
+%ci5 = OpConstant %i32 5
+%ci_3 = OpConstant %i32 -3
+%scope_wg = OpConstant %u32 2
+%scope_dev = OpConstant %u32 1
+%sem_relaxed = OpConstant %u32 0
+%sem_acq_wg = OpConstant %u32 258
+%sem_rel_wg = OpConstant %u32 260
+%sem_acqrel_wg = OpConstant %u32 264
+%sem_acqrel_dev = OpConstant %u32 72
+%sem_acq_dev = OpConstant %u32 66
+%sem_rel_dev = OpConstant %u32 68
+%i32arr = OpTypeArray %i32 %c4096
+%tilearr = OpTypeArray %i32 %c64
+%IBuf = OpTypeStruct %i32arr
+%p_IBuf = OpTypePointer StorageBuffer %IBuf
+%p_sb_i32 = OpTypePointer StorageBuffer %i32
+%p_wg_tile = OpTypePointer Workgroup %tilearr
+%p_wg_i32 = OpTypePointer Workgroup %i32
+%p_in_v3u32 = OpTypePointer Input %v3u32
+%p_in_u32 = OpTypePointer Input %u32
+%p_wg_f32 = OpTypePointer Workgroup %f32
+%u64arr = OpTypeArray %u64 %c4
+%U64Buf = OpTypeStruct %u64arr
+%p_U64Buf = OpTypePointer StorageBuffer %U64Buf
+%p_sb_u64 = OpTypePointer StorageBuffer %u64
+%f32arr = OpTypeArray %f32 %c1
+%FBuf = OpTypeStruct %f32arr
+%p_FBuf = OpTypePointer StorageBuffer %FBuf
+%p_sb_f32 = OpTypePointer StorageBuffer %f32
+%gid = OpVariable %p_in_v3u32 Input
+%lid = OpVariable %p_in_v3u32 Input
+%in0 = OpVariable %p_IBuf StorageBuffer
+%in1 = OpVariable %p_IBuf StorageBuffer
+%out = OpVariable %p_IBuf StorageBuffer
+%tile = OpVariable %p_wg_tile Workgroup
+%counter = OpVariable %p_wg_i32 Workgroup
+%m64 = OpVariable %p_U64Buf StorageBuffer
+%facc = OpVariable %p_FBuf StorageBuffer
+%ftg = OpVariable %p_wg_f32 Workgroup
+%sglid = OpVariable %p_in_u32 Input
+%sgsize = OpVariable %p_in_u32 Input
+; tg_reverse
+%k_tg_reverse = OpFunction %void None %fn_void
+%tr_entry = OpLabel
+%tr_g = OpLoad %v3u32 %gid
+%tr_i = OpCompositeExtract %u32 %tr_g 0
+%tr_l = OpLoad %v3u32 %lid
+%tr_li = OpCompositeExtract %u32 %tr_l 0
+%tr_pa = OpAccessChain %p_sb_i32 %in0 %c0 %tr_i
+%tr_a = OpLoad %i32 %tr_pa
+%tr_pt = OpAccessChain %p_wg_i32 %tile %tr_li
+OpStore %tr_pt %tr_a
+OpControlBarrier %scope_wg %scope_wg %sem_acqrel_wg
+%tr_ri = OpISub %u32 %c63 %tr_li
+%tr_pr = OpAccessChain %p_wg_i32 %tile %tr_ri
+%tr_r = OpLoad %i32 %tr_pr
+%tr_po = OpAccessChain %p_sb_i32 %out %c0 %tr_i
+OpStore %tr_po %tr_r
+OpReturn
+OpFunctionEnd
+; atomic_counter
+%k_atomic_counter = OpFunction %void None %fn_void
+%ac_entry = OpLabel
+%ac_g = OpLoad %v3u32 %gid
+%ac_i = OpCompositeExtract %u32 %ac_g 0
+%ac_pc = OpAccessChain %p_sb_i32 %out %c0 %c0
+%ac_old = OpAtomicIAdd %i32 %ac_pc %scope_dev %sem_relaxed %ci1
+%ac_i1 = OpIAdd %u32 %ac_i %c1
+%ac_po = OpAccessChain %p_sb_i32 %out %c0 %ac_i1
+OpStore %ac_po %ac_old
+OpReturn
+OpFunctionEnd
+; atomic_device
+%k_atomic_device = OpFunction %void None %fn_void
+%ad_entry = OpLabel
+%ad_g = OpLoad %v3u32 %gid
+%ad_i = OpCompositeExtract %u32 %ad_g 0
+%ad_pa = OpAccessChain %p_sb_i32 %in0 %c0 %ad_i
+%ad_a = OpLoad %i32 %ad_pa
+%ad_pb = OpAccessChain %p_sb_i32 %in1 %c0 %ad_i
+%ad_b = OpLoad %i32 %ad_pb
+%ad_slot = OpBitwiseAnd %u32 %ad_i %c63
+%ad_p = OpAccessChain %p_sb_i32 %out %c0 %ad_slot
+%ad_0 = OpAtomicIAdd %i32 %ad_p %scope_dev %sem_relaxed %ad_a
+%ad_1 = OpAtomicISub %i32 %ad_p %scope_dev %sem_acq_dev %ad_b
+%ad_2 = OpAtomicSMin %i32 %ad_p %scope_dev %sem_rel_dev %ad_a
+%ad_3 = OpAtomicSMax %i32 %ad_p %scope_dev %sem_acqrel_dev %ad_b
+%ad_4 = OpAtomicUMin %i32 %ad_p %scope_dev %sem_relaxed %ad_a
+%ad_5 = OpAtomicUMax %i32 %ad_p %scope_dev %sem_relaxed %ad_b
+%ad_6 = OpAtomicAnd %i32 %ad_p %scope_dev %sem_relaxed %ad_a
+%ad_7 = OpAtomicOr %i32 %ad_p %scope_dev %sem_relaxed %ad_b
+%ad_8 = OpAtomicXor %i32 %ad_p %scope_dev %sem_relaxed %ad_a
+%ad_9 = OpAtomicExchange %i32 %ad_p %scope_dev %sem_relaxed %ad_b
+%ad_10 = OpAtomicCompareExchange %i32 %ad_p %scope_dev %sem_acqrel_dev %sem_relaxed %ci5 %ad_b
+%ad_11 = OpAtomicLoad %i32 %ad_p %scope_dev %sem_acq_dev
+OpAtomicStore %ad_p %scope_dev %sem_rel_dev %ad_a
+%ad_s1 = OpIAdd %i32 %ad_0 %ad_1
+%ad_s2 = OpIAdd %i32 %ad_s1 %ad_2
+%ad_s3 = OpIAdd %i32 %ad_s2 %ad_3
+%ad_s4 = OpIAdd %i32 %ad_s3 %ad_4
+%ad_s5 = OpIAdd %i32 %ad_s4 %ad_5
+%ad_s6 = OpIAdd %i32 %ad_s5 %ad_6
+%ad_s7 = OpIAdd %i32 %ad_s6 %ad_7
+%ad_s8 = OpIAdd %i32 %ad_s7 %ad_8
+%ad_s9 = OpIAdd %i32 %ad_s8 %ad_9
+%ad_s10 = OpIAdd %i32 %ad_s9 %ad_10
+%ad_s11 = OpIAdd %i32 %ad_s10 %ad_11
+%ad_hi = OpIAdd %u32 %ad_i %c64
+%ad_po = OpAccessChain %p_sb_i32 %out %c0 %ad_hi
+OpStore %ad_po %ad_s11
+OpReturn
+OpFunctionEnd
+; atomic_workgroup
+%k_atomic_workgroup = OpFunction %void None %fn_void
+%aw_entry = OpLabel
+%aw_g = OpLoad %v3u32 %gid
+%aw_i = OpCompositeExtract %u32 %aw_g 0
+%aw_l = OpLoad %v3u32 %lid
+%aw_li = OpCompositeExtract %u32 %aw_l 0
+%aw_pa = OpAccessChain %p_sb_i32 %in0 %c0 %aw_i
+%aw_a = OpLoad %i32 %aw_pa
+%aw_pt = OpAccessChain %p_wg_i32 %tile %aw_li
+OpStore %aw_pt %ci0
+OpAtomicStore %counter %scope_wg %sem_rel_wg %ci0
+OpControlBarrier %scope_wg %scope_wg %sem_acqrel_wg
+%aw_slot = OpBitwiseAnd %u32 %aw_li %c1
+%aw_p = OpAccessChain %p_wg_i32 %tile %aw_slot
+%aw_0 = OpAtomicIAdd %i32 %aw_p %scope_wg %sem_relaxed %aw_a
+%aw_1 = OpAtomicISub %i32 %aw_p %scope_wg %sem_acq_wg %ci1
+%aw_2 = OpAtomicSMin %i32 %aw_p %scope_wg %sem_rel_wg %aw_a
+%aw_3 = OpAtomicSMax %i32 %aw_p %scope_wg %sem_acqrel_wg %ci_3
+%aw_4 = OpAtomicUMin %i32 %aw_p %scope_wg %sem_relaxed %aw_a
+%aw_5 = OpAtomicUMax %i32 %aw_p %scope_wg %sem_relaxed %ci5
+%aw_6 = OpAtomicAnd %i32 %aw_p %scope_wg %sem_relaxed %aw_a
+%aw_7 = OpAtomicOr %i32 %aw_p %scope_wg %sem_relaxed %ci1
+%aw_8 = OpAtomicXor %i32 %aw_p %scope_wg %sem_relaxed %aw_a
+%aw_9 = OpAtomicExchange %i32 %aw_p %scope_wg %sem_relaxed %ci5
+%aw_10 = OpAtomicCompareExchange %i32 %aw_p %scope_wg %sem_acqrel_wg %sem_relaxed %ci5 %aw_a
+%aw_11 = OpAtomicLoad %i32 %aw_p %scope_wg %sem_acq_wg
+%aw_c = OpAtomicIAdd %i32 %counter %scope_wg %sem_relaxed %ci1
+OpMemoryBarrier %scope_wg %sem_acqrel_wg
+OpControlBarrier %scope_wg %scope_wg %sem_acqrel_wg
+%aw_final = OpAtomicLoad %i32 %counter %scope_wg %sem_acq_wg
+%aw_s1 = OpIAdd %i32 %aw_0 %aw_1
+%aw_s2 = OpIAdd %i32 %aw_s1 %aw_2
+%aw_s3 = OpIAdd %i32 %aw_s2 %aw_3
+%aw_s4 = OpIAdd %i32 %aw_s3 %aw_4
+%aw_s5 = OpIAdd %i32 %aw_s4 %aw_5
+%aw_s6 = OpIAdd %i32 %aw_s5 %aw_6
+%aw_s7 = OpIAdd %i32 %aw_s6 %aw_7
+%aw_s8 = OpIAdd %i32 %aw_s7 %aw_8
+%aw_s9 = OpIAdd %i32 %aw_s8 %aw_9
+%aw_s10 = OpIAdd %i32 %aw_s9 %aw_10
+%aw_s11 = OpIAdd %i32 %aw_s10 %aw_11
+%aw_s12 = OpIAdd %i32 %aw_s11 %aw_c
+%aw_s13 = OpIMul %i32 %aw_s12 %aw_final
+%aw_po = OpAccessChain %p_sb_i32 %out %c0 %aw_i
+OpStore %aw_po %aw_s13
+OpReturn
+OpFunctionEnd
+; atomic_minmax64
+%k_atomic_minmax64 = OpFunction %void None %fn_void
+%mm_entry = OpLabel
+%mm_g = OpLoad %v3u32 %gid
+%mm_i = OpCompositeExtract %u32 %mm_g 0
+%mm_pa = OpAccessChain %p_sb_i32 %in0 %c0 %mm_i
+%mm_a = OpLoad %i32 %mm_pa
+%mm_pb = OpAccessChain %p_sb_i32 %in1 %c0 %mm_i
+%mm_b = OpLoad %i32 %mm_pb
+%mm_hi = OpSConvert %i64 %mm_a
+%mm_hs = OpShiftLeftLogical %i64 %mm_hi %c32_64
+%mm_bu = OpBitcast %u32 %mm_b
+%mm_lo = OpUConvert %u64 %mm_bu
+%mm_hu = OpBitcast %u64 %mm_hs
+%mm_v = OpBitwiseOr %u64 %mm_hu %mm_lo
+%mm_p0 = OpAccessChain %p_sb_u64 %m64 %c0 %c0
+%mm_p1 = OpAccessChain %p_sb_u64 %m64 %c0 %c1
+%mm_p2 = OpAccessChain %p_sb_u64 %m64 %c0 %c2
+%mm_p3 = OpAccessChain %p_sb_u64 %m64 %c0 %c3
+%mm_0 = OpAtomicSMax %u64 %mm_p0 %scope_dev %sem_relaxed %mm_v
+%mm_1 = OpAtomicSMin %u64 %mm_p1 %scope_dev %sem_relaxed %mm_v
+%mm_2 = OpAtomicUMax %u64 %mm_p2 %scope_dev %sem_relaxed %mm_v
+%mm_3 = OpAtomicUMin %u64 %mm_p3 %scope_dev %sem_relaxed %mm_v
+OpReturn
+OpFunctionEnd
+; atomic_fadd
+%k_atomic_fadd = OpFunction %void None %fn_void
+%fa_entry = OpLabel
+%fa_g = OpLoad %v3u32 %gid
+%fa_i = OpCompositeExtract %u32 %fa_g 0
+%fa_p = OpAccessChain %p_sb_f32 %facc %c0 %c0
+%fa_old = OpAtomicFAddEXT %f32 %fa_p %scope_dev %sem_relaxed %f_half
+%fa_bits = OpBitcast %i32 %fa_old
+%fa_po = OpAccessChain %p_sb_i32 %out %c0 %fa_i
+OpStore %fa_po %fa_bits
+OpReturn
+OpFunctionEnd
+; atomic_fxchg_tg
+%k_atomic_fxchg_tg = OpFunction %void None %fn_void
+%xf_entry = OpLabel
+%xf_g = OpLoad %v3u32 %gid
+%xf_i = OpCompositeExtract %u32 %xf_g 0
+%xf_l = OpLoad %v3u32 %lid
+%xf_li = OpCompositeExtract %u32 %xf_l 0
+%xf_lf = OpConvertUToF %f32 %xf_li
+%xf_v = OpFAdd %f32 %xf_lf %f_one
+OpAtomicStore %ftg %scope_wg %sem_relaxed %f_zero
+OpControlBarrier %scope_wg %scope_wg %sem_acqrel_wg
+%xf_old = OpAtomicExchange %f32 %ftg %scope_wg %sem_relaxed %xf_v
+OpControlBarrier %scope_wg %scope_wg %sem_acqrel_wg
+%xf_fin = OpAtomicLoad %f32 %ftg %scope_wg %sem_relaxed
+%xf_ou = OpConvertFToU %u32 %xf_old
+%xf_fu = OpConvertFToU %u32 %xf_fin
+%xf_hi = OpIMul %u32 %xf_ou %c128
+%xf_w = OpIAdd %u32 %xf_hi %xf_fu
+%xf_wi = OpBitcast %i32 %xf_w
+%xf_po = OpAccessChain %p_sb_i32 %out %c0 %xf_i
+OpStore %xf_po %xf_wi
+OpReturn
+OpFunctionEnd
+; atomic_fadd_tg
+%k_atomic_fadd_tg = OpFunction %void None %fn_void
+%ft_entry = OpLabel
+%ft_g = OpLoad %v3u32 %gid
+%ft_i = OpCompositeExtract %u32 %ft_g 0
+OpAtomicStore %ftg %scope_wg %sem_relaxed %f_zero
+OpControlBarrier %scope_wg %scope_wg %sem_acqrel_wg
+%ft_old = OpAtomicFAddEXT %f32 %ftg %scope_wg %sem_relaxed %f_one
+OpControlBarrier %scope_wg %scope_wg %sem_acqrel_wg
+%ft_fin = OpAtomicLoad %f32 %ftg %scope_wg %sem_relaxed
+%ft_ou = OpConvertFToU %u32 %ft_old
+%ft_fu = OpConvertFToU %u32 %ft_fin
+%ft_hi = OpIMul %u32 %ft_ou %c128
+%ft_w = OpIAdd %u32 %ft_hi %ft_fu
+%ft_wi = OpBitcast %i32 %ft_w
+%ft_po = OpAccessChain %p_sb_i32 %out %c0 %ft_i
+OpStore %ft_po %ft_wi
+OpReturn
+OpFunctionEnd
+; sg_reverse
+%k_sg_reverse = OpFunction %void None %fn_void
+%sr_entry = OpLabel
+%sr_g = OpLoad %v3u32 %gid
+%sr_i = OpCompositeExtract %u32 %sr_g 0
+%sr_l = OpLoad %v3u32 %lid
+%sr_li = OpCompositeExtract %u32 %sr_l 0
+%sr_sl = OpLoad %u32 %sglid
+%sr_ss = OpLoad %u32 %sgsize
+%sr_pa = OpAccessChain %p_sb_i32 %in0 %c0 %sr_i
+%sr_a = OpLoad %i32 %sr_pa
+%sr_pt = OpAccessChain %p_wg_i32 %tile %sr_li
+OpStore %sr_pt %sr_a
+OpControlBarrier %scope_sg %scope_wg %sem_acqrel_wg
+%sr_base = OpISub %u32 %sr_li %sr_sl
+%sr_ss1 = OpISub %u32 %sr_ss %c1
+%sr_rs = OpISub %u32 %sr_ss1 %sr_sl
+%sr_pi = OpIAdd %u32 %sr_base %sr_rs
+%sr_pr = OpAccessChain %p_wg_i32 %tile %sr_pi
+%sr_r = OpLoad %i32 %sr_pr
+%sr_po = OpAccessChain %p_sb_i32 %out %c0 %sr_i
+OpStore %sr_po %sr_r
+OpReturn
+OpFunctionEnd

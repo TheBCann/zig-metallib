@@ -1,0 +1,231 @@
+; hand-glslang-stage4.spvasm: barriers and atomics in the shapes glslang emits (docs/spirv.md "Barriers and
+; atomics"), written by hand in tools/spirv/asm.zig syntax in the shape glslangValidator -V (target Vulkan 1.0,
+; no optimizer) gives the GLSL below, with both entry points in one module. It is not glslang's output: glslang
+; is not installed here, so the shape was never compared with a real build. Generator 0x0008000b is glslang's id,
+; set to imitate it (nothing in the lowering keys on it).
+;
+;   #version 450
+;   layout(local_size_x = 64) in;
+;   layout(std430, binding = 0) readonly buffer In { uint data[]; } inb;
+;   layout(std430, binding = 1) buffer Out { uint data[]; } outb;
+;   layout(std430, binding = 2) buffer Counters { uint count; uint slot[16]; } cnt;
+;   shared uint sdata[64];
+;
+;   void reduce() {                                   // tree reduction, one sum per workgroup
+;     uint lid = gl_LocalInvocationID.x;
+;     sdata[lid] = inb.data[gl_GlobalInvocationID.x];
+;     barrier();
+;     for (uint s = gl_WorkGroupSize.x / 2u; s > 0u; s >>= 1) {
+;       if (lid < s) sdata[lid] += sdata[lid + s];
+;       barrier();                                    // in a loop bounded by a uniform value
+;     }
+;     if (lid == 0u) outb.data[gl_WorkGroupID.x] = sdata[0];
+;   }
+;   void atomics() {                                  // atomicAdd and atomicCompSwap on an SSBO
+;     uint gid = gl_GlobalInvocationID.x;
+;     uint old = atomicAdd(cnt.count, 1u);
+;     outb.data[gid] = old;
+;     uint prev = atomicCompSwap(cnt.slot[gid & 15u], 0u, gid + 1u);
+;     outb.data[gid + 4096u] = prev;
+;   }
+;
+; The glslang shape: SPIR-V 1.0 SSBOs (Uniform storage class + BufferBlock, so every atomic pointer is a Uniform
+; pointer into device memory), every local an OpVariable Function read and written with OpLoad / OpStore (the loop
+; counter `s` too: the uniformity analysis must see through it), builtins read through OpAccessChain on the Input
+; variable, struct members indexed by `int` constants, `barrier()` as OpControlBarrier Workgroup Workgroup
+; AcquireRelease|WorkgroupMemory (2 2 264), atomicAdd as OpAtomicIAdd Device Relaxed (1 0), atomicCompSwap as
+; OpAtomicCompareExchange Device Relaxed Relaxed with Value before Comparator, gl_WorkGroupSize as a BuiltIn
+; WorkgroupSize constant composite, structured loops with OpLoopMerge and a continue block.
+; tools/spirv/corpus_driver.zig runs both: `reduce` over 4096 inputs against the CPU's per-workgroup sums, `atomics`
+; over 4096 threads (the old counter values a permutation of 0..4095; per slot, exactly one thread swapped 0 for
+; gid + 1 and every other thread of that slot saw the winner's value).
+; SPIR-V
+; Version: 1.0
+; Generator: 0x0008000b
+; Schema: 0
+OpCapability Shader
+%1 = OpExtInstImport "GLSL.std.450"
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %reduce "reduce" %gl_LocalInvocationID %gl_GlobalInvocationID %gl_WorkGroupID
+OpEntryPoint GLCompute %atomics "atomics" %gl_GlobalInvocationID
+OpExecutionMode %reduce LocalSize 64 1 1
+OpExecutionMode %atomics LocalSize 64 1 1
+OpSource GLSL 450
+OpName %reduce "reduce"
+OpName %atomics "atomics"
+OpName %lid "lid"
+OpName %gl_LocalInvocationID "gl_LocalInvocationID"
+OpName %sdata "sdata"
+OpName %In "In"
+OpMemberName %In 0 "data"
+OpName %inb "inb"
+OpName %gl_GlobalInvocationID "gl_GlobalInvocationID"
+OpName %s "s"
+OpName %Out "Out"
+OpMemberName %Out 0 "data"
+OpName %outb "outb"
+OpName %gl_WorkGroupID "gl_WorkGroupID"
+OpName %gid "gid"
+OpName %old "old"
+OpName %Counters "Counters"
+OpMemberName %Counters 0 "count"
+OpMemberName %Counters 1 "slot"
+OpName %cnt "cnt"
+OpName %prev "prev"
+OpDecorate %gl_LocalInvocationID BuiltIn LocalInvocationId
+OpDecorate %_runtimearr_uint ArrayStride 4
+OpMemberDecorate %In 0 NonWritable
+OpMemberDecorate %In 0 Offset 0
+OpDecorate %In BufferBlock
+OpDecorate %inb DescriptorSet 0
+OpDecorate %inb Binding 0
+OpDecorate %gl_GlobalInvocationID BuiltIn GlobalInvocationId
+OpMemberDecorate %Out 0 Offset 0
+OpDecorate %Out BufferBlock
+OpDecorate %outb DescriptorSet 0
+OpDecorate %outb Binding 1
+OpDecorate %gl_WorkGroupID BuiltIn WorkgroupId
+OpDecorate %_arr_uint_uint_16 ArrayStride 4
+OpMemberDecorate %Counters 0 Offset 0
+OpMemberDecorate %Counters 1 Offset 4
+OpDecorate %Counters BufferBlock
+OpDecorate %cnt DescriptorSet 0
+OpDecorate %cnt Binding 2
+OpDecorate %gl_WorkGroupSize BuiltIn WorkgroupSize
+%void = OpTypeVoid
+%3 = OpTypeFunction %void
+%uint = OpTypeInt 32 0
+%_ptr_Function_uint = OpTypePointer Function %uint
+%v3uint = OpTypeVector %uint 3
+%_ptr_Input_v3uint = OpTypePointer Input %v3uint
+%gl_LocalInvocationID = OpVariable %_ptr_Input_v3uint Input
+%uint_0 = OpConstant %uint 0
+%_ptr_Input_uint = OpTypePointer Input %uint
+%uint_64 = OpConstant %uint 64
+%_arr_uint_uint_64 = OpTypeArray %uint %uint_64
+%_ptr_Workgroup__arr_uint_uint_64 = OpTypePointer Workgroup %_arr_uint_uint_64
+%sdata = OpVariable %_ptr_Workgroup__arr_uint_uint_64 Workgroup
+%_runtimearr_uint = OpTypeRuntimeArray %uint
+%In = OpTypeStruct %_runtimearr_uint
+%_ptr_Uniform_In = OpTypePointer Uniform %In
+%inb = OpVariable %_ptr_Uniform_In Uniform
+%int = OpTypeInt 32 1
+%int_0 = OpConstant %int 0
+%gl_GlobalInvocationID = OpVariable %_ptr_Input_v3uint Input
+%_ptr_Uniform_uint = OpTypePointer Uniform %uint
+%_ptr_Workgroup_uint = OpTypePointer Workgroup %uint
+%uint_2 = OpConstant %uint 2
+%uint_264 = OpConstant %uint 264
+%uint_1 = OpConstant %uint 1
+%gl_WorkGroupSize = OpConstantComposite %v3uint %uint_64 %uint_1 %uint_1
+%bool = OpTypeBool
+%int_1 = OpConstant %int 1
+%Out = OpTypeStruct %_runtimearr_uint
+%_ptr_Uniform_Out = OpTypePointer Uniform %Out
+%outb = OpVariable %_ptr_Uniform_Out Uniform
+%gl_WorkGroupID = OpVariable %_ptr_Input_v3uint Input
+%uint_16 = OpConstant %uint 16
+%_arr_uint_uint_16 = OpTypeArray %uint %uint_16
+%Counters = OpTypeStruct %uint %_arr_uint_uint_16
+%_ptr_Uniform_Counters = OpTypePointer Uniform %Counters
+%cnt = OpVariable %_ptr_Uniform_Counters Uniform
+%uint_15 = OpConstant %uint 15
+%uint_4096 = OpConstant %uint 4096
+%reduce = OpFunction %void None %3
+%5 = OpLabel
+%lid = OpVariable %_ptr_Function_uint Function
+%s = OpVariable %_ptr_Function_uint Function
+%14 = OpAccessChain %_ptr_Input_uint %gl_LocalInvocationID %uint_0
+%15 = OpLoad %uint %14
+OpStore %lid %15
+%20 = OpLoad %uint %lid
+%27 = OpAccessChain %_ptr_Input_uint %gl_GlobalInvocationID %uint_0
+%28 = OpLoad %uint %27
+%30 = OpAccessChain %_ptr_Uniform_uint %inb %int_0 %28
+%31 = OpLoad %uint %30
+%33 = OpAccessChain %_ptr_Workgroup_uint %sdata %20
+OpStore %33 %31
+OpControlBarrier %uint_2 %uint_2 %uint_264
+%36 = OpCompositeExtract %uint %gl_WorkGroupSize 0
+%37 = OpUDiv %uint %36 %uint_2
+OpStore %s %37
+OpBranch %40
+%40 = OpLabel
+OpLoopMerge %42 %43 None
+OpBranch %44
+%44 = OpLabel
+%45 = OpLoad %uint %s
+%47 = OpUGreaterThan %bool %45 %uint_0
+OpBranchConditional %47 %41 %42
+%41 = OpLabel
+%48 = OpLoad %uint %lid
+%49 = OpLoad %uint %s
+%50 = OpULessThan %bool %48 %49
+OpSelectionMerge %52 None
+OpBranchConditional %50 %51 %52
+%51 = OpLabel
+%53 = OpLoad %uint %lid
+%54 = OpLoad %uint %lid
+%55 = OpLoad %uint %s
+%56 = OpIAdd %uint %54 %55
+%57 = OpAccessChain %_ptr_Workgroup_uint %sdata %56
+%58 = OpLoad %uint %57
+%59 = OpAccessChain %_ptr_Workgroup_uint %sdata %53
+%60 = OpLoad %uint %59
+%61 = OpIAdd %uint %60 %58
+%62 = OpAccessChain %_ptr_Workgroup_uint %sdata %53
+OpStore %62 %61
+OpBranch %52
+%52 = OpLabel
+OpControlBarrier %uint_2 %uint_2 %uint_264
+OpBranch %43
+%43 = OpLabel
+%63 = OpLoad %uint %s
+%65 = OpShiftRightLogical %uint %63 %int_1
+OpStore %s %65
+OpBranch %40
+%42 = OpLabel
+%66 = OpLoad %uint %lid
+%67 = OpIEqual %bool %66 %uint_0
+OpSelectionMerge %69 None
+OpBranchConditional %67 %68 %69
+%68 = OpLabel
+%74 = OpAccessChain %_ptr_Input_uint %gl_WorkGroupID %uint_0
+%75 = OpLoad %uint %74
+%76 = OpAccessChain %_ptr_Workgroup_uint %sdata %int_0
+%77 = OpLoad %uint %76
+%78 = OpAccessChain %_ptr_Uniform_uint %outb %int_0 %75
+OpStore %78 %77
+OpBranch %69
+%69 = OpLabel
+OpReturn
+OpFunctionEnd
+%atomics = OpFunction %void None %3
+%80 = OpLabel
+%gid = OpVariable %_ptr_Function_uint Function
+%old = OpVariable %_ptr_Function_uint Function
+%prev = OpVariable %_ptr_Function_uint Function
+%84 = OpAccessChain %_ptr_Input_uint %gl_GlobalInvocationID %uint_0
+%85 = OpLoad %uint %84
+OpStore %gid %85
+%87 = OpAccessChain %_ptr_Uniform_uint %cnt %int_0
+%88 = OpAtomicIAdd %uint %87 %uint_1 %uint_0 %uint_1
+OpStore %old %88
+%89 = OpLoad %uint %gid
+%90 = OpLoad %uint %old
+%91 = OpAccessChain %_ptr_Uniform_uint %outb %int_0 %89
+OpStore %91 %90
+%93 = OpLoad %uint %gid
+%94 = OpBitwiseAnd %uint %93 %uint_15
+%95 = OpAccessChain %_ptr_Uniform_uint %cnt %int_1 %94
+%96 = OpLoad %uint %gid
+%97 = OpIAdd %uint %96 %uint_1
+%98 = OpAtomicCompareExchange %uint %95 %uint_1 %uint_0 %uint_0 %97 %uint_0
+OpStore %prev %98
+%99 = OpLoad %uint %gid
+%100 = OpIAdd %uint %99 %uint_4096
+%101 = OpLoad %uint %prev
+%102 = OpAccessChain %_ptr_Uniform_uint %outb %int_0 %100
+OpStore %102 %101
+OpReturn
+OpFunctionEnd

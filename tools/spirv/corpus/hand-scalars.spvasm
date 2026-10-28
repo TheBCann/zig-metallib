@@ -1,0 +1,449 @@
+; hand-scalars.spvasm: the scalar instructions of docs/spirv-plan.md stage 1 (SPIRV-DESIGN section 4),
+; one GLCompute kernel per group so a refusal by Metal's runtime compiler is attributable:
+;   bool_locals        a Function-storage bool variable (stored, loaded, selected on), OpLogical*, OpSelect
+;   int_arith          + - * sdiv udiv srem umod smod (signs: OpSMod floors, OpSRem truncates), shifts, bit ops, OpSNegate, OpNot
+;   int_compare        every integer comparison folded into one word
+;   narrow_wide        i8/i16/i64 arithmetic with OpSConvert/OpUConvert both ways, OpBitcast int<->float
+;   carry_extended     OpIAddCarry, OpISubBorrow, OpUMulExtended, OpSMulExtended (struct results, OpCompositeExtract)
+;   bit_fields         OpBitCount, OpBitReverse, OpBitFieldUExtract, OpBitFieldSExtract, OpBitFieldInsert
+;   float_arith        f32 + - * / OpFRem OpFMod OpFNegate, every float comparison (ordered and unordered), OpIsNan, OpIsInf
+;   float_convert      OpConvertFToS/FToU/SToF/UToF, OpFConvert f32<->f16<->f64 (Float16 and Float64 capabilities)
+; Standard Vulkan compute shape: bindings 0 in0 i32[4096] (NonWritable), 1 in1 i32[4096] (NonWritable),
+; 2 out i32[4096]; floats travel through the i32 buffers via OpBitcast; LocalSize 64 1 1.
+; Hand-written for this project's corpus in tools/spirv/asm.zig syntax (spirv-as compatible).
+; SPIR-V
+; Version: 1.3
+; Generator: 0x00000000
+OpCapability Shader
+OpCapability Int8
+OpCapability Int16
+OpCapability Int64
+OpCapability Float16
+OpCapability Float64
+OpExtension "SPV_KHR_storage_buffer_storage_class"
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %k_bool_locals "bool_locals" %gid
+OpEntryPoint GLCompute %k_int_arith "int_arith" %gid
+OpEntryPoint GLCompute %k_int_compare "int_compare" %gid
+OpEntryPoint GLCompute %k_narrow_wide "narrow_wide" %gid
+OpEntryPoint GLCompute %k_carry_extended "carry_extended" %gid
+OpEntryPoint GLCompute %k_bit_fields "bit_fields" %gid
+OpEntryPoint GLCompute %k_float_arith "float_arith" %gid
+OpEntryPoint GLCompute %k_float_convert "float_convert" %gid
+OpExecutionMode %k_bool_locals LocalSize 64 1 1
+OpExecutionMode %k_int_arith LocalSize 64 1 1
+OpExecutionMode %k_int_compare LocalSize 64 1 1
+OpExecutionMode %k_narrow_wide LocalSize 64 1 1
+OpExecutionMode %k_carry_extended LocalSize 64 1 1
+OpExecutionMode %k_bit_fields LocalSize 64 1 1
+OpExecutionMode %k_float_arith LocalSize 64 1 1
+OpExecutionMode %k_float_convert LocalSize 64 1 1
+OpName %k_bool_locals "bool_locals"
+OpName %k_int_arith "int_arith"
+OpName %k_int_compare "int_compare"
+OpName %k_narrow_wide "narrow_wide"
+OpName %k_carry_extended "carry_extended"
+OpName %k_bit_fields "bit_fields"
+OpName %k_float_arith "float_arith"
+OpName %k_float_convert "float_convert"
+OpName %in0 "in0"
+OpName %in1 "in1"
+OpName %out "out"
+OpName %gid "gid"
+OpName %IBuf "IBuf"
+OpMemberName %IBuf 0 "data"
+OpName %load_ab "load_ab"
+OpDecorate %gid BuiltIn GlobalInvocationId
+OpDecorate %i32arr ArrayStride 4
+OpDecorate %IBuf Block
+OpMemberDecorate %IBuf 0 Offset 0
+OpDecorate %in0 DescriptorSet 0
+OpDecorate %in0 Binding 0
+OpDecorate %in0 NonWritable
+OpDecorate %in1 DescriptorSet 0
+OpDecorate %in1 Binding 1
+OpDecorate %in1 NonWritable
+OpDecorate %out DescriptorSet 0
+OpDecorate %out Binding 2
+%void = OpTypeVoid
+%bool = OpTypeBool
+%u32 = OpTypeInt 32 0
+%i32 = OpTypeInt 32 1
+%i8 = OpTypeInt 8 1
+%u8 = OpTypeInt 8 0
+%i16 = OpTypeInt 16 1
+%u16 = OpTypeInt 16 0
+%i64 = OpTypeInt 64 1
+%u64 = OpTypeInt 64 0
+%f16 = OpTypeFloat 16
+%f32 = OpTypeFloat 32
+%f64 = OpTypeFloat 64
+%v3u32 = OpTypeVector %u32 3
+%v2i32 = OpTypeVector %i32 2
+%pair_u32 = OpTypeStruct %u32 %u32
+%pair_i32 = OpTypeStruct %i32 %i32
+%fn_void = OpTypeFunction %void
+%fn_pair = OpTypeFunction %v2i32 %u32
+%c0 = OpConstant %u32 0
+%c1 = OpConstant %u32 1
+%c2 = OpConstant %u32 2
+%c3 = OpConstant %u32 3
+%c4 = OpConstant %u32 4
+%c5 = OpConstant %u32 5
+%c8 = OpConstant %u32 8
+%c31 = OpConstant %u32 31
+%c4096 = OpConstant %u32 4096
+%ci0 = OpConstant %i32 0
+%ci1 = OpConstant %i32 1
+%ci_1 = OpConstant %i32 -1
+%ci7 = OpConstant %i32 7
+%ci_7 = OpConstant %i32 -7
+%ci100 = OpConstant %i32 100
+%ci_min = OpConstant %i32 -2147483648
+%ci64_3 = OpConstant %i64 3
+%ci64_big = OpConstant %i64 -4294967296
+%cu64_1 = OpConstant %u64 1
+%ci8_3 = OpConstant %i8 3
+%ci16_300 = OpConstant %i16 300
+%cu16_1 = OpConstant %u16 1
+%cu8_1 = OpConstant %u8 1
+%f_0 = OpConstant %f32 0
+%f_half = OpConstant %f32 0.5
+%f_1p5 = OpConstant %f32 1.5
+%f_3 = OpConstant %f32 3
+%f_neg2 = OpConstant %f32 -2
+%f_nan = OpConstant %f32 nan
+%f_nan2 = OpConstant %f32 0x7fc00001
+%f_inf = OpConstant %f32 inf
+%f_big = OpConstant %f32 -3.4028235e38
+%f_small = OpConstant %f32 1e-7
+%h_1 = OpConstant %f16 1
+%h_pi = OpConstant %f16 3.140625
+%d_pi = OpConstant %f64 3.141592653589793
+%d_tiny = OpConstant %f64 1e-300
+%true = OpConstantTrue %bool
+%false = OpConstantFalse %bool
+%i32arr = OpTypeArray %i32 %c4096
+%IBuf = OpTypeStruct %i32arr
+%p_IBuf = OpTypePointer StorageBuffer %IBuf
+%p_sb_i32 = OpTypePointer StorageBuffer %i32
+%p_in_v3u32 = OpTypePointer Input %v3u32
+%p_fn_bool = OpTypePointer Function %bool
+%p_fn_i32 = OpTypePointer Function %i32
+%gid = OpVariable %p_in_v3u32 Input
+%in0 = OpVariable %p_IBuf StorageBuffer
+%in1 = OpVariable %p_IBuf StorageBuffer
+%out = OpVariable %p_IBuf StorageBuffer
+; load_ab(i) -> (in0[i], in1[i]) as a 2-vector: a helper every kernel calls.
+%load_ab = OpFunction %v2i32 None %fn_pair
+%lab_i = OpFunctionParameter %u32
+%lab_entry = OpLabel
+%lab_pa = OpAccessChain %p_sb_i32 %in0 %c0 %lab_i
+%lab_a = OpLoad %i32 %lab_pa
+%lab_pb = OpAccessChain %p_sb_i32 %in1 %c0 %lab_i
+%lab_b = OpLoad %i32 %lab_pb
+%lab_r = OpCompositeConstruct %v2i32 %lab_a %lab_b
+OpReturnValue %lab_r
+OpFunctionEnd
+; bool_locals
+%k_bool_locals = OpFunction %void None %fn_void
+%bl_entry = OpLabel
+%bl_flag = OpVariable %p_fn_bool Function %false
+%bl_acc = OpVariable %p_fn_i32 Function
+%bl_g = OpLoad %v3u32 %gid
+%bl_i = OpCompositeExtract %u32 %bl_g 0
+%bl_ab = OpFunctionCall %v2i32 %load_ab %bl_i
+%bl_a = OpCompositeExtract %i32 %bl_ab 0
+%bl_b = OpCompositeExtract %i32 %bl_ab 1
+%bl_lt = OpSLessThan %bool %bl_a %bl_b
+OpStore %bl_flag %bl_lt
+%bl_f1 = OpLoad %bool %bl_flag
+%bl_eq = OpIEqual %bool %bl_a %bl_b
+%bl_or = OpLogicalOr %bool %bl_f1 %bl_eq
+%bl_and = OpLogicalAnd %bool %bl_or %true
+%bl_ne = OpLogicalNotEqual %bool %bl_and %false
+%bl_leq = OpLogicalEqual %bool %bl_ne %bl_f1
+%bl_not = OpLogicalNot %bool %bl_leq
+OpStore %bl_flag %bl_not
+%bl_f2 = OpLoad %bool %bl_flag
+%bl_sel = OpSelect %i32 %bl_f2 %bl_a %bl_b
+OpStore %bl_acc %bl_sel
+%bl_acc1 = OpLoad %i32 %bl_acc
+%bl_z = OpSelect %i32 %bl_lt %ci1 %ci0
+%bl_r = OpIAdd %i32 %bl_acc1 %bl_z
+%bl_po = OpAccessChain %p_sb_i32 %out %c0 %bl_i
+OpStore %bl_po %bl_r
+OpReturn
+OpFunctionEnd
+; int_arith
+%k_int_arith = OpFunction %void None %fn_void
+%ia_entry = OpLabel
+%ia_g = OpLoad %v3u32 %gid
+%ia_i = OpCompositeExtract %u32 %ia_g 0
+%ia_ab = OpFunctionCall %v2i32 %load_ab %ia_i
+%ia_a = OpCompositeExtract %i32 %ia_ab 0
+%ia_b = OpCompositeExtract %i32 %ia_ab 1
+%ia_add = OpIAdd %i32 %ia_a %ia_b
+%ia_sub = OpISub %i32 %ia_add %ia_b
+%ia_mul = OpIMul %i32 %ia_sub %ci7
+; guard the divisors: b | 1 is never zero, and (b | 1) != -1 is not guaranteed, so the
+; dividend is masked to a non-minimum value first.
+%ia_d = OpBitwiseOr %i32 %ia_b %ci1
+%ia_n = OpBitwiseAnd %i32 %ia_mul %ci100
+%ia_sdiv = OpSDiv %i32 %ia_n %ia_d
+%ia_srem = OpSRem %i32 %ia_n %ia_d
+%ia_smod = OpSMod %i32 %ia_n %ia_d
+%ia_du = OpBitcast %u32 %ia_d
+%ia_nu = OpBitcast %u32 %ia_n
+%ia_udiv = OpUDiv %u32 %ia_nu %ia_du
+%ia_umod = OpUMod %u32 %ia_nu %ia_du
+%ia_udivi = OpBitcast %i32 %ia_udiv
+%ia_umodi = OpBitcast %i32 %ia_umod
+%ia_s1 = OpIAdd %i32 %ia_sdiv %ia_srem
+%ia_s2 = OpIAdd %i32 %ia_s1 %ia_smod
+%ia_s3 = OpIAdd %i32 %ia_s2 %ia_udivi
+%ia_s4 = OpIAdd %i32 %ia_s3 %ia_umodi
+%ia_sh = OpBitwiseAnd %u32 %ia_du %c31
+%ia_shl = OpShiftLeftLogical %i32 %ia_s4 %ia_sh
+%ia_lshr = OpShiftRightLogical %i32 %ia_shl %c3
+%ia_ashr = OpShiftRightArithmetic %i32 %ia_lshr %ia_sh
+%ia_and = OpBitwiseAnd %i32 %ia_ashr %ia_a
+%ia_or = OpBitwiseOr %i32 %ia_and %ci7
+%ia_xor = OpBitwiseXor %i32 %ia_or %ia_b
+%ia_not = OpNot %i32 %ia_xor
+%ia_neg = OpSNegate %i32 %ia_not
+%ia_po = OpAccessChain %p_sb_i32 %out %c0 %ia_i
+OpStore %ia_po %ia_neg
+OpReturn
+OpFunctionEnd
+; int_compare: fold the ten comparisons into a bit mask
+%k_int_compare = OpFunction %void None %fn_void
+%ic_entry = OpLabel
+%ic_g = OpLoad %v3u32 %gid
+%ic_i = OpCompositeExtract %u32 %ic_g 0
+%ic_ab = OpFunctionCall %v2i32 %load_ab %ic_i
+%ic_a = OpCompositeExtract %i32 %ic_ab 0
+%ic_b = OpCompositeExtract %i32 %ic_ab 1
+%ic_au = OpBitcast %u32 %ic_a
+%ic_bu = OpBitcast %u32 %ic_b
+%ic_0 = OpIEqual %bool %ic_a %ic_b
+%ic_1 = OpINotEqual %bool %ic_a %ic_b
+%ic_2 = OpSLessThan %bool %ic_a %ic_b
+%ic_3 = OpSLessThanEqual %bool %ic_a %ic_b
+%ic_4 = OpSGreaterThan %bool %ic_a %ic_b
+%ic_5 = OpSGreaterThanEqual %bool %ic_a %ic_b
+%ic_6 = OpULessThan %bool %ic_au %ic_bu
+%ic_7 = OpULessThanEqual %bool %ic_au %ic_bu
+%ic_8 = OpUGreaterThan %bool %ic_au %ic_bu
+%ic_9 = OpUGreaterThanEqual %bool %ic_au %ic_bu
+%ic_v0 = OpSelect %i32 %ic_0 %ci1 %ci0
+%ic_v1 = OpSelect %i32 %ic_1 %ci1 %ci0
+%ic_v2 = OpSelect %i32 %ic_2 %ci1 %ci0
+%ic_v3 = OpSelect %i32 %ic_3 %ci1 %ci0
+%ic_v4 = OpSelect %i32 %ic_4 %ci1 %ci0
+%ic_v5 = OpSelect %i32 %ic_5 %ci1 %ci0
+%ic_v6 = OpSelect %i32 %ic_6 %ci1 %ci0
+%ic_v7 = OpSelect %i32 %ic_7 %ci1 %ci0
+%ic_v8 = OpSelect %i32 %ic_8 %ci1 %ci0
+%ic_v9 = OpSelect %i32 %ic_9 %ci1 %ci0
+%ic_s1 = OpShiftLeftLogical %i32 %ic_v1 %c1
+%ic_s2 = OpShiftLeftLogical %i32 %ic_v2 %c2
+%ic_s3 = OpShiftLeftLogical %i32 %ic_v3 %c3
+%ic_s4 = OpShiftLeftLogical %i32 %ic_v4 %c4
+%ic_s5 = OpShiftLeftLogical %i32 %ic_v5 %c5
+%ic_s6 = OpShiftLeftLogical %i32 %ic_v6 %c8
+%ic_s7 = OpShiftLeftLogical %i32 %ic_v7 %c31
+%ic_m1 = OpBitwiseOr %i32 %ic_v0 %ic_s1
+%ic_m2 = OpBitwiseOr %i32 %ic_m1 %ic_s2
+%ic_m3 = OpBitwiseOr %i32 %ic_m2 %ic_s3
+%ic_m4 = OpBitwiseOr %i32 %ic_m3 %ic_s4
+%ic_m5 = OpBitwiseOr %i32 %ic_m4 %ic_s5
+%ic_m6 = OpBitwiseOr %i32 %ic_m5 %ic_s6
+%ic_m7 = OpBitwiseOr %i32 %ic_m6 %ic_s7
+%ic_m8 = OpIAdd %i32 %ic_m7 %ic_v8
+%ic_m9 = OpIAdd %i32 %ic_m8 %ic_v9
+%ic_po = OpAccessChain %p_sb_i32 %out %c0 %ic_i
+OpStore %ic_po %ic_m9
+OpReturn
+OpFunctionEnd
+; narrow_wide: i8 / i16 / i64 arithmetic through the conversions
+%k_narrow_wide = OpFunction %void None %fn_void
+%nw_entry = OpLabel
+%nw_g = OpLoad %v3u32 %gid
+%nw_i = OpCompositeExtract %u32 %nw_g 0
+%nw_ab = OpFunctionCall %v2i32 %load_ab %nw_i
+%nw_a = OpCompositeExtract %i32 %nw_ab 0
+%nw_b = OpCompositeExtract %i32 %nw_ab 1
+%nw_a8 = OpSConvert %i8 %nw_a
+%nw_b8 = OpSConvert %i8 %nw_b
+%nw_m8 = OpIMul %i8 %nw_a8 %nw_b8
+%nw_p8 = OpIAdd %i8 %nw_m8 %ci8_3
+%nw_u8 = OpBitcast %u8 %nw_p8
+%nw_u8s = OpShiftRightLogical %u8 %nw_u8 %cu8_1
+%nw_w8 = OpUConvert %u32 %nw_u8s
+%nw_w8i = OpBitcast %i32 %nw_w8
+%nw_a16 = OpSConvert %i16 %nw_a
+%nw_s16 = OpISub %i16 %nw_a16 %ci16_300
+%nw_u16 = OpBitcast %u16 %nw_s16
+%nw_u16s = OpShiftLeftLogical %u16 %nw_u16 %cu16_1
+%nw_w16 = OpUConvert %u32 %nw_u16s
+%nw_w16i = OpBitcast %i32 %nw_w16
+%nw_x16 = OpSConvert %i32 %nw_s16
+%nw_a64 = OpSConvert %i64 %nw_a
+%nw_b64 = OpSConvert %i64 %nw_b
+%nw_m64 = OpIMul %i64 %nw_a64 %nw_b64
+%nw_p64 = OpIAdd %i64 %nw_m64 %ci64_big
+%nw_q64 = OpIMul %i64 %nw_p64 %ci64_3
+%nw_u64 = OpBitcast %u64 %nw_q64
+%nw_u64s = OpShiftRightLogical %u64 %nw_u64 %cu64_1
+%nw_hi = OpShiftRightLogical %u64 %nw_u64s %c31
+%nw_hi32 = OpUConvert %u32 %nw_hi
+%nw_lo32 = OpUConvert %u32 %nw_u64s
+%nw_h = OpBitwiseXor %u32 %nw_hi32 %nw_lo32
+%nw_hi_i = OpBitcast %i32 %nw_h
+%nw_lt64 = OpSLessThan %bool %nw_q64 %ci64_3
+%nw_sel = OpSelect %i32 %nw_lt64 %nw_hi_i %nw_x16
+%nw_s1 = OpIAdd %i32 %nw_w8i %nw_w16i
+%nw_s2 = OpIAdd %i32 %nw_s1 %nw_sel
+%nw_fa = OpBitcast %f32 %nw_a
+%nw_fi = OpBitcast %i32 %nw_fa
+%nw_s3 = OpIAdd %i32 %nw_s2 %nw_fi
+%nw_po = OpAccessChain %p_sb_i32 %out %c0 %nw_i
+OpStore %nw_po %nw_s3
+OpReturn
+OpFunctionEnd
+; carry_extended
+%k_carry_extended = OpFunction %void None %fn_void
+%ce_entry = OpLabel
+%ce_g = OpLoad %v3u32 %gid
+%ce_i = OpCompositeExtract %u32 %ce_g 0
+%ce_ab = OpFunctionCall %v2i32 %load_ab %ce_i
+%ce_a = OpCompositeExtract %i32 %ce_ab 0
+%ce_b = OpCompositeExtract %i32 %ce_ab 1
+%ce_au = OpBitcast %u32 %ce_a
+%ce_bu = OpBitcast %u32 %ce_b
+%ce_add = OpIAddCarry %pair_u32 %ce_au %ce_bu
+%ce_add_lo = OpCompositeExtract %u32 %ce_add 0
+%ce_add_c = OpCompositeExtract %u32 %ce_add 1
+%ce_sub = OpISubBorrow %pair_u32 %ce_au %ce_bu
+%ce_sub_lo = OpCompositeExtract %u32 %ce_sub 0
+%ce_sub_b = OpCompositeExtract %u32 %ce_sub 1
+%ce_um = OpUMulExtended %pair_u32 %ce_au %ce_bu
+%ce_um_lo = OpCompositeExtract %u32 %ce_um 0
+%ce_um_hi = OpCompositeExtract %u32 %ce_um 1
+%ce_sm = OpSMulExtended %pair_i32 %ce_a %ce_b
+%ce_sm_lo = OpCompositeExtract %i32 %ce_sm 0
+%ce_sm_hi = OpCompositeExtract %i32 %ce_sm 1
+%ce_s1 = OpIAdd %u32 %ce_add_lo %ce_add_c
+%ce_s2 = OpIAdd %u32 %ce_s1 %ce_sub_lo
+%ce_s3 = OpIAdd %u32 %ce_s2 %ce_sub_b
+%ce_s4 = OpIAdd %u32 %ce_s3 %ce_um_lo
+%ce_s5 = OpBitwiseXor %u32 %ce_s4 %ce_um_hi
+%ce_s5i = OpBitcast %i32 %ce_s5
+%ce_s6 = OpIAdd %i32 %ce_s5i %ce_sm_lo
+%ce_s7 = OpBitwiseXor %i32 %ce_s6 %ce_sm_hi
+%ce_po = OpAccessChain %p_sb_i32 %out %c0 %ce_i
+OpStore %ce_po %ce_s7
+OpReturn
+OpFunctionEnd
+; bit_fields
+%k_bit_fields = OpFunction %void None %fn_void
+%bf_entry = OpLabel
+%bf_g = OpLoad %v3u32 %gid
+%bf_i = OpCompositeExtract %u32 %bf_g 0
+%bf_ab = OpFunctionCall %v2i32 %load_ab %bf_i
+%bf_a = OpCompositeExtract %i32 %bf_ab 0
+%bf_b = OpCompositeExtract %i32 %bf_ab 1
+%bf_au = OpBitcast %u32 %bf_a
+%bf_cnt = OpBitCount %i32 %bf_a
+%bf_rev = OpBitReverse %u32 %bf_au
+%bf_off = OpBitwiseAnd %u32 %bf_au %c8
+%bf_ue = OpBitFieldUExtract %u32 %bf_rev %bf_off %c5
+%bf_se = OpBitFieldSExtract %i32 %bf_b %c4 %c8
+%bf_ins = OpBitFieldInsert %i32 %bf_a %bf_b %c3 %c5
+%bf_uei = OpBitcast %i32 %bf_ue
+%bf_s1 = OpIAdd %i32 %bf_cnt %bf_uei
+%bf_s2 = OpIAdd %i32 %bf_s1 %bf_se
+%bf_s3 = OpBitwiseXor %i32 %bf_s2 %bf_ins
+%bf_po = OpAccessChain %p_sb_i32 %out %c0 %bf_i
+OpStore %bf_po %bf_s3
+OpReturn
+OpFunctionEnd
+; float_arith
+%k_float_arith = OpFunction %void None %fn_void
+%fa_entry = OpLabel
+%fa_g = OpLoad %v3u32 %gid
+%fa_i = OpCompositeExtract %u32 %fa_g 0
+%fa_ab = OpFunctionCall %v2i32 %load_ab %fa_i
+%fa_ai = OpCompositeExtract %i32 %fa_ab 0
+%fa_bi = OpCompositeExtract %i32 %fa_ab 1
+%fa_a = OpBitcast %f32 %fa_ai
+%fa_b = OpBitcast %f32 %fa_bi
+%fa_add = OpFAdd %f32 %fa_a %fa_b
+%fa_sub = OpFSub %f32 %fa_add %f_1p5
+%fa_mul = OpFMul %f32 %fa_sub %f_3
+%fa_div = OpFDiv %f32 %fa_mul %f_neg2
+%fa_rem = OpFRem %f32 %fa_div %fa_b
+%fa_mod = OpFMod %f32 %fa_div %fa_b
+%fa_neg = OpFNegate %f32 %fa_mod
+%fa_0 = OpFOrdEqual %bool %fa_a %fa_b
+%fa_1 = OpFOrdNotEqual %bool %fa_a %fa_b
+%fa_2 = OpFOrdLessThan %bool %fa_a %fa_b
+%fa_3 = OpFOrdLessThanEqual %bool %fa_a %fa_b
+%fa_4 = OpFOrdGreaterThan %bool %fa_a %fa_b
+%fa_5 = OpFOrdGreaterThanEqual %bool %fa_a %fa_b
+%fa_6 = OpFUnordEqual %bool %fa_a %fa_b
+%fa_7 = OpFUnordNotEqual %bool %fa_a %fa_b
+%fa_8 = OpFUnordLessThan %bool %fa_a %fa_b
+%fa_9 = OpFUnordLessThanEqual %bool %fa_a %fa_b
+%fa_10 = OpFUnordGreaterThan %bool %fa_a %fa_b
+%fa_11 = OpFUnordGreaterThanEqual %bool %fa_a %fa_b
+%fa_nan = OpIsNan %bool %fa_rem
+%fa_inf = OpIsInf %bool %fa_div
+%fa_s0 = OpSelect %f32 %fa_0 %f_1p5 %f_0
+%fa_s1 = OpSelect %f32 %fa_1 %fa_neg %fa_s0
+%fa_s2 = OpSelect %f32 %fa_2 %fa_s1 %f_half
+%fa_s3 = OpSelect %f32 %fa_3 %fa_s2 %f_nan
+%fa_s4 = OpSelect %f32 %fa_4 %fa_s3 %f_nan2
+%fa_s5 = OpSelect %f32 %fa_5 %fa_s4 %f_inf
+%fa_s6 = OpSelect %f32 %fa_6 %fa_s5 %f_big
+%fa_s7 = OpSelect %f32 %fa_7 %fa_s6 %f_small
+%fa_s8 = OpSelect %f32 %fa_8 %fa_s7 %fa_a
+%fa_s9 = OpSelect %f32 %fa_9 %fa_s8 %fa_b
+%fa_s10 = OpSelect %f32 %fa_10 %fa_s9 %fa_rem
+%fa_s11 = OpSelect %f32 %fa_11 %fa_s10 %fa_mod
+%fa_s12 = OpSelect %f32 %fa_nan %f_0 %fa_s11
+%fa_s13 = OpSelect %f32 %fa_inf %f_1p5 %fa_s12
+%fa_ri = OpBitcast %i32 %fa_s13
+%fa_po = OpAccessChain %p_sb_i32 %out %c0 %fa_i
+OpStore %fa_po %fa_ri
+OpReturn
+OpFunctionEnd
+; float_convert
+%k_float_convert = OpFunction %void None %fn_void
+%fc_entry = OpLabel
+%fc_g = OpLoad %v3u32 %gid
+%fc_i = OpCompositeExtract %u32 %fc_g 0
+%fc_ab = OpFunctionCall %v2i32 %load_ab %fc_i
+%fc_a = OpCompositeExtract %i32 %fc_ab 0
+%fc_b = OpCompositeExtract %i32 %fc_ab 1
+%fc_bu = OpBitcast %u32 %fc_b
+%fc_fa = OpConvertSToF %f32 %fc_a
+%fc_fb = OpConvertUToF %f32 %fc_bu
+%fc_h = OpFConvert %f16 %fc_fa
+%fc_h2 = OpFMul %f16 %fc_h %h_pi
+%fc_h3 = OpFAdd %f16 %fc_h2 %h_1
+%fc_hf = OpFConvert %f32 %fc_h3
+%fc_d = OpFConvert %f64 %fc_fb
+%fc_d2 = OpFMul %f64 %fc_d %d_pi
+%fc_d3 = OpFAdd %f64 %fc_d2 %d_tiny
+%fc_df = OpFConvert %f32 %fc_d3
+%fc_sum = OpFAdd %f32 %fc_hf %fc_df
+%fc_si = OpConvertFToS %i32 %fc_sum
+%fc_ui = OpConvertFToU %u32 %fc_hf
+%fc_uii = OpBitcast %i32 %fc_ui
+%fc_r = OpIAdd %i32 %fc_si %fc_uii
+%fc_po = OpAccessChain %p_sb_i32 %out %c0 %fc_i
+OpStore %fc_po %fc_r
+OpReturn
+OpFunctionEnd

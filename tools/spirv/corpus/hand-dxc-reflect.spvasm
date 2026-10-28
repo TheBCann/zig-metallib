@@ -1,0 +1,77 @@
+; hand-dxc-reflect.spvasm: the shape DXC emits for an HLSL compute shader with -fspv-reflect, written by hand in
+; tools/spirv/asm.zig syntax (no DXC on this machine): `dxc -spirv -fspv-reflect -T cs_6_0 -E main` of
+;
+;   StructuredBuffer<uint> input : register(t0);
+;   RWStructuredBuffer<uint> output : register(u1);
+;   [numthreads(64, 1, 1)]
+;   void main(uint3 id : SV_DispatchThreadID) { output[id.x] = input[id.x] * 3 + 1; }
+;
+; -fspv-reflect adds SPV_GOOGLE_hlsl_functionality1 / SPV_GOOGLE_user_type and decorates every resource variable
+; with `OpDecorateString <var> UserTypeGOOGLE "<hlsl type>"` and every semantic-carrying input with
+; `OpDecorateString <var> UserSemantic "<semantic>"`. UserTypeGOOGLE (5636) is missing from the vendored
+; spec.zig tables; before tools/spirv/spec_extra.zig supplied it the reader refused this module as malformed
+; ("trailing word(s) the grammar does not account for"). Both decorations are reflection hints the lowering
+; ignores. The rest is DXC's default Vulkan 1.0 shape: SPIR-V 1.0 structured buffers as Uniform pointers to
+; BufferBlock structs wrapping a runtime array, `type.StructuredBuffer.uint` names, the builtin read whole with
+; OpLoad + OpCompositeExtract. tools/spirv/corpus_driver.zig runs it: out[i] = in[i] * 3 + 1 over 4096 words.
+; SPIR-V
+; Version: 1.0
+; Generator: 0x000e0000
+; Schema: 0
+OpCapability Shader
+OpExtension "SPV_GOOGLE_hlsl_functionality1"
+OpExtension "SPV_GOOGLE_user_type"
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main" %gl_GlobalInvocationID
+OpExecutionMode %main LocalSize 64 1 1
+OpSource HLSL 600
+OpName %type_StructuredBuffer_uint "type.StructuredBuffer.uint"
+OpName %input "input"
+OpName %type_RWStructuredBuffer_uint "type.RWStructuredBuffer.uint"
+OpName %output "output"
+OpName %main "main"
+OpModuleProcessed "dxc-cl-option: -spirv -fspv-reflect -T cs_6_0 -E main"
+OpDecorate %gl_GlobalInvocationID BuiltIn GlobalInvocationId
+OpDecorateString %gl_GlobalInvocationID UserSemantic "SV_DispatchThreadID"
+OpDecorate %input DescriptorSet 0
+OpDecorate %input Binding 0
+OpDecorateString %input UserTypeGOOGLE "structuredbuffer:<uint>"
+OpDecorate %output DescriptorSet 0
+OpDecorate %output Binding 1
+OpDecorateString %output UserTypeGOOGLE "rwstructuredbuffer:<uint>"
+OpDecorate %_runtimearr_uint ArrayStride 4
+OpMemberDecorate %type_StructuredBuffer_uint 0 Offset 0
+OpMemberDecorate %type_StructuredBuffer_uint 0 NonWritable
+OpDecorate %type_StructuredBuffer_uint BufferBlock
+OpMemberDecorate %type_RWStructuredBuffer_uint 0 Offset 0
+OpDecorate %type_RWStructuredBuffer_uint BufferBlock
+%int = OpTypeInt 32 1
+%int_0 = OpConstant %int 0
+%uint = OpTypeInt 32 0
+%uint_3 = OpConstant %uint 3
+%uint_1 = OpConstant %uint 1
+%_runtimearr_uint = OpTypeRuntimeArray %uint
+%type_StructuredBuffer_uint = OpTypeStruct %_runtimearr_uint
+%_ptr_Uniform_type_StructuredBuffer_uint = OpTypePointer Uniform %type_StructuredBuffer_uint
+%type_RWStructuredBuffer_uint = OpTypeStruct %_runtimearr_uint
+%_ptr_Uniform_type_RWStructuredBuffer_uint = OpTypePointer Uniform %type_RWStructuredBuffer_uint
+%v3uint = OpTypeVector %uint 3
+%_ptr_Input_v3uint = OpTypePointer Input %v3uint
+%void = OpTypeVoid
+%fn_void = OpTypeFunction %void
+%_ptr_Uniform_uint = OpTypePointer Uniform %uint
+%input = OpVariable %_ptr_Uniform_type_StructuredBuffer_uint Uniform
+%output = OpVariable %_ptr_Uniform_type_RWStructuredBuffer_uint Uniform
+%gl_GlobalInvocationID = OpVariable %_ptr_Input_v3uint Input
+%main = OpFunction %void None %fn_void
+%entry = OpLabel
+%id = OpLoad %v3uint %gl_GlobalInvocationID
+%x = OpCompositeExtract %uint %id 0
+%in_ptr = OpAccessChain %_ptr_Uniform_uint %input %int_0 %x
+%v = OpLoad %uint %in_ptr
+%m = OpIMul %uint %v %uint_3
+%r = OpIAdd %uint %m %uint_1
+%out_ptr = OpAccessChain %_ptr_Uniform_uint %output %int_0 %x
+OpStore %out_ptr %r
+OpReturn
+OpFunctionEnd

@@ -1,7 +1,10 @@
 //! The `!air.*` metadata Apple's driver needs, derived at comptime from the
-//! shader manifest (`shader.functions`) and the Zig types it names.
+//! shader manifest (`shader.functions`) and the Zig types it names, or at
+//! runtime from a SPIR-V module's interface (tools/spirv/manifest.zig builds
+//! the same `FunctionMetadata` from it).
 //!
-//! The tree is built once as `Node` values. Two consumers walk it:
+//! The tree is built once as `Node` values. Two consumers walk it, both at
+//! runtime, so a comptime manifest and a runtime one go through the same code:
 //!   * `printModule` renders LLVM IR text (for the debug `.ll` output), and
 //!   * `lowerModule` builds the same nodes with `std.zig.llvm.Builder` for
 //!     the bitcode path.
@@ -459,7 +462,7 @@ pub fn printModule(gpa: std.mem.Allocator, out: *std.ArrayList(u8), samplers: []
 
 /// `printModule` for an explicit list of entry points (tests use their own),
 /// for the default deployment target and compile options.
-pub fn printManifest(gpa: std.mem.Allocator, out: *std.ArrayList(u8), comptime fms: []const FunctionMetadata) !void {
+pub fn printManifest(gpa: std.mem.Allocator, out: *std.ArrayList(u8), fms: []const FunctionMetadata) !void {
     return printManifestWith(gpa, out, fms, &.{}, target.default, default_compile_options);
 }
 
@@ -493,15 +496,19 @@ fn printModuleLists(gpa: std.mem.Allocator, nodes: *std.ArrayList(u8), named: *s
     }
 }
 
-pub fn printManifestWith(gpa: std.mem.Allocator, out: *std.ArrayList(u8), comptime fms: []const FunctionMetadata, samplers: []const []const u8, profile: target.Profile, compile: CompileOptions) !void {
+/// The metadata block for the entry points `fms` as text. The entries are
+/// ordinary runtime values: the Zig path passes its comptime manifest
+/// (`function_metadata`), the SPIR-V path one built from the module's
+/// interface at runtime (tools/spirv/manifest.zig).
+pub fn printManifestWith(gpa: std.mem.Allocator, out: *std.ArrayList(u8), fms: []const FunctionMetadata, samplers: []const []const u8, profile: target.Profile, compile: CompileOptions) !void {
     var next: u32 = 0;
     var nodes: std.ArrayList(u8) = .empty;
     var named: std.ArrayList(u8) = .empty;
 
     try printModuleLists(gpa, &nodes, &named, &next, profile, compile);
-    inline for (stage_order) |stage| {
+    for (stage_order) |stage| {
         var refs: std.ArrayList(u8) = .empty;
-        inline for (fms) |fm| {
+        for (fms) |fm| {
             if (fm.stage == stage) {
                 const id = try printNode(gpa, &nodes, &next, fm.node, fm.name);
                 try appendRef(gpa, &refs, id);
@@ -532,29 +539,58 @@ fn appendRef(gpa: std.mem.Allocator, refs: *std.ArrayList(u8), id: u32) !void {
 }
 
 /// Post-order: children get ids before their parent. Returns the node's id.
-fn printNode(gpa: std.mem.Allocator, nodes: *std.ArrayList(u8), next: *u32, comptime node: Node, fn_name: []const u8) !u32 {
-    switch (node) {
-        .tuple => |elems| {
-            var body: std.ArrayList(u8) = .empty;
-            inline for (elems) |e| {
-                if (body.items.len > 0) try body.appendSlice(gpa, ", ");
-                switch (e) {
-                    .str => |text| try body.print(gpa, "!\"{s}\"", .{text}),
-                    .int => |v| try body.print(gpa, "i32 {d}", .{v}),
-                    .func => try body.print(gpa, "ptr @{s}", .{fn_name}),
-                    .tuple => {
-                        const id = try printNode(gpa, nodes, next, e, fn_name);
-                        try body.print(gpa, "!{d}", .{id});
-                    },
-                }
-            }
-            const id = next.*;
-            next.* += 1;
-            try nodes.print(gpa, "!{d} = !{{{s}}}\n", .{ id, body.items });
-            return id;
-        },
-        else => @compileError("printNode expects a tuple at the top level"),
+/// `node` must be a tuple (every top-level node is one).
+fn printNode(gpa: std.mem.Allocator, nodes: *std.ArrayList(u8), next: *u32, node: Node, fn_name: []const u8) !u32 {
+    const elems = switch (node) {
+        .tuple => |elems| elems,
+        else => unreachable,
+    };
+    var body: std.ArrayList(u8) = .empty;
+    for (elems) |e| {
+        if (body.items.len > 0) try body.appendSlice(gpa, ", ");
+        switch (e) {
+            .str => |text| try body.print(gpa, "!\"{s}\"", .{text}),
+            .int => |v| try body.print(gpa, "i32 {d}", .{v}),
+            .func => {
+                try body.appendSlice(gpa, "ptr @");
+                try appendGlobalName(gpa, &body, fn_name);
+            },
+            .tuple => {
+                const id = try printNode(gpa, nodes, next, e, fn_name);
+                try body.print(gpa, "!{d}", .{id});
+            },
+        }
     }
+    const id = next.*;
+    next.* += 1;
+    try nodes.print(gpa, "!{d} = !{{{s}}}\n", .{ id, body.items });
+    return id;
+}
+
+/// Whether `name` can follow `@` in LLVM IR text without quotes
+/// (`[-a-zA-Z$._][-a-zA-Z$._0-9]*`). Every Zig entry point qualifies; a
+/// SPIR-V entry point name is an arbitrary string.
+pub fn isPlainIdentifier(name: []const u8) bool {
+    if (name.len == 0) return false;
+    for (name, 0..) |ch, idx| {
+        const ok = std.ascii.isAlphabetic(ch) or ch == '-' or ch == '$' or ch == '.' or ch == '_' or (idx > 0 and std.ascii.isDigit(ch));
+        if (!ok) return false;
+    }
+    return true;
+}
+
+/// `name` as it follows `@`: verbatim when it is a plain identifier, else
+/// quoted with `\XX` escapes for `"`, `\` and bytes outside printable ASCII
+/// (the assembler's quotedOrPlainName decodes them).
+pub fn appendGlobalName(gpa: std.mem.Allocator, out: *std.ArrayList(u8), name: []const u8) !void {
+    if (isPlainIdentifier(name)) return out.appendSlice(gpa, name);
+    try out.append(gpa, '"');
+    for (name) |ch| {
+        if (ch == '"' or ch == '\\' or ch < 0x20 or ch >= 0x7f) {
+            try out.print(gpa, "\\{X:0>2}", .{ch});
+        } else try out.append(gpa, ch);
+    }
+    try out.append(gpa, '"');
 }
 
 // ── Consumer 2: std.zig.llvm.Builder ────────────────────────────────────────
@@ -563,7 +599,7 @@ fn printNode(gpa: std.mem.Allocator, nodes: *std.ArrayList(u8), next: *u32, comp
 /// and `!air.sampler_states` for the constexpr sampler globals the
 /// assembler saw as sampler operands (`samplers`; empty for a module that
 /// samples through bound samplers only).
-pub fn lowerModule(b: *Builder, comptime fm: FunctionMetadata, func: Builder.Function.Index, samplers: []const Builder.Global.Index, profile: target.Profile, compile: CompileOptions) !void {
+pub fn lowerModule(b: *Builder, fm: FunctionMetadata, func: Builder.Function.Index, samplers: []const Builder.Global.Index, profile: target.Profile, compile: CompileOptions) !void {
     // `moduleLists` needs the profile and the fast-math choice at comptime:
     // pick the matching one of the few known profiles and of the two choices
     // (only these lists are instantiated per combination, not the entry-point
@@ -592,15 +628,18 @@ pub fn lowerModule(b: *Builder, comptime fm: FunctionMetadata, func: Builder.Fun
     }
 }
 
-fn lowerNode(b: *Builder, comptime node: Node, func: Builder.Function.Index) !Builder.Metadata {
+/// Post-order like `printNode`, so the Builder numbers the nodes the way the
+/// comptime walk this replaced did (the Zig path's bitcode is unchanged).
+fn lowerNode(b: *Builder, node: Node, func: Builder.Function.Index) !Builder.Metadata {
     switch (node) {
         .str => |text| return (try b.metadataString(text)).toMetadata(),
         .int => |v| return b.metadataConstant(try b.intConst(.i32, v)),
         .func => return b.metadataConstant(func.toConst(b)),
         .tuple => |elems| {
-            var operands: [elems.len]Builder.Metadata = undefined;
-            inline for (elems, 0..) |e, idx| operands[idx] = try lowerNode(b, e, func);
-            return b.metadataTuple(&operands);
+            const operands = try b.gpa.alloc(Builder.Metadata, elems.len);
+            defer b.gpa.free(operands);
+            for (elems, operands) |e, *op| op.* = try lowerNode(b, e, func);
+            return b.metadataTuple(operands);
         },
     }
 }

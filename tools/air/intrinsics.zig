@@ -24,7 +24,9 @@
 //!     which passes. `llvm.powi.<T>.i32` has no AIR form; it becomes
 //!     `air.pow.<T>` with the exponent converted by `sitofp`.
 //!     `llvm.ldexp.<T>.i32` keeps its integer parameter but Apple spells it
-//!     `air.ldexp.<T>`. `llvm.minimum`/`maximum` keep the fast spelling, the
+//!     `air.ldexp.<T>`, and for half it is always the precise one
+//!     (`air.fast_ldexp.f16` crashes MTLCompilerService; Apple's own
+//!     -ffast-math output calls `air.ldexp.f16`). `llvm.minimum`/`maximum` keep the fast spelling, the
 //!     only one verified to build.
 //!   * Every `llvm.vector.reduce.*` crashes the GPU backend (r11 finding
 //!     15, dumps/air_acceptance.txt reduce_*); a scalar chain of
@@ -131,6 +133,12 @@ const RenameRule = struct {
     to: []const u8 = "",
     /// Only the fast spelling is known to build.
     always_fast: bool = false,
+    /// Half precision always takes the precise spelling: `air.fast_ldexp.f16`
+    /// crashes MTLCompilerService (SPIR-V probe glsl_Ldexp_f16 under fast
+    /// math, docs/spirv.md), and Apple's front end itself calls
+    /// `air.ldexp.f16` / `air.ldexp.v4f16` under -ffast-math while it picks
+    /// `air.fast_ldexp.f32` for float.
+    precise_half: bool = false,
     /// Keep only the first suffix segment (`f32.i32` -> `f32`).
     drop_int_suffix: bool = false,
     exponent_to_float: bool = false,
@@ -147,7 +155,7 @@ const rename_rules = [_]RenameRule{
     .{ .op = "exp", .air = "exp" },
     .{ .op = "pow", .air = "pow" },
     .{ .op = "powi", .air = "pow", .drop_int_suffix = true, .exponent_to_float = true },
-    .{ .op = "ldexp", .air = "ldexp", .drop_int_suffix = true },
+    .{ .op = "ldexp", .air = "ldexp", .drop_int_suffix = true, .precise_half = true },
     .{ .op = "nearbyint", .to = "llvm.rint" },
     .{ .op = "roundeven", .to = "llvm.rint" },
     .{ .op = "minimum", .air = "fmin", .always_fast = true },
@@ -185,7 +193,7 @@ pub fn classify(gpa: Allocator, name: []const u8, fast_math: bool) Allocator.Err
         const new_name = if (rule.to.len > 0)
             try std.mem.concat(gpa, u8, &.{ rule.to, ".", suffix })
         else
-            try std.mem.concat(gpa, u8, &.{ "air.", if (fast_math or rule.always_fast) "fast_" else "", rule.air, ".", suffix });
+            try std.mem.concat(gpa, u8, &.{ "air.", if ((fast_math or rule.always_fast) and !(rule.precise_half and std.mem.endsWith(u8, suffix, "f16"))) "fast_" else "", rule.air, ".", suffix });
         return .{ .rename = .{ .name = new_name, .exponent_to_float = rule.exponent_to_float } };
     }
     return .pass;
@@ -214,6 +222,313 @@ pub fn isConvergent(name: []const u8) bool {
         std.mem.eql(u8, name, "air.simdgroup.barrier") or
         std.mem.startsWith(u8, name, "air.simd_") or
         std.mem.startsWith(u8, name, "air.quad_");
+}
+
+/// The IR text a splice tool prints beside its library (air-splice's
+/// `shader.air.ll` / `crosscheck.air.ll`, spirv-splice's `out.ll`), made to
+/// mean for Apple's front end (`xcrun metal -Xclang -opaque-pointers`) what
+/// it means for our assembler, so that the attribution path (the same text
+/// through Apple's assembler) builds and behaves like our library:
+///
+///   * every intrinsic `classify` renames is spelled as the assembler calls
+///     it, with the same fast-math choice (`llvm.sin.f32` -> `air.sin.f32`
+///     or `air.fast_sin.f32`, `llvm.ldexp.f32.i32` -> `air.ldexp.f32`,
+///     `llvm.nearbyint` -> `llvm.rint`, `llvm.powi` -> `air.pow` with a
+///     `sitofp` (and splat) of the exponent). Passed through, Apple's front
+///     end lets `llvm.sin/cos/tan/pow/log10` reach MTLCompilerService, which
+///     crashes, and `llvm.exp10/ldexp` fail with "Undefined symbols"
+///     (docs/spirv.md: probes glsl_Pow_f32, glsl_Sin_f32, ocl_pow_f32,
+///     ocl_exp10_f32, ocl_log10_f32, glsl_Ldexp_f32 and the
+///     opencl_edge_math execution module). A renamed declaration that
+///     another one already provides (`llvm.nearbyint` and `llvm.rint`) is
+///     printed once.
+///   * the barriers, the SIMD-group collectives and every define that
+///     reaches one get the assembler's `convergent` attribute sets
+///     (assembler.ModuleState.attributesFor): without them Apple's
+///     optimizer jump-threads a barrier between two branches on the same
+///     per-thread condition, as Metal's runtime compiler does with an
+///     attribute-less library.
+///
+/// The forms the assembler rewrites to avoid a recorded Metal miscompile or
+/// crash are left as they are, so that Apple's build of the text still
+/// reproduces the finding: `frem` (air.fmod), `llvm.round` (the sign-keeping
+/// expansion), `llvm.smul/umul.fix.sat` (air.mad_sat), the
+/// `llvm.vector.reduce.*` and bool-vector bitcast expansions, and the
+/// assembler's address-space relocation of constant globals. Lines are
+/// otherwise copied unchanged.
+pub fn printForApple(gpa: Allocator, ir: []const u8, fast_math: bool) Allocator.Error![]u8 {
+    var lines: std.ArrayList([]const u8) = .empty;
+    defer lines.deinit(gpa);
+    var it = std.mem.splitScalar(u8, ir, '\n');
+    while (it.next()) |l| try lines.append(gpa, l);
+
+    // Defines, their callees, and the attribute groups already in use.
+    var define_index: std.StringHashMapUnmanaged(usize) = .empty;
+    defer define_index.deinit(gpa);
+    const DefineInfo = struct { callees: std.ArrayList([]const u8) = .empty, convergent: bool = false };
+    var defines: std.ArrayList(DefineInfo) = .empty;
+    defer {
+        for (defines.items) |*d| d.callees.deinit(gpa);
+        defines.deinit(gpa);
+    }
+    var next_group: u32 = 0;
+    {
+        var current: ?usize = null;
+        for (lines.items) |raw| {
+            const line = std.mem.trim(u8, raw, " \t\r");
+            if (std.mem.startsWith(u8, line, "attributes #")) {
+                const rest = line["attributes #".len..];
+                var end: usize = 0;
+                while (end < rest.len and std.ascii.isDigit(rest[end])) end += 1;
+                const n = std.fmt.parseInt(u32, rest[0..end], 10) catch 0;
+                next_group = @max(next_group, n + 1);
+                continue;
+            }
+            if (std.mem.startsWith(u8, line, "define ")) {
+                const name = globalAfter(line, 0) orelse continue;
+                const gop = try define_index.getOrPut(gpa, name);
+                if (!gop.found_existing) {
+                    gop.value_ptr.* = defines.items.len;
+                    try defines.append(gpa, .{});
+                }
+                current = gop.value_ptr.*;
+                continue;
+            }
+            if (std.mem.eql(u8, line, "}")) {
+                current = null;
+                continue;
+            }
+            const d = current orelse continue;
+            if (calleeOf(line)) |callee| try defines.items[d].callees.append(gpa, callee.name);
+        }
+    }
+    // A define is convergent when it calls a convergent intrinsic or a
+    // convergent define (fixpoint over the call graph).
+    var changed = true;
+    while (changed) {
+        changed = false;
+        for (defines.items) |*d| {
+            if (d.convergent) continue;
+            for (d.callees.items) |callee| {
+                const conv = isConvergent(callee) or if (define_index.get(callee)) |ci| defines.items[ci].convergent else false;
+                if (conv) {
+                    d.convergent = true;
+                    changed = true;
+                    break;
+                }
+            }
+        }
+    }
+
+    const group_declaration = next_group;
+    const group_call = next_group + 1;
+    const group_helper = next_group + 2;
+    var used = [3]bool{ false, false, false };
+    var declared: std.StringHashMapUnmanaged(void) = .empty;
+    defer {
+        var kit = declared.keyIterator();
+        while (kit.next()) |k| gpa.free(k.*);
+        declared.deinit(gpa);
+    }
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(gpa);
+    var powi_count: usize = 0;
+    for (lines.items, 0..) |raw, li| {
+        if (li > 0) try out.append(gpa, '\n');
+        const line = std.mem.trim(u8, raw, " \t\r");
+        if (std.mem.startsWith(u8, line, "declare ")) {
+            const renamed = try renameLine(gpa, raw, fast_math);
+            defer gpa.free(renamed);
+            const name = globalAfter(renamed, 0) orelse {
+                try out.appendSlice(gpa, renamed);
+                continue;
+            };
+            if (declared.contains(name)) {
+                // Printed already (two llvm.* names renamed to one): drop the
+                // line's newline as well.
+                if (li > 0) _ = out.pop();
+                continue;
+            }
+            try declared.put(gpa, try gpa.dupe(u8, name), {});
+            try out.appendSlice(gpa, std.mem.trimEnd(u8, renamed, " \t\r"));
+            if (isConvergent(name)) {
+                try out.print(gpa, " #{d}", .{group_declaration});
+                used[0] = true;
+            }
+            continue;
+        }
+        if (std.mem.startsWith(u8, line, "define ")) {
+            const name = globalAfter(line, 0);
+            const conv = if (name) |n| if (define_index.get(n)) |di| defines.items[di].convergent else false else false;
+            const trimmed = std.mem.trimEnd(u8, raw, " \t\r");
+            if (conv and std.mem.endsWith(u8, trimmed, "{")) {
+                try out.appendSlice(gpa, std.mem.trimEnd(u8, trimmed[0 .. trimmed.len - 1], " "));
+                try out.print(gpa, " #{d} {{", .{group_helper});
+                used[2] = true;
+            } else try out.appendSlice(gpa, raw);
+            continue;
+        }
+        const callee = calleeOf(raw) orelse {
+            try out.appendSlice(gpa, raw);
+            continue;
+        };
+        if (std.mem.startsWith(u8, callee.name, "llvm.powi.")) {
+            if (try powiCall(gpa, &out, raw, callee, fast_math, powi_count)) {
+                powi_count += 1;
+                continue;
+            }
+        }
+        const renamed = try renameLine(gpa, raw, fast_math);
+        defer gpa.free(renamed);
+        const group: ?u32 = if (isConvergent(callee.name))
+            group_call
+        else if (define_index.get(callee.name)) |di| (if (defines.items[di].convergent) group_helper else null) else null;
+        const g = group orelse {
+            try out.appendSlice(gpa, renamed);
+            continue;
+        };
+        used[if (g == group_call) 1 else 2] = true;
+        // `call ... @f(args) #N [bundles], !md`: the group goes right after
+        // the argument list. A rename changes the callee's length, so the
+        // argument list is found again in the renamed line.
+        const c2 = calleeOf(renamed).?;
+        const close = matchingParen(renamed, c2.args_open) orelse renamed.len;
+        try out.appendSlice(gpa, renamed[0..close]);
+        try out.print(gpa, " #{d}", .{g});
+        try out.appendSlice(gpa, renamed[close..]);
+    }
+    if (used[0] or used[1] or used[2]) {
+        if (out.items.len > 0 and out.items[out.items.len - 1] != '\n') try out.append(gpa, '\n');
+        if (used[0]) try out.print(gpa, "attributes #{d} = {{ convergent mustprogress nounwind willreturn }}\n", .{group_declaration});
+        if (used[1]) try out.print(gpa, "attributes #{d} = {{ convergent nounwind willreturn }}\n", .{group_call});
+        if (used[2]) try out.print(gpa, "attributes #{d} = {{ convergent }}\n", .{group_helper});
+    }
+    return out.toOwnedSlice(gpa);
+}
+
+/// The unquoted name of the first `@global` at or after `from`.
+fn globalAfter(line: []const u8, from: usize) ?[]const u8 {
+    const at = std.mem.findScalarPos(u8, line, from, '@') orelse return null;
+    return globalNameAt(line, at).name;
+}
+
+const GlobalRef = struct { name: []const u8, end: usize };
+
+/// The global name at `line[at] == '@'`: `@name` or `@"quoted name"` (the
+/// quotes dropped, escapes kept as written).
+fn globalNameAt(line: []const u8, at: usize) GlobalRef {
+    var i = at + 1;
+    if (i < line.len and line[i] == '"') {
+        const close = std.mem.findScalarPos(u8, line, i + 1, '"') orelse line.len;
+        return .{ .name = line[i + 1 .. close], .end = @min(close + 1, line.len) };
+    }
+    while (i < line.len and (std.ascii.isAlphanumeric(line[i]) or line[i] == '.' or line[i] == '_' or line[i] == '$' or line[i] == '-')) i += 1;
+    return .{ .name = line[at + 1 .. i], .end = i };
+}
+
+const CallRef = struct { name: []const u8, at: usize, args_open: usize };
+
+/// The callee of a `call` instruction line, if the line is one.
+fn calleeOf(line: []const u8) ?CallRef {
+    var pos: usize = 0;
+    while (std.mem.findPos(u8, line, pos, "call ")) |ci| : (pos = ci + 5) {
+        if (ci > 0 and line[ci - 1] != ' ' and line[ci - 1] != '\t') continue;
+        const at = std.mem.findScalarPos(u8, line, ci, '@') orelse return null;
+        const ref = globalNameAt(line, at);
+        if (ref.end >= line.len or line[ref.end] != '(') return null;
+        return .{ .name = ref.name, .at = at, .args_open = ref.end };
+    }
+    return null;
+}
+
+/// Index just past the `)` matching `line[open] == '('`.
+fn matchingParen(line: []const u8, open: usize) ?usize {
+    var depth: usize = 0;
+    var i = open;
+    while (i < line.len) : (i += 1) switch (line[i]) {
+        '(' => depth += 1,
+        ')' => {
+            depth -= 1;
+            if (depth == 0) return i + 1;
+        },
+        else => {},
+    };
+    return null;
+}
+
+/// `line` with every `@llvm.*` that `classify` renames spelled as the
+/// assembler calls it (the exceptions of `printForApple` kept), and a
+/// renamed `llvm.powi` declaration's exponent parameter retyped.
+fn renameLine(gpa: Allocator, line: []const u8, fast_math: bool) Allocator.Error![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(gpa);
+    var i: usize = 0;
+    while (std.mem.findPos(u8, line, i, "@llvm.")) |at| {
+        const ref = globalNameAt(line, at);
+        try out.appendSlice(gpa, line[i .. at + 1]);
+        i = ref.end;
+        const lowering = try classify(gpa, ref.name, fast_math);
+        defer lowering.deinit(gpa);
+        switch (lowering) {
+            .rename => |r| if (!r.zero_scale) {
+                try out.appendSlice(gpa, r.name);
+                if (r.exponent_to_float and std.mem.startsWith(u8, std.mem.trimStart(u8, line, " \t"), "declare ") and i < line.len and line[i] == '(') {
+                    // `(T, i32)` -> `(T, T)`.
+                    const close = matchingParen(line, i) orelse line.len;
+                    const params = line[i + 1 .. close -| 1];
+                    const comma = std.mem.findScalar(u8, params, ',') orelse params.len;
+                    const base = std.mem.trim(u8, params[0..comma], " ");
+                    try out.print(gpa, "({s}, {s})", .{ base, base });
+                    i = close;
+                }
+                continue;
+            },
+            else => {},
+        }
+        try out.appendSlice(gpa, ref.name);
+    }
+    try out.appendSlice(gpa, line[i..]);
+    return out.toOwnedSlice(gpa);
+}
+
+/// `call T @llvm.powi.<T>.i32(T x, i32 n)` -> `sitofp` (and a splat for a
+/// vector base) of n, then `call T @air.pow.<T>(T x, T n')`, as
+/// `renamedArgs` builds it. False (nothing written) for a shape it does not
+/// recognise, which is then printed unchanged.
+fn powiCall(gpa: Allocator, out: *std.ArrayList(u8), line: []const u8, callee: CallRef, fast_math: bool, n: usize) Allocator.Error!bool {
+    const close = matchingParen(line, callee.args_open) orelse return false;
+    const args = line[callee.args_open + 1 .. close - 1];
+    const comma = std.mem.findScalarLast(u8, args, ',') orelse return false;
+    const base_arg = std.mem.trim(u8, args[0..comma], " ");
+    const exp_arg = std.mem.trim(u8, args[comma + 1 ..], " ");
+    if (!std.mem.startsWith(u8, exp_arg, "i32 ")) return false;
+    const exp_value = std.mem.trim(u8, exp_arg["i32 ".len..], " ");
+    // The base's type: `float`, `half` or `<N x float>` before its value.
+    const base_ty = if (base_arg.len > 0 and base_arg[0] == '<')
+        base_arg[0 .. (std.mem.findScalar(u8, base_arg, '>') orelse return false) + 1]
+    else
+        base_arg[0 .. std.mem.findScalar(u8, base_arg, ' ') orelse return false];
+    const lowering = try classify(gpa, callee.name, fast_math);
+    defer lowering.deinit(gpa);
+    const new_name = switch (lowering) {
+        .rename => |r| r.name,
+        else => return false,
+    };
+    const indent = line[0 .. line.len - std.mem.trimStart(u8, line, " \t").len];
+    if (base_ty[0] == '<') {
+        const x = std.mem.findScalar(u8, base_ty, 'x') orelse return false;
+        const lanes = std.mem.trim(u8, base_ty[1..x], " ");
+        const scalar = std.mem.trim(u8, base_ty[x + 1 .. base_ty.len - 1], " ");
+        try out.print(gpa, "{s}%air.powi.exp.{d}.s = sitofp i32 {s} to {s}\n", .{ indent, n, exp_value, scalar });
+        try out.print(gpa, "{s}%air.powi.exp.{d}.v = insertelement <1 x {s}> poison, {s} %air.powi.exp.{d}.s, i64 0\n", .{ indent, n, scalar, scalar, n });
+        try out.print(gpa, "{s}%air.powi.exp.{d} = shufflevector <1 x {s}> %air.powi.exp.{d}.v, <1 x {s}> poison, <{s} x i32> zeroinitializer\n", .{ indent, n, scalar, n, scalar, lanes });
+    } else {
+        try out.print(gpa, "{s}%air.powi.exp.{d} = sitofp i32 {s} to {s}\n", .{ indent, n, exp_value, base_ty });
+    }
+    try out.appendSlice(gpa, line[0..callee.at]);
+    try out.print(gpa, "@{s}({s}, {s} %air.powi.exp.{d})", .{ new_name, base_arg, base_ty, n });
+    try out.appendSlice(gpa, line[close..]);
+    return true;
 }
 
 /// `llvm.memcpy.p0.p0.i64` with pointer operands in address spaces
@@ -572,6 +887,8 @@ test "rename table: every suffix, powi/ldexp suffix handling, pass-through" {
         .{ .in = "llvm.powi.f32.i32", .strict = "air.pow.f32", .fast = "air.fast_pow.f32" },
         .{ .in = "llvm.powi.v4f32.i32", .strict = "air.pow.v4f32", .fast = "air.fast_pow.v4f32" },
         .{ .in = "llvm.ldexp.f32.i32", .strict = "air.ldexp.f32", .fast = "air.fast_ldexp.f32" },
+        .{ .in = "llvm.ldexp.f16.i32", .strict = "air.ldexp.f16", .fast = "air.ldexp.f16" },
+        .{ .in = "llvm.ldexp.v4f16.v4i32", .strict = "air.ldexp.v4f16", .fast = "air.ldexp.v4f16" },
         .{ .in = "llvm.nearbyint.f32", .strict = "llvm.rint.f32", .fast = "llvm.rint.f32" },
         .{ .in = "llvm.roundeven.v4f32", .strict = "llvm.rint.v4f32", .fast = "llvm.rint.v4f32" },
         .{ .in = "llvm.minimum.f32", .strict = "air.fast_fmin.f32", .fast = "air.fast_fmin.f32" },
@@ -642,6 +959,124 @@ test "convergent table: barriers and every SIMD-group collective, nothing else" 
         "air.atomic.global.add.u.i32", "air.atomic.local.add.u.i32",  "air.atomic.fence", "air.fast_sin.f32",
         "llvm.sqrt.f32",               "air.sample_texture_2d.v4f32", "my_shader.syncTg", "air.simdgroup_barrier",
     }) |name| try std.testing.expect(!isConvergent(name));
+}
+
+test "printForApple: the assembler's renames and convergent attributes, the workaround forms kept" {
+    const gpa = std.testing.allocator;
+    const ir =
+        \\declare float @llvm.sin.f32(float)
+        \\declare float @llvm.ldexp.f32.i32(float, i32)
+        \\declare float @llvm.nearbyint.f32(float)
+        \\declare float @llvm.rint.f32(float)
+        \\declare <4 x float> @llvm.powi.v4f32.i32(<4 x float>, i32)
+        \\declare float @llvm.round.f32(float)
+        \\declare i32 @llvm.smul.fix.sat.i32(i32, i32, i32)
+        \\declare void @air.wg.barrier(i32, i32) local_unnamed_addr
+        \\declare float @air.simd_sum.f32(float)
+        \\declare void @air.atomic.fence(i32, i32, i32)
+        \\define private float @helper(float %x) {
+        \\  %s = tail call float @air.simd_sum.f32(float %x)
+        \\  ret float %s
+        \\}
+        \\define private float @outer(float %x) {
+        \\  %s = call float @helper(float %x)
+        \\  ret float %s
+        \\}
+        \\define void @k(float %a, i32 %n, <4 x float> %v) {
+        \\  %0 = call float @llvm.sin.f32(float %a)
+        \\  %1 = call float @llvm.ldexp.f32.i32(float %0, i32 %n)
+        \\  %2 = call float @llvm.nearbyint.f32(float %1)
+        \\  %3 = call float @llvm.round.f32(float %2)
+        \\  %4 = frem float %3, %a
+        \\  %5 = call i32 @llvm.smul.fix.sat.i32(i32 %n, i32 %n, i32 0)
+        \\  %6 = call <4 x float> @llvm.powi.v4f32.i32(<4 x float> %v, i32 %n)
+        \\  tail call void @air.wg.barrier(i32 2, i32 1)
+        \\  call void @air.atomic.fence(i32 1, i32 5, i32 2)
+        \\  %7 = call float @outer(float %4)
+        \\  ret void
+        \\}
+    ;
+    const strict = try printForApple(gpa, ir, false);
+    defer gpa.free(strict);
+    const want =
+        \\declare float @air.sin.f32(float)
+        \\declare float @air.ldexp.f32(float, i32)
+        \\declare float @llvm.rint.f32(float)
+        \\declare <4 x float> @air.pow.v4f32(<4 x float>, <4 x float>)
+        \\declare float @llvm.round.f32(float)
+        \\declare i32 @llvm.smul.fix.sat.i32(i32, i32, i32)
+        \\declare void @air.wg.barrier(i32, i32) local_unnamed_addr #0
+        \\declare float @air.simd_sum.f32(float) #0
+        \\declare void @air.atomic.fence(i32, i32, i32)
+        \\define private float @helper(float %x) #2 {
+        \\  %s = tail call float @air.simd_sum.f32(float %x) #1
+        \\  ret float %s
+        \\}
+        \\define private float @outer(float %x) #2 {
+        \\  %s = call float @helper(float %x) #2
+        \\  ret float %s
+        \\}
+        \\define void @k(float %a, i32 %n, <4 x float> %v) #2 {
+        \\  %0 = call float @air.sin.f32(float %a)
+        \\  %1 = call float @air.ldexp.f32(float %0, i32 %n)
+        \\  %2 = call float @llvm.rint.f32(float %1)
+        \\  %3 = call float @llvm.round.f32(float %2)
+        \\  %4 = frem float %3, %a
+        \\  %5 = call i32 @llvm.smul.fix.sat.i32(i32 %n, i32 %n, i32 0)
+        \\  %air.powi.exp.0.s = sitofp i32 %n to float
+        \\  %air.powi.exp.0.v = insertelement <1 x float> poison, float %air.powi.exp.0.s, i64 0
+        \\  %air.powi.exp.0 = shufflevector <1 x float> %air.powi.exp.0.v, <1 x float> poison, <4 x i32> zeroinitializer
+        \\  %6 = call <4 x float> @air.pow.v4f32(<4 x float> %v, <4 x float> %air.powi.exp.0)
+        \\  tail call void @air.wg.barrier(i32 2, i32 1) #1
+        \\  call void @air.atomic.fence(i32 1, i32 5, i32 2)
+        \\  %7 = call float @outer(float %4) #2
+        \\  ret void
+        \\}
+        \\attributes #0 = { convergent mustprogress nounwind willreturn }
+        \\attributes #1 = { convergent nounwind willreturn }
+        \\attributes #2 = { convergent }
+        \\
+    ;
+    try std.testing.expectEqualStrings(want, strict);
+
+    // Fast math picks Apple's fast spellings (half ldexp stays precise), a
+    // scalar powi converts its exponent without a splat, and attribute
+    // groups already in the text are not reused.
+    const fast = try printForApple(gpa,
+        \\declare half @llvm.ldexp.f16.i32(half, i32)
+        \\declare float @llvm.powi.f32.i32(float, i32)
+        \\define void @k(half %h, float %f, i32 %n) {
+        \\  %0 = call half @llvm.ldexp.f16.i32(half %h, i32 %n)
+        \\  %1 = call fast float @llvm.powi.f32.i32(float %f, i32 3)
+        \\  %2 = call float @llvm.exp.f32(float %f)
+        \\  call void @air.simdgroup.barrier(i32 2, i32 4)
+        \\  ret void
+        \\}
+        \\attributes #4 = { nounwind }
+    , true);
+    defer gpa.free(fast);
+    try std.testing.expectEqualStrings(
+        \\declare half @air.ldexp.f16(half, i32)
+        \\declare float @air.fast_pow.f32(float, float)
+        \\define void @k(half %h, float %f, i32 %n) #7 {
+        \\  %0 = call half @air.ldexp.f16(half %h, i32 %n)
+        \\  %air.powi.exp.0 = sitofp i32 3 to float
+        \\  %1 = call fast float @air.fast_pow.f32(float %f, float %air.powi.exp.0)
+        \\  %2 = call float @air.fast_exp.f32(float %f)
+        \\  call void @air.simdgroup.barrier(i32 2, i32 4) #6
+        \\  ret void
+        \\}
+        \\attributes #4 = { nounwind }
+        \\attributes #6 = { convergent nounwind willreturn }
+        \\attributes #7 = { convergent }
+        \\
+    , fast);
+
+    // Nothing to change: the text comes back byte for byte.
+    const plain = "define void @k(float %a) {\n  %0 = call float @llvm.sqrt.f32(float %a)\n  ret void\n}\n";
+    const same = try printForApple(gpa, plain, false);
+    defer gpa.free(same);
+    try std.testing.expectEqualStrings(plain, same);
 }
 
 /// Test harness: one function with the given parameter types, whose body

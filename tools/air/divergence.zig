@@ -11,8 +11,22 @@
 //! counted) or sums only the lanes that took the same arm
 //! (review-b/r4/helper/check.log: `out[0]=1 out[1]=33 want 528 1552`).
 //!
-//! The IR keeps no trace of the duplication, so the assembler decides from
-//! the CFG alone which threads reach a call site together. A purely
+//! Two optimizers can duplicate such a call. Zig's LLVM does it before the
+//! assembler sees the IR; the IR keeps no trace of the duplication, so the
+//! assembler decides from the CFG alone which threads reach a call site
+//! together, and refuses a call that only some of them reach. Metal's own
+//! optimizer does it after: it jump-threads `if (lid == 0) ...; barrier;
+//! ...; barrier; if (lid == 0) ...`, which this analysis accepts (every
+//! barrier is in a join block), into both arms unless the barrier is
+//! declared `convergent`. The SPIR-V front end hands Metal unoptimized IR of
+//! exactly that shape (glslang's workgroup counters and histograms), and so
+//! does a Debug Zig shader; the assembler therefore also writes Apple's
+//! `convergent` attribute sets on the declarations, the calls and every
+//! helper this module finds reaching one (`Func.convergent`;
+//! assembler.ModuleState.attributesFor), which is what stops Metal (exec
+//! tests barrier_workgroup_counter and barrier_shared_flag, metallib-check's
+//! barrierJoinKernel under -Dshader-optimize=debug: wrong without the
+//! attribute, right with it). A purely
 //! structural rule (the block must post-dominate the entry) refused every
 //! barrier inside a loop with a runtime trip count, including the canonical
 //! tree reduction `while (s > 0) : (s >>= 1)` (review-b/r4/reduce/
@@ -35,17 +49,50 @@
 //!     threadgroup` is `.simdgroup`, buffer pointers and the sizes and
 //!     positions of the threadgroup are `.threadgroup`). Constants and
 //!     globals are uniform. An instruction's result is as divergent as its
-//!     most divergent operand; `alloca` (per-thread storage), `atomicrmw`/
-//!     `cmpxchg`, `air.atomic.*`, the SIMD-group shuffles and prefix
+//!     most divergent operand; an `alloca` whose address escapes (below),
+//!     `atomicrmw`/`cmpxchg`, `air.atomic.*`, the SIMD-group shuffles and prefix
 //!     operations are `.thread` whatever their operands, and the SIMD-group
 //!     reductions (`air.simd_sum`, `_max`, `_min`, `_product`, `_and`,
 //!     `_or`, `_xor`, `_any`, `_all`, `_broadcast_first`) are `.simdgroup`
-//!     whatever their operands. A `load` is as divergent as its address. A
+//!     whatever their operands. A `load` is as divergent as its address,
+//!     except a `load atomic`, which is `.thread` (another thread may store
+//!     between two loads), and a load from a private variable (below). A
 //!     `phi` is as divergent as its incoming values and as the branches
 //!     whose paths its block joins. Helpers (`define private fastcc`) take
-//!     the level of their arguments over every call site (interprocedural
-//!     fixpoint); a call returns the join of its arguments' levels and the
-//!     callee's return level.
+//!     the level of their arguments over every call site (an
+//!     interprocedural fixpoint over a worklist, `analyse`); a call returns
+//!     the join of its arguments' levels and the callee's return level.
+//!   * Private variables: every `alloca` is a variable, and so is a `ptr`
+//!     parameter of a helper that some caller passes a variable to. Pointers
+//!     into it are the variable itself and the `getelementptr`s derived from
+//!     it (a struct member, an array element, a vector lane). While every
+//!     such pointer is only the address of a plain `load` or `store`, the
+//!     base of a `getelementptr`, or an argument of a helper (a `define`)
+//!     whose parameter does not escape in turn (or of `llvm.lifetime.*`),
+//!     the variable holds what was stored in it: its address names the
+//!     same variable in every thread (`.threadgroup`), a store raises its
+//!     content by the stored value, the address's indices and the block the
+//!     store sits in (a store that only some threads execute makes the
+//!     variable per-thread, as a phi joining divergent paths would be), and
+//!     a load returns that content joined with the address's indices. A
+//!     helper reads its callers' variables through the parameter
+//!     (`Func.param_mem`, joined over the call sites) and what it stores
+//!     through it lands in them (`Func.param_store`, joined with the
+//!     calling block). This is mem2reg and SROA's view of the variable
+//!     without the rewrite: the SPIR-V front end (tools/spirv/lower.zig)
+//!     keeps every OpVariable Function as an `alloca`; glslang and Zig's
+//!     SPIR-V backend keep a loop counter in one, glslang -V copies every
+//!     helper argument into a `param` variable and passes it by pointer
+//!     (`uint tiles = ceilDiv(pc.n, 64u);`), and reads a local struct or
+//!     vector through OpAccessChain (`P p = P(pc.n); ... p.n`), so a tree
+//!     reduction bounded by the workgroup size or a tiled loop bounded by a
+//!     push constant, with a barrier inside, is accepted as on the Zig
+//!     path, where LLVM has promoted all of these to SSA values (review
+//!     round 2: such kernels were refused; exec tests uniform_bound_*). A
+//!     variable whose address escapes (stored, compared, selected, passed
+//!     to an intrinsic such as `llvm.memcpy` or an external function, or to
+//!     a helper whose parameter escapes) is not followed: its address and
+//!     everything loaded through it are `.thread`.
 //!   * Control: a conditional `br` or `switch` on a value of level L > 0 is
 //!     a divergent branch X of level L. Every block reachable from X's
 //!     successors without passing a block that post-dominates X is raised
@@ -88,7 +135,13 @@
 //! behaviour on the GPU; the analysis errs on the side of refusing.
 //!
 //! The analysis never fails: anything it does not understand is treated as
-//! per-thread (values) or as an ordinary instruction (control flow).
+//! per-thread (values) or as an ordinary instruction (control flow). Its
+//! cost is near-linear in the module: post-dominance and loop membership
+//! are answered from trees in O(1) (`Control`), a divergent branch walks
+//! only the blocks it makes divergent, and functions are found by name in
+//! a hash map (review round 2: the former n x n tables and linear lookups
+//! took 17 s for a 1000-block chain, 111 s for 1600 sequential ifs and
+//! 113 s for 20 000 helpers; now 0.04 s, 0.3 s and 2.6 s, debug build).
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -146,6 +199,17 @@ pub const Func = struct {
     /// every other function starts uniform and picks up divergence from
     /// its call sites.
     param_level: []Level,
+    /// Per parameter: the level of the private variable a `ptr` argument
+    /// points to, joined over the call sites (module doc, "Private
+    /// variables"); null while no call site passes a private pointer.
+    param_mem: []?Level,
+    /// Per parameter: the level of what this function stores through the
+    /// pointer, itself or through its callees; null if it never does.
+    param_store: []?Level,
+    /// Per parameter: this function lets the pointer escape (anything but
+    /// a load, a store, a getelementptr or a helper call uses it), so the
+    /// callers' variable can no longer be followed.
+    param_escapes: []bool,
     /// How the value this function returns may differ between threads.
     ret_level: Level = .threadgroup,
     /// The widest scope of a convergent call it executes, directly or
@@ -156,16 +220,29 @@ pub const Func = struct {
     line_level: []Level,
 
     pub fn init(gpa: Allocator, name: []const u8, param_names: []const []const u8, body: ?[]const []const u8) Error!Func {
-        const pl = try gpa.alloc(Level, param_names.len);
+        const n = param_names.len;
+        const pl = try gpa.alloc(Level, n);
         errdefer gpa.free(pl);
         @memset(pl, .threadgroup);
+        const pm = try gpa.alloc(?Level, n);
+        errdefer gpa.free(pm);
+        @memset(pm, null);
+        const ps = try gpa.alloc(?Level, n);
+        errdefer gpa.free(ps);
+        @memset(ps, null);
+        const pe = try gpa.alloc(bool, n);
+        errdefer gpa.free(pe);
+        @memset(pe, false);
         const ll = try gpa.alloc(Level, if (body) |b| b.len else 0);
         @memset(ll, .threadgroup);
-        return .{ .name = name, .param_names = param_names, .body = body, .param_level = pl, .line_level = ll };
+        return .{ .name = name, .param_names = param_names, .body = body, .param_level = pl, .param_mem = pm, .param_store = ps, .param_escapes = pe, .line_level = ll };
     }
 
     pub fn deinit(f: *Func, gpa: Allocator) void {
         gpa.free(f.param_level);
+        gpa.free(f.param_mem);
+        gpa.free(f.param_store);
+        gpa.free(f.param_escapes);
         gpa.free(f.line_level);
     }
 };
@@ -174,16 +251,77 @@ pub const Func = struct {
 /// point's `param_level` needs to be seeded; the results of functions
 /// nothing reaches are meaningless but harmless (their parameters stay
 /// uniform, so no divergence flows out of them).
+///
+/// A worklist, not rounds over the whole module: a function is analysed
+/// again only when an input of it rose (a parameter's level or private
+/// content, from a call site) or an output of a callee did (its return
+/// level, convergence scope, or what it stores through or lets escape
+/// from a pointer parameter). Callees are found by name in a hash map. A
+/// module of F helpers and a call chain of depth D therefore costs about
+/// one analysis per function and change instead of D rounds of F scans
+/// (review finding: 20 000 helpers took 113 s, a 10 000-deep chain 21 s).
 pub fn analyse(gpa: Allocator, funcs: []Func) Error!void {
-    var changed = true;
-    while (changed) {
-        changed = false;
-        for (funcs, 0..) |*f, i| {
-            if (f.body == null) continue;
-            if (try analyseOne(gpa, funcs, i)) changed = true;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    var m = try Module.init(arena.allocator(), funcs);
+    for (funcs, 0..) |_, i| try m.enqueue(@intCast(i));
+    while (m.head < m.queue.items.len) {
+        const fi = m.queue.items[m.head];
+        m.head += 1;
+        if (m.head == m.queue.items.len) {
+            m.queue.clearRetainingCapacity();
+            m.head = 0;
         }
+        m.queued[fi] = false;
+        try analyseOne(gpa, &m, fi);
     }
 }
+
+/// The module-wide bookkeeping of `analyse`.
+const Module = struct {
+    a: Allocator,
+    funcs: []Func,
+    /// Function name -> index (the first of a name, as a linear search
+    /// would find it).
+    index: std.StringHashMapUnmanaged(u32) = .empty,
+    /// Per function: the distinct functions seen calling it.
+    callers: []std.ArrayList(u32),
+    edges: std.AutoHashMapUnmanaged(u64, void) = .empty,
+    queued: []bool,
+    queue: std.ArrayList(u32) = .empty,
+    head: usize = 0,
+
+    fn init(a: Allocator, funcs: []Func) Error!Module {
+        var m = Module{ .a = a, .funcs = funcs, .callers = try a.alloc(std.ArrayList(u32), funcs.len), .queued = try a.alloc(bool, funcs.len) };
+        @memset(m.callers, .empty);
+        @memset(m.queued, false);
+        for (funcs, 0..) |f, i| {
+            const gop = try m.index.getOrPut(a, f.name);
+            if (!gop.found_existing) gop.value_ptr.* = @intCast(i);
+        }
+        return m;
+    }
+
+    fn find(m: *const Module, name: []const u8) ?u32 {
+        return m.index.get(name);
+    }
+
+    fn enqueue(m: *Module, fi: u32) Error!void {
+        if (m.queued[fi] or m.funcs[fi].body == null) return;
+        m.queued[fi] = true;
+        try m.queue.append(m.a, fi);
+    }
+
+    fn addCaller(m: *Module, callee: u32, caller: u32) Error!void {
+        const gop = try m.edges.getOrPut(m.a, (@as(u64, callee) << 32) | caller);
+        if (!gop.found_existing) try m.callers[callee].append(m.a, caller);
+    }
+
+    /// An output of `fi` rose: its callers read it.
+    fn outputsChanged(m: *Module, fi: u32) Error!void {
+        for (m.callers[fi].items) |c| try m.enqueue(c);
+    }
+};
 
 /// The SIMD-group reductions: the result is the same for every lane of the
 /// SIMD-group whatever the lanes passed in (`air.simd_sum.f32`,
@@ -212,10 +350,33 @@ fn callResultLevel(name: []const u8) Level {
 
 // ── Per-function analysis ───────────────────────────────────────────────────
 
+/// A private variable: an `alloca` of this function, or a pointer
+/// parameter some caller passes a private variable to (module doc).
+const Root = struct {
+    /// The `%name` of the alloca or parameter.
+    name: []const u8,
+    /// The parameter index, for a parameter.
+    param: ?u32 = null,
+    /// Its address reaches something other than a load, a store, a
+    /// getelementptr or a helper call: it is not followed.
+    escaped: bool = false,
+    /// What the callers stored in it (a parameter's `Func.param_mem`).
+    content: Level = .threadgroup,
+    /// What this function (and its callees) store into it; null if
+    /// nothing.
+    written: ?Level = null,
+
+    fn level(r: Root) Level {
+        return r.content.join(r.written orelse .threadgroup);
+    }
+};
+
+const none: u32 = std.math.maxInt(u32);
+
 const Analyser = struct {
     a: Allocator,
-    funcs: []Func,
-    fi: usize,
+    mod: *Module,
+    fi: u32,
     body: []const []const u8,
     cfg: Cfg,
     /// Level of every value above `.threadgroup` (function-local names).
@@ -229,12 +390,50 @@ const Analyser = struct {
     /// condition rises).
     branch_level: []Level,
     /// Lazily built control-flow facts.
-    pdom: ?[]bool = null,
-    loops: ?[]Loop = null,
+    ctl: ?Control = null,
     ret_level: Level = .threadgroup,
     convergent: Scope = .none,
-    inter_changed: bool = false,
     local_changed: bool = false,
+    /// Private variables (`findRoots`).
+    roots: std.ArrayList(Root) = .empty,
+    /// Pointer name (a root or a getelementptr from one) -> root index.
+    root_of: std.StringHashMapUnmanaged(u32) = .empty,
+    /// Scratch for `expandBranch`: per block the epoch it was last
+    /// reached in and the join count of that epoch, per loop the epoch
+    /// its header was last hit in.
+    reached: []u32,
+    join_epoch: []u32,
+    join_count: []u32,
+    hit_epoch: []u32 = &.{},
+    epoch: u32 = 0,
+    region: std.ArrayList(u32) = .empty,
+    hits: std.ArrayList(u32) = .empty,
+    stack: std.ArrayList(u32) = .empty,
+
+    fn init(a: Allocator, mod: *Module, fi: u32) Error!Analyser {
+        const body = mod.funcs[fi].body.?;
+        const cfg = try Cfg.build(a, body);
+        const n = cfg.n;
+        const s = Analyser{
+            .a = a,
+            .mod = mod,
+            .fi = fi,
+            .body = body,
+            .cfg = cfg,
+            .block_level = try a.alloc(Level, n),
+            .join = try a.alloc(Level, n),
+            .branch_level = try a.alloc(Level, n),
+            .reached = try a.alloc(u32, n),
+            .join_epoch = try a.alloc(u32, n),
+            .join_count = try a.alloc(u32, n),
+        };
+        @memset(s.block_level, .threadgroup);
+        @memset(s.join, .threadgroup);
+        @memset(s.branch_level, .threadgroup);
+        @memset(s.reached, 0);
+        @memset(s.join_epoch, 0);
+        return s;
+    }
 
     fn levelOfName(s: *Analyser, name: []const u8) Level {
         return s.div.get(name) orelse .threadgroup;
@@ -252,23 +451,52 @@ const Analyser = struct {
         s.local_changed = true;
     }
 
+    /// The followed (non-escaping) private variable `name` points into.
+    fn trackedRoot(s: *Analyser, name: []const u8) ?*Root {
+        const r = &s.roots.items[s.root_of.get(name) orelse return null];
+        return if (r.escaped) null else r;
+    }
+
+    fn raiseWritten(s: *Analyser, r: *Root, level: Level) void {
+        if (r.written) |w| if (!level.above(w)) return;
+        r.written = level;
+        s.local_changed = true;
+    }
+
     fn run(s: *Analyser) Error!void {
-        const f = &s.funcs[s.fi];
+        const f = &s.mod.funcs[s.fi];
         for (f.param_names, f.param_level) |p, l| if (l != .threadgroup) try s.div.put(s.a, p, l);
+        try s.findRoots();
+        // An escaped variable is not followed: its address, every pointer
+        // derived from it and every load through one is per-thread.
+        for (s.roots.items) |r| if (r.escaped) try s.raiseValue(r.name, .thread);
         s.local_changed = true;
         while (s.local_changed) {
             s.local_changed = false;
             for (s.body, 0..) |raw, li| try s.visitLine(raw, li);
         }
         for (f.line_level, 0..) |*ll, li| ll.* = s.block_level[s.cfg.line_block[li]];
+        var changed = false;
         if (s.ret_level.above(f.ret_level)) {
             f.ret_level = s.ret_level;
-            s.inter_changed = true;
+            changed = true;
         }
         if (@backingInt(s.convergent) > @backingInt(f.convergent)) {
             f.convergent = s.convergent;
-            s.inter_changed = true;
+            changed = true;
         }
+        for (s.roots.items) |r| {
+            const pi = r.param orelse continue;
+            if (r.escaped and !f.param_escapes[pi]) {
+                f.param_escapes[pi] = true;
+                changed = true;
+            }
+            if (r.written) |w| if (f.param_store[pi] == null or w.above(f.param_store[pi].?)) {
+                f.param_store[pi] = w;
+                changed = true;
+            };
+        }
+        if (changed) try s.mod.outputsChanged(s.fi);
     }
 
     fn visitLine(s: *Analyser, raw: []const u8, li: usize) Error!void {
@@ -293,10 +521,29 @@ const Analyser = struct {
         var level: Level = undefined;
         if (std.mem.eql(u8, op, "phi")) {
             level = s.levelOf(rest).join(s.join[blk]);
-        } else if (std.mem.eql(u8, op, "alloca") or std.mem.eql(u8, op, "atomicrmw") or std.mem.eql(u8, op, "cmpxchg")) {
+        } else if (std.mem.eql(u8, op, "alloca")) {
+            // The address of a followed variable names the same variable
+            // in every thread; what it holds is tracked in its `Root`.
+            level = if (result != null and s.trackedRoot(result.?) != null) .threadgroup else .thread;
+        } else if (std.mem.eql(u8, op, "atomicrmw") or std.mem.eql(u8, op, "cmpxchg")) {
             level = .thread;
+        } else if (std.mem.eql(u8, op, "load")) {
+            if (startsWithWord(rest, "atomic")) {
+                level = .thread;
+            } else if (lastName(rest)) |ptr| {
+                level = s.levelOf(rest);
+                if (s.trackedRoot(ptr.name)) |r| level = level.join(r.level());
+            } else level = s.levelOf(rest);
+        } else if (std.mem.eql(u8, op, "store")) {
+            if (startsWithWord(rest, "atomic")) return;
+            const ptr = lastName(rest) orelse return;
+            const r = s.trackedRoot(ptr.name) orelse return;
+            // The value, the element the address selects, and which
+            // threads store at all.
+            s.raiseWritten(r, s.levelOf(rest[0..ptr.start]).join(s.levelOfName(ptr.name)).join(s.block_level[blk]));
+            return;
         } else if (std.mem.eql(u8, op, "call")) {
-            level = try s.visitCall(rest);
+            level = try s.visitCall(rest, blk);
         } else if (std.mem.eql(u8, op, "br") or std.mem.eql(u8, op, "switch")) {
             const l = s.levelOf(rest);
             if (l.above(s.branch_level[blk])) {
@@ -320,19 +567,16 @@ const Analyser = struct {
     /// `[fast-math] [cc] [attrs] RET [(fn type)] @callee(args) [bundle]`:
     /// the callee is the first `@`; nothing before it may contain one.
     /// Returns the level of the result.
-    fn visitCall(s: *Analyser, rest: []const u8) Error!Level {
+    fn visitCall(s: *Analyser, rest: []const u8, blk: u32) Error!Level {
         const at = std.mem.findScalar(u8, rest, '@') orelse return s.levelOf(rest);
         var c = Scanner{ .s = rest, .i = at + 1 };
         const callee = c.name();
         c.skipWs();
         var args_level: Level = .threadgroup;
-        var callee_index: ?usize = null;
-        for (s.funcs, 0..) |cf, i| if (std.mem.eql(u8, cf.name, callee)) {
-            callee_index = i;
-            break;
-        };
+        const callee_index = s.mod.find(callee);
+        if (callee_index) |ci| try s.mod.addCaller(ci, s.fi);
         s.convergent = s.convergent.join(callScope(callee));
-        if (callee_index) |ci| s.convergent = s.convergent.join(s.funcs[ci].convergent);
+        if (callee_index) |ci| s.convergent = s.convergent.join(s.mod.funcs[ci].convergent);
         if (c.eat('(')) {
             var arg_index: usize = 0;
             while (true) {
@@ -342,10 +586,13 @@ const Analyser = struct {
                 const l = s.levelOf(arg);
                 args_level = args_level.join(l);
                 if (callee_index) |ci| {
-                    const cf = &s.funcs[ci];
-                    if (arg_index < cf.param_level.len and l.above(cf.param_level[arg_index])) {
-                        cf.param_level[arg_index] = l;
-                        s.inter_changed = true;
+                    const cf = &s.mod.funcs[ci];
+                    if (arg_index < cf.param_level.len) {
+                        if (l.above(cf.param_level[arg_index])) {
+                            cf.param_level[arg_index] = l;
+                            try s.mod.enqueue(ci);
+                        }
+                        if (cf.body != null and isPrivatePointer(arg)) try s.passPointer(cf, ci, arg_index, arg, l, blk);
                     }
                 }
                 arg_index += 1;
@@ -357,11 +604,171 @@ const Analyser = struct {
             }
         }
         if (callee_index) |ci| {
-            const cf = s.funcs[ci];
+            const cf = s.mod.funcs[ci];
             if (cf.body != null) return args_level.join(cf.ret_level);
         }
         if (isSimdReduction(callee)) return .simdgroup;
         return args_level.join(callResultLevel(callee));
+    }
+
+    /// A private pointer passed to helper `cf`'s parameter `pi`: the
+    /// helper reads the variable's content through it, and what it
+    /// stores through it lands in the variable (for the threads that make
+    /// the call). A pointer this function does not follow carries
+    /// unknown, per-thread content.
+    fn passPointer(s: *Analyser, cf: *Func, ci: u32, pi: usize, arg: []const u8, l: Level, blk: u32) Error!void {
+        const name = lastName(arg);
+        const root: ?*Root = if (name) |n| s.trackedRoot(n.name) else null;
+        const content: Level = if (root) |r| r.level() else if (name != null) .thread else .threadgroup;
+        if (cf.param_mem[pi] == null or content.above(cf.param_mem[pi].?)) {
+            cf.param_mem[pi] = content;
+            try s.mod.enqueue(ci);
+        }
+        if (root) |r| if (cf.param_store[pi]) |st| s.raiseWritten(r, st.join(l).join(s.block_level[blk]));
+    }
+
+    /// Collect the private variables (module doc): every `alloca`, every
+    /// pointer parameter a caller passes a private variable to, and the
+    /// `getelementptr`s derived from them; then mark a variable escaped
+    /// when a pointer into it is used other than as the address of a
+    /// plain `load` or `store`, the base of a `getelementptr`, or an
+    /// argument of a helper whose parameter does not escape.
+    fn findRoots(s: *Analyser) Error!void {
+        const f = s.mod.funcs[s.fi];
+        for (f.param_names, f.param_mem, 0..) |p, pm, i| if (pm) |content| {
+            try s.addRoot(.{ .name = p, .param = @intCast(i), .content = content });
+        };
+        // getelementptr result -> its base operand.
+        var gep_base: std.StringHashMapUnmanaged([]const u8) = .empty;
+        for (s.body) |raw| {
+            const line = instructionText(raw) orelse continue;
+            var c = Scanner{ .s = line };
+            if (c.peek() != '%') continue;
+            _ = c.next();
+            const name = c.name();
+            c.skipWs();
+            if (!c.eat('=')) continue;
+            c.skipWs();
+            const op = c.word();
+            if (std.mem.eql(u8, op, "alloca")) {
+                try s.addRoot(.{ .name = name });
+            } else if (std.mem.eql(u8, op, "getelementptr")) {
+                const base = gepBase(c.rest()) orelse continue;
+                try gep_base.put(s.a, name, base.name);
+            }
+        }
+        if (s.roots.items.len == 0) return;
+        // Derived pointers, whatever the textual order of the chain; each
+        // getelementptr is resolved once (`no_root`: not derived from a
+        // variable, such as every device-buffer address).
+        var no_root: std.StringHashMapUnmanaged(void) = .empty;
+        var it = gep_base.iterator();
+        var path: std.ArrayList([]const u8) = .empty;
+        while (it.next()) |e| {
+            if (s.root_of.contains(e.key_ptr.*) or no_root.contains(e.key_ptr.*)) continue;
+            path.clearRetainingCapacity();
+            var cur = e.key_ptr.*;
+            const root: ?u32 = while (true) {
+                if (s.root_of.get(cur)) |r| break r;
+                if (no_root.contains(cur)) break null;
+                const base = gep_base.get(cur) orelse break null;
+                try path.append(s.a, cur);
+                if (path.items.len > gep_base.count()) break null; // a cycle: not SSA
+                cur = base;
+            };
+            if (root) |r| {
+                for (path.items) |p| try s.root_of.put(s.a, p, r);
+            } else for (path.items) |p| try no_root.put(s.a, p, {});
+        }
+        // Escapes.
+        for (s.body) |raw| {
+            const line = instructionText(raw) orelse continue;
+            var c = Scanner{ .s = line };
+            if (c.peek() == '%') {
+                const save = c.i;
+                _ = c.next();
+                _ = c.name();
+                c.skipWs();
+                if (!c.eat('=')) c.i = save;
+            }
+            c.skipWs();
+            var op = c.word();
+            if (std.mem.eql(u8, op, "tail") or std.mem.eql(u8, op, "musttail") or std.mem.eql(u8, op, "notail")) {
+                c.skipWs();
+                op = c.word();
+            }
+            if (std.mem.eql(u8, op, "alloca")) continue;
+            const rest = c.rest();
+            if (std.mem.eql(u8, op, "call")) {
+                try s.callEscapes(rest);
+                continue;
+            }
+            const plain = !startsWithWord(rest, "atomic");
+            const last = lastName(rest);
+            const is_mem = plain and (std.mem.eql(u8, op, "load") or std.mem.eql(u8, op, "store"));
+            const base: ?NameAt = if (std.mem.eql(u8, op, "getelementptr")) gepBase(rest) else null;
+            var r = Scanner{ .s = rest };
+            while (!r.atEnd()) {
+                const at = r.i;
+                if (r.next() != '%') continue;
+                const ri = s.root_of.get(r.name()) orelse continue;
+                const ok = (is_mem and last != null and last.?.start == at) or (base != null and base.?.start == at);
+                if (!ok) s.roots.items[ri].escaped = true;
+            }
+        }
+    }
+
+    fn addRoot(s: *Analyser, root: Root) Error!void {
+        const gop = try s.root_of.getOrPut(s.a, root.name);
+        if (gop.found_existing) return;
+        gop.value_ptr.* = @intCast(s.roots.items.len);
+        try s.roots.append(s.a, root);
+    }
+
+    /// The escape rule for a call: a private pointer may be an argument
+    /// of a helper (a `define`) whose parameter does not escape, and of
+    /// `llvm.lifetime.*`; anything else (`llvm.memcpy`, an intrinsic, an
+    /// external function) lets it escape.
+    fn callEscapes(s: *Analyser, rest: []const u8) Error!void {
+        const at = std.mem.findScalar(u8, rest, '@') orelse return s.escapeAll(rest);
+        var c = Scanner{ .s = rest, .i = at + 1 };
+        const callee = c.name();
+        c.skipWs();
+        const ci = s.mod.find(callee);
+        if (ci) |i| try s.mod.addCaller(i, s.fi);
+        const harmless = std.mem.startsWith(u8, callee, "llvm.lifetime.");
+        if (!c.eat('(')) return;
+        var arg_index: usize = 0;
+        while (true) {
+            c.skipWs();
+            if (c.eat(')') or c.atEnd()) break;
+            const arg = c.argument();
+            if (!harmless) {
+                const pass = if (ci) |i| blk: {
+                    const cf = s.mod.funcs[i];
+                    break :blk cf.body != null and arg_index < cf.param_escapes.len and !cf.param_escapes[arg_index] and isPrivatePointer(arg);
+                } else false;
+                const last = lastName(arg);
+                var r = Scanner{ .s = arg };
+                while (!r.atEnd()) {
+                    const p = r.i;
+                    if (r.next() != '%') continue;
+                    const ri = s.root_of.get(r.name()) orelse continue;
+                    if (!(pass and last != null and last.?.start == p)) s.roots.items[ri].escaped = true;
+                }
+            }
+            arg_index += 1;
+            c.skipWs();
+            if (!c.eat(',')) break;
+        }
+    }
+
+    fn escapeAll(s: *Analyser, text: []const u8) void {
+        var r = Scanner{ .s = text };
+        while (!r.atEnd()) {
+            if (r.next() != '%') continue;
+            if (s.root_of.get(r.name())) |ri| s.roots.items[ri].escaped = true;
+        }
     }
 
     /// The join of the levels of every `%name` in `text`. Block labels and
@@ -380,37 +787,37 @@ const Analyser = struct {
     /// Block `x` ends in a branch on a value of `level`: raise the blocks
     /// that only a subset of the threads reaches, the loops the subset
     /// leaves or re-enters at its own pace, and the joins whose phis merge
-    /// values from different subsets.
+    /// values from different subsets. Costs O(region + loops hit), with
+    /// O(1) post-dominance and loop-membership queries (`Control`).
     fn expandBranch(s: *Analyser, x: u32, level: Level) Error!void {
         const a = s.a;
-        const n = s.cfg.n;
-        const pdom = try s.postDominators();
-        const loops = try s.naturalLoops();
-        const reached = try a.alloc(bool, n);
-        @memset(reached, false);
-        // Headers of loops containing `x` that a path from `x`'s
-        // successors reaches without passing a post-dominator of `x`.
-        const header_hit = try a.alloc(bool, loops.len);
-        @memset(header_hit, false);
-        var stack: std.ArrayList(u32) = .empty;
-        for (s.cfg.succs[x]) |succ| try stack.append(a, succ);
-        while (stack.pop()) |b| {
-            if (reached[b]) continue;
+        const ctl = try s.control();
+        s.epoch += 1;
+        const ep = s.epoch;
+        s.region.clearRetainingCapacity();
+        s.hits.clearRetainingCapacity();
+        s.stack.clearRetainingCapacity();
+        for (s.cfg.succs[x]) |succ| try s.stack.append(a, succ);
+        while (s.stack.pop()) |b| {
+            if (s.reached[b] == ep) continue;
             // The region ends at the headers of the loops around `x`: the
             // threads arriving there start another iteration. (Checked
             // before post-dominance: `x` post-dominates itself, but reaching
             // it again through a back edge is exactly this case.)
-            var is_header = false;
-            for (loops, 0..) |l, li| if (l.header == b and l.members[x]) {
-                header_hit[li] = true;
-                is_header = true;
-            };
-            if (is_header) continue;
+            const li = ctl.header_loop[b];
+            if (li != none and ctl.loops[li].members.isSet(x)) {
+                if (s.hit_epoch[li] != ep) {
+                    s.hit_epoch[li] = ep;
+                    try s.hits.append(a, li);
+                }
+                continue;
+            }
             // A block every path from `x` passes reconverges the threads.
-            if (pdom[@as(usize, x) * n + b]) continue;
-            reached[b] = true;
+            if (ctl.postDominates(b, x)) continue;
+            s.reached[b] = ep;
+            try s.region.append(a, b);
             s.raiseBlock(b, level);
-            for (s.cfg.succs[b]) |succ| if (!reached[succ]) try stack.append(a, succ);
+            for (s.cfg.succs[b]) |succ| if (s.reached[succ] != ep) try s.stack.append(a, succ);
         }
         // Temporal divergence: some of the threads that passed `x` start
         // the next iteration of a loop while others leave it (an edge out
@@ -418,29 +825,36 @@ const Analyser = struct {
         // trap leaves nothing behind and does not count). Every block of
         // that loop then runs for threads at different iterations, and
         // every value it defines is seen at different iterations after it.
-        for (loops, header_hit) |l, hit| {
-            if (!hit) continue;
+        for (s.hits.items) |li| {
+            const l = ctl.loops[li];
             var leaves = false;
-            for (0..n) |u| {
-                if (u != x and !reached[u]) continue;
-                for (s.cfg.succs[u]) |v| if (!l.members[v] and !s.cfg.traps[v]) {
-                    leaves = true;
-                };
-            }
+            for (s.cfg.succs[x]) |v| if (!l.members.isSet(v) and !s.cfg.traps[v]) {
+                leaves = true;
+            };
+            for (s.region.items) |u| for (s.cfg.succs[u]) |v| if (!l.members.isSet(v) and !s.cfg.traps[v]) {
+                leaves = true;
+            };
             if (!leaves) continue;
-            for (l.members, 0..) |m, i| if (m and !reached[i]) {
-                reached[i] = true;
+            for (l.list) |i| if (s.reached[i] != ep) {
+                s.reached[i] = ep;
+                try s.region.append(a, i);
                 s.raiseBlock(i, level);
-                try s.raiseBlockValues(@intCast(i), level);
+                try s.raiseBlockValues(i, level);
             };
         }
         // Joins: two or more predecessors among the branch and the region.
-        for (0..n) |j| {
-            var count: usize = 0;
-            for (s.cfg.preds[j]) |p| if (p == x or reached[p]) {
-                count += 1;
-            };
-            if (count >= 2 and level.above(s.join[j])) {
+        if (s.reached[x] != ep) s.countJoins(x, ep, level);
+        for (s.region.items) |u| s.countJoins(u, ep, level);
+    }
+
+    fn countJoins(s: *Analyser, u: u32, ep: u32, level: Level) void {
+        for (s.cfg.succs[u]) |j| {
+            if (s.join_epoch[j] != ep) {
+                s.join_epoch[j] = ep;
+                s.join_count[j] = 0;
+            }
+            s.join_count[j] += 1;
+            if (s.join_count[j] == 2 and level.above(s.join[j])) {
                 s.join[j] = level;
                 s.local_changed = true;
             }
@@ -450,9 +864,8 @@ const Analyser = struct {
     /// Every value defined in block `b` (temporal divergence: threads see
     /// the loop's values at different iterations).
     fn raiseBlockValues(s: *Analyser, b: u32, level: Level) Error!void {
-        for (s.body, 0..) |raw, li| {
-            if (s.cfg.line_block[li] != b) continue;
-            const line = instructionText(raw) orelse continue;
+        for (s.cfg.blockLines(b)) |li| {
+            const line = instructionText(s.body[li]) orelse continue;
             var c = Scanner{ .s = line };
             if (c.peek() != '%') continue;
             _ = c.next();
@@ -462,135 +875,229 @@ const Analyser = struct {
         }
     }
 
-    /// `pdom[b * n + a]`: block `a` post-dominates block `b`. Greatest
-    /// fixpoint of `pdom(b) = {b} ∪ ⋂ pdom(succ)`, so a block every
-    /// terminating path passes post-dominates even through a loop. A
-    /// no-return block (`unreachable`) has the full row: no path through it
-    /// reaches the exit, so it does not cut post-dominance (the block
-    /// after `if (i >= 64) trap` post-dominates the check).
-    fn postDominators(s: *Analyser) Error![]bool {
-        if (s.pdom) |p| return p;
-        const n = s.cfg.n;
-        const tab = try s.a.alloc(bool, n * n);
-        for (0..n) |b| {
-            const row = tab[b * n .. (b + 1) * n];
-            if (s.cfg.succs[b].len == 0 and !s.cfg.traps[b]) {
-                @memset(row, false);
-                row[b] = true;
-            } else @memset(row, true);
+    fn control(s: *Analyser) Error!*const Control {
+        if (s.ctl == null) {
+            s.ctl = try Control.build(s.a, s.cfg);
+            s.hit_epoch = try s.a.alloc(u32, s.ctl.?.loops.len);
+            @memset(s.hit_epoch, 0);
         }
-        var changed = true;
-        while (changed) {
-            changed = false;
-            for (0..n) |b| {
-                if (s.cfg.succs[b].len == 0) continue;
-                for (0..n) |v| {
-                    if (!tab[b * n + v] or v == b) continue;
-                    var keep = true;
-                    for (s.cfg.succs[b]) |succ| if (!tab[@as(usize, succ) * n + v]) {
-                        keep = false;
-                        break;
-                    };
-                    if (!keep) {
-                        tab[b * n + v] = false;
-                        changed = true;
-                    }
-                }
-            }
-        }
-        s.pdom = tab;
-        return tab;
-    }
-
-    /// Natural loops from the back edges of the dominator tree (one entry
-    /// per header, the loops of one header merged).
-    fn naturalLoops(s: *Analyser) Error![]Loop {
-        if (s.loops) |l| return l;
-        const a = s.a;
-        const n = s.cfg.n;
-        // dom[b * n + v]: v dominates b.
-        const dom = try a.alloc(bool, n * n);
-        @memset(dom, true);
-        @memset(dom[0..n], false);
-        dom[0] = true;
-        var changed = true;
-        while (changed) {
-            changed = false;
-            for (1..n) |b| {
-                if (!s.cfg.reach[b]) continue;
-                for (0..n) |v| {
-                    if (!dom[b * n + v] or v == b) continue;
-                    var keep = true;
-                    for (s.cfg.preds[b]) |p| if (!dom[@as(usize, p) * n + v]) {
-                        keep = false;
-                        break;
-                    };
-                    if (!keep) {
-                        dom[b * n + v] = false;
-                        changed = true;
-                    }
-                }
-            }
-        }
-        var loops: std.ArrayList(Loop) = .empty;
-        for (0..n) |u| {
-            if (!s.cfg.reach[u]) continue;
-            for (s.cfg.succs[u]) |h| {
-                if (!dom[u * n + h]) continue;
-                var loop: *Loop = undefined;
-                var found = false;
-                for (loops.items) |*l| if (l.header == h) {
-                    loop = l;
-                    found = true;
-                    break;
-                };
-                if (!found) {
-                    const members = try a.alloc(bool, n);
-                    @memset(members, false);
-                    members[h] = true;
-                    try loops.append(a, .{ .header = h, .members = members });
-                    loop = &loops.items[loops.items.len - 1];
-                }
-                var stack: std.ArrayList(u32) = .empty;
-                try stack.append(a, @intCast(u));
-                while (stack.pop()) |b| {
-                    if (loop.members[b]) continue;
-                    loop.members[b] = true;
-                    for (s.cfg.preds[b]) |p| try stack.append(a, p);
-                }
-            }
-        }
-        s.loops = loops.items;
-        return loops.items;
+        return &s.ctl.?;
     }
 };
 
-const Loop = struct { header: u32, members: []bool };
+/// A natural loop: its header, its blocks as a set and as a list.
+const Loop = struct { header: u32, members: std.DynamicBitSetUnmanaged, list: []u32 };
 
-fn analyseOne(gpa: Allocator, funcs: []Func, fi: usize) Error!bool {
+/// The control-flow facts `expandBranch` needs, in O(N + E) space: the
+/// post-dominator tree and the dominator tree (Cooper, Harvey and
+/// Kennedy's iterative algorithm, "A Simple, Fast Dominance Algorithm"),
+/// each numbered in DFS pre/post order so "a (post-)dominates b" is two
+/// comparisons, and the natural loops. The former n x n tables cost O(n^2)
+/// memory and an O(n^3) fixpoint (review finding: a 1000-block chain behind
+/// one divergent branch took 17 s, 1600 sequential ifs 111 s).
+const Control = struct {
+    /// The block has a path to a return. Post-dominance is the greatest
+    /// fixpoint of `pdom(b) = {b} ∪ ⋂ pdom(succ)` with a returning block's
+    /// set `{b}`, so a block with no path to a return (it traps or loops
+    /// forever) is post-dominated by every block and post-dominates
+    /// nothing that returns: a no-return path does not cut post-dominance
+    /// (the block after `if (i >= 64) trap` post-dominates the check).
+    to_exit: []bool,
+    /// DFS numbering of the post-dominator tree, rooted at a virtual exit
+    /// joining the returns.
+    pd_pre: []u32,
+    pd_post: []u32,
+    loops: []Loop,
+    /// Per block: the index of the loop it heads, or `none`.
+    header_loop: []u32,
+
+    /// Whether `b` post-dominates `x`.
+    fn postDominates(c: *const Control, b: u32, x: u32) bool {
+        if (!c.to_exit[x]) return true;
+        if (!c.to_exit[b]) return false;
+        return c.pd_pre[b] <= c.pd_pre[x] and c.pd_post[x] <= c.pd_post[b];
+    }
+
+    fn build(a: Allocator, cfg: Cfg) Error!Control {
+        const n = cfg.n;
+        // Post-dominators: the reverse graph plus a virtual exit `n`.
+        const v: u32 = @intCast(n);
+        var exits: std.ArrayList(u32) = .empty;
+        for (0..n) |b| if (cfg.reach[b] and cfg.succs[b].len == 0 and !cfg.traps[b]) try exits.append(a, @intCast(b));
+        const rsucc = try a.alloc([]const u32, n + 1);
+        const rpred = try a.alloc([]const u32, n + 1);
+        for (0..n) |b| {
+            rsucc[b] = cfg.preds[b];
+            const is_exit = cfg.reach[b] and cfg.succs[b].len == 0 and !cfg.traps[b];
+            if (is_exit) {
+                const p = try a.alloc(u32, 1);
+                p[0] = v;
+                rpred[b] = p;
+            } else rpred[b] = cfg.succs[b];
+        }
+        rsucc[n] = exits.items;
+        rpred[n] = &.{};
+        const pd = try dominatorTree(a, n + 1, v, rsucc, rpred);
+        const to_exit = try a.alloc(bool, n);
+        for (to_exit, 0..) |*t, b| t.* = pd.pre[b] != none;
+
+        // Dominators from the entry, for the back edges.
+        const succs_c = try a.alloc([]const u32, n);
+        const preds_c = try a.alloc([]const u32, n);
+        for (0..n) |b| {
+            succs_c[b] = cfg.succs[b];
+            preds_c[b] = cfg.preds[b];
+        }
+        const dt = try dominatorTree(a, n, 0, succs_c, preds_c);
+        const header_loop = try a.alloc(u32, n);
+        @memset(header_loop, none);
+        var loops: std.ArrayList(Loop) = .empty;
+        var stack: std.ArrayList(u32) = .empty;
+        for (0..n) |u| {
+            if (!cfg.reach[u] or dt.pre[u] == none) continue;
+            for (cfg.succs[u]) |h| {
+                // A back edge `u -> h`: `h` dominates `u`.
+                if (!(dt.pre[h] <= dt.pre[u] and dt.post[u] <= dt.post[h])) continue;
+                if (header_loop[h] == none) {
+                    header_loop[h] = @intCast(loops.items.len);
+                    var members = try std.DynamicBitSetUnmanaged.initEmpty(a, n);
+                    members.set(h);
+                    const list = try a.alloc(u32, 1);
+                    list[0] = h;
+                    try loops.append(a, .{ .header = h, .members = members, .list = list });
+                }
+                const loop = &loops.items[header_loop[h]];
+                var list: std.ArrayList(u32) = .fromOwnedSlice(loop.list);
+                stack.clearRetainingCapacity();
+                try stack.append(a, @intCast(u));
+                while (stack.pop()) |b| {
+                    if (loop.members.isSet(b)) continue;
+                    loop.members.set(b);
+                    try list.append(a, b);
+                    for (cfg.preds[b]) |p| try stack.append(a, p);
+                }
+                loop.list = list.items;
+            }
+        }
+        return .{ .to_exit = to_exit, .pd_pre = pd.pre, .pd_post = pd.post, .loops = loops.items, .header_loop = header_loop };
+    }
+};
+
+/// A (post-)dominator tree numbered in DFS pre/post order: `a` dominates
+/// `b` iff `pre[a] <= pre[b] and post[b] <= post[a]`; `pre[b] == none`
+/// for a node the root does not reach.
+const DomTree = struct { pre: []u32, post: []u32 };
+
+/// Cooper-Harvey-Kennedy over `succ` from `root` (`pred` is its reverse,
+/// possibly naming nodes the root does not reach).
+fn dominatorTree(a: Allocator, n: usize, root: u32, succ: []const []const u32, pred: []const []const u32) Error!DomTree {
+    // Postorder of a DFS from the root.
+    const po = try a.alloc(u32, n);
+    @memset(po, none);
+    var order: std.ArrayList(u32) = .empty;
+    {
+        const Frame = struct { node: u32, next: u32 };
+        var stack: std.ArrayList(Frame) = .empty;
+        const seen = try a.alloc(bool, n);
+        @memset(seen, false);
+        seen[root] = true;
+        try stack.append(a, .{ .node = root, .next = 0 });
+        while (stack.items.len > 0) {
+            const top = &stack.items[stack.items.len - 1];
+            const ss = succ[top.node];
+            if (top.next < ss.len) {
+                const w = ss[top.next];
+                top.next += 1;
+                if (!seen[w]) {
+                    seen[w] = true;
+                    try stack.append(a, .{ .node = w, .next = 0 });
+                }
+                continue;
+            }
+            po[top.node] = @intCast(order.items.len);
+            try order.append(a, top.node);
+            _ = stack.pop();
+        }
+    }
+    const idom = try a.alloc(u32, n);
+    @memset(idom, none);
+    idom[root] = root;
+    var changed = true;
+    while (changed) {
+        changed = false;
+        var k = order.items.len;
+        while (k > 0) {
+            k -= 1;
+            const b = order.items[k];
+            if (b == root) continue;
+            var new: u32 = none;
+            for (pred[b]) |p| {
+                if (po[p] == none or idom[p] == none) continue;
+                if (new == none) {
+                    new = p;
+                    continue;
+                }
+                var x = p;
+                var y = new;
+                while (x != y) {
+                    while (po[x] < po[y]) x = idom[x];
+                    while (po[y] < po[x]) y = idom[y];
+                }
+                new = x;
+            }
+            if (new != none and idom[b] != new) {
+                idom[b] = new;
+                changed = true;
+            }
+        }
+    }
+    // Children lists, then the pre/post numbering.
+    const child_count = try a.alloc(u32, n + 1);
+    @memset(child_count, 0);
+    for (order.items) |b| if (b != root) {
+        child_count[idom[b] + 1] += 1;
+    };
+    for (1..n + 1) |i| child_count[i] += child_count[i - 1];
+    const children = try a.alloc(u32, order.items.len);
+    const fill = try a.alloc(u32, n);
+    @memcpy(fill, child_count[0..n]);
+    for (order.items) |b| if (b != root) {
+        children[fill[idom[b]]] = b;
+        fill[idom[b]] += 1;
+    };
+    const pre = try a.alloc(u32, n);
+    const post = try a.alloc(u32, n);
+    @memset(pre, none);
+    @memset(post, none);
+    const Frame = struct { node: u32, next: u32 };
+    var stack: std.ArrayList(Frame) = .empty;
+    var pre_n: u32 = 0;
+    var post_n: u32 = 0;
+    pre[root] = pre_n;
+    pre_n += 1;
+    try stack.append(a, .{ .node = root, .next = child_count[root] });
+    while (stack.items.len > 0) {
+        const top = &stack.items[stack.items.len - 1];
+        if (top.next < child_count[top.node + 1]) {
+            const w = children[top.next];
+            top.next += 1;
+            pre[w] = pre_n;
+            pre_n += 1;
+            try stack.append(a, .{ .node = w, .next = child_count[w] });
+            continue;
+        }
+        post[top.node] = post_n;
+        post_n += 1;
+        _ = stack.pop();
+    }
+    return .{ .pre = pre, .post = post };
+}
+
+fn analyseOne(gpa: Allocator, mod: *Module, fi: u32) Error!void {
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
-    const a = arena.allocator();
-    const body = funcs[fi].body.?;
-    const cfg = try Cfg.build(a, body);
-    const block_level = try a.alloc(Level, cfg.n);
-    @memset(block_level, .threadgroup);
-    const join = try a.alloc(Level, cfg.n);
-    @memset(join, .threadgroup);
-    const branch_level = try a.alloc(Level, cfg.n);
-    @memset(branch_level, .threadgroup);
-    var s = Analyser{
-        .a = a,
-        .funcs = funcs,
-        .fi = fi,
-        .body = body,
-        .cfg = cfg,
-        .block_level = block_level,
-        .join = join,
-        .branch_level = branch_level,
-    };
+    var s = try Analyser.init(arena.allocator(), mod, fi);
     try s.run();
-    return s.inter_changed;
 }
 
 // ── CFG from the text ───────────────────────────────────────────────────────
@@ -606,15 +1113,29 @@ const Cfg = struct {
     reach: []bool,
     /// The block ends in `unreachable` (a trap: no thread returns from it).
     traps: []bool,
+    /// The body lines of block `b` are `lines[line_start[b]..line_start[b + 1]]`.
+    line_start: []u32,
+    lines: []u32,
 
+    fn blockLines(cfg: Cfg, b: u32) []const u32 {
+        return cfg.lines[cfg.line_start[b]..cfg.line_start[b + 1]];
+    }
+
+    /// Labels are looked up by name in a hash map and duplicate edges are
+    /// caught with a per-block stamp, so a function of N blocks and E
+    /// branch targets costs O(N + E) (review finding: a 20 000-block chain
+    /// spent most of a minute here and in the assembler's block lookup).
     fn build(a: Allocator, body: []const []const u8) Error!Cfg {
         var names: std.ArrayList([]const u8) = .empty;
+        var index: std.StringHashMapUnmanaged(u32) = .empty;
         // The entry block is implicit unless the body opens with a label.
         var first = true;
         for (body) |raw| {
             const line = std.mem.trim(u8, raw, " \t\r");
             if (line.len == 0 or line[0] == ';') continue;
             if (labelName(line)) |name| {
+                const gop = try index.getOrPut(a, name);
+                if (!gop.found_existing) gop.value_ptr.* = @intCast(names.items.len);
                 try names.append(a, name);
             } else if (first) {
                 try names.append(a, "");
@@ -623,6 +1144,9 @@ const Cfg = struct {
         }
         if (names.items.len == 0) try names.append(a, "");
         const n = names.items.len;
+        // `edge_stamp[t] == cur + 1`: block `cur` already has an edge to `t`.
+        const edge_stamp = try a.alloc(u32, n);
+        @memset(edge_stamp, 0);
         const line_block = try a.alloc(u32, body.len);
         const edges = try a.alloc(std.ArrayList(u32), n);
         for (edges) |*e| e.* = .empty;
@@ -632,9 +1156,7 @@ const Cfg = struct {
         for (body, 0..) |raw, li| {
             const line = std.mem.trim(u8, raw, " \t\r");
             if (labelName(line)) |name| {
-                for (names.items, 0..) |nm, i| if (std.mem.eql(u8, nm, name)) {
-                    cur = @intCast(i);
-                };
+                if (index.get(name)) |i| cur = i;
                 line_block[li] = cur;
                 continue;
             }
@@ -646,13 +1168,10 @@ const Cfg = struct {
                 var c = Scanner{ .s = text, .i = p + "label %".len };
                 const target = c.name();
                 pos = c.i;
-                for (names.items, 0..) |nm, i| if (std.mem.eql(u8, nm, target)) {
-                    var dup = false;
-                    for (edges[cur].items) |e| if (e == i) {
-                        dup = true;
-                    };
-                    if (!dup) try edges[cur].append(a, @intCast(i));
-                };
+                const i = index.get(target) orelse continue;
+                if (edge_stamp[i] == cur + 1) continue;
+                edge_stamp[i] = cur + 1;
+                try edges[cur].append(a, i);
             }
         }
         const reach = try a.alloc(bool, n);
@@ -675,9 +1194,68 @@ const Cfg = struct {
         }
         const preds = try a.alloc([]u32, n);
         for (0..n) |b| preds[b] = pred_lists[b].items;
-        return .{ .n = n, .line_block = line_block, .succs = succs, .preds = preds, .reach = reach, .traps = traps };
+        const line_start = try a.alloc(u32, n + 1);
+        @memset(line_start, 0);
+        for (line_block) |b| line_start[b + 1] += 1;
+        for (1..n + 1) |b| line_start[b] += line_start[b - 1];
+        const fill = try a.alloc(u32, n);
+        @memcpy(fill, line_start[0..n]);
+        const lines = try a.alloc(u32, body.len);
+        for (line_block, 0..) |b, li| {
+            lines[fill[b]] = @intCast(li);
+            fill[b] += 1;
+        }
+        return .{ .n = n, .line_block = line_block, .succs = succs, .preds = preds, .reach = reach, .traps = traps, .line_start = line_start, .lines = lines };
     }
 };
+
+/// Whether `text` (after optional blanks) starts with the word `w`.
+fn startsWithWord(text: []const u8, w: []const u8) bool {
+    const t = std.mem.trimStart(u8, text, " \t");
+    return std.mem.startsWith(u8, t, w) and (t.len == w.len or !isIdentChar(t[w.len]));
+}
+
+const NameAt = struct { name: []const u8, start: usize };
+
+/// The last `%name` of `text` and the offset of its `%`.
+fn lastName(text: []const u8) ?NameAt {
+    var c = Scanner{ .s = text };
+    var found: ?NameAt = null;
+    while (!c.atEnd()) {
+        const at = c.i;
+        if (c.next() != '%') continue;
+        found = .{ .name = c.name(), .start = at };
+    }
+    return found;
+}
+
+/// The base pointer of `getelementptr [flags] T, ptr %base, indices...`
+/// (the operand after the first top-level comma) and its offset in `rest`.
+fn gepBase(rest: []const u8) ?NameAt {
+    var depth: usize = 0;
+    var i: usize = 0;
+    while (i < rest.len) : (i += 1) switch (rest[i]) {
+        '(', '[', '{', '<' => depth += 1,
+        ')', ']', '}', '>' => depth -|= 1,
+        ',' => if (depth == 0) break,
+        else => {},
+    };
+    if (i >= rest.len) return null;
+    var c = Scanner{ .s = rest, .i = i + 1 };
+    const arg = c.argument();
+    const n = lastName(arg) orelse return null;
+    return .{ .name = n.name, .start = i + 1 + n.start };
+}
+
+/// Whether a call argument is a thread-space pointer (`ptr %x`, `ptr
+/// noundef %x`; Zig's local space 5 is Metal's thread space too).
+fn isPrivatePointer(arg: []const u8) bool {
+    const t = std.mem.trimStart(u8, arg, " \t");
+    if (!startsWithWord(t, "ptr")) return false;
+    const after = std.mem.trimStart(u8, t[3..], " \t");
+    if (!std.mem.startsWith(u8, after, "addrspace(")) return true;
+    return std.mem.startsWith(u8, after, "addrspace(0)") or std.mem.startsWith(u8, after, "addrspace(5)");
+}
 
 /// The instruction on a body line: trimmed, with a trailing comment
 /// removed; null for blank, comment and label lines.
@@ -829,12 +1407,8 @@ test "values: per-thread parameters flow through arithmetic, loads and phis; uni
     var a2 = std.heap.ArenaAllocator.init(gpa);
     defer a2.deinit();
     const a = a2.allocator();
-    const body = t.funcs.items[fi].body.?;
-    const cfg = try Cfg.build(a, body);
-    var s = Analyser{ .a = a, .funcs = t.funcs.items, .fi = fi, .body = body, .cfg = cfg, .block_level = try a.alloc(Level, cfg.n), .join = try a.alloc(Level, cfg.n), .branch_level = try a.alloc(Level, cfg.n) };
-    @memset(s.block_level, .threadgroup);
-    @memset(s.join, .threadgroup);
-    @memset(s.branch_level, .threadgroup);
+    var mod = try Module.init(a, t.funcs.items);
+    var s = try Analyser.init(a, &mod, @intCast(fi));
     try s.run();
     try expectEqual(.threadgroup, s.levelOfName("a"));
     try expectEqual(.thread, s.levelOfName("b"));
@@ -928,6 +1502,98 @@ test "control: a guarded loop with a uniform trip count is uniform even with a p
     try expectEqual(.thread, levelAt(f, "%__27 = load"));
     try expectEqual(.threadgroup, levelAt(f, "%__14 = icmp"));
     try expectEqual(.threadgroup, levelAt(f, "ret void"));
+}
+
+test "private variables: a loop counter in an alloca is as uniform as what is stored in it" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const gpa = arena.allocator();
+    // glslang's -O0 shape (and Zig's SPIR-V backend's) as tools/spirv/
+    // lower.zig prints it: the tree reduction's counter `s` lives in an
+    // alloca; `lid` too, stored from the per-thread builtin.
+    const reduce =
+        \\  %lid = alloca i32, align 4
+        \\  %s = alloca i32, align 4
+        \\  %t = extractelement <3 x i32> %__0, i32 0
+        \\  store i32 %t, ptr %lid, align 4
+        \\  store i32 32, ptr %s, align 4
+        \\  br label %head
+        \\head:
+        \\  %sv = load i32, ptr %s, align 4
+        \\  %more = icmp ugt i32 %sv, 0
+        \\  br i1 %more, label %body, label %exit
+        \\body:
+        \\  %l = load i32, ptr %lid, align 4
+        \\  %lt = icmp ult i32 %l, %sv
+        \\  br i1 %lt, label %add, label %join
+        \\add:
+        \\  store i32 1, ptr addrspace(3) @tile, align 4
+        \\  br label %join
+        \\join:
+        \\  call void @air.wg.barrier(i32 2, i32 1)
+        \\  %s2 = load i32, ptr %s, align 4
+        \\  %s3 = lshr i32 %s2, STEP
+        \\  store i32 %s3, ptr %s, align 4
+        \\  br label %head
+        \\exit:
+        \\  ret void
+    ;
+    {
+        var t = TestModule{};
+        const fi = try t.add(gpa, "k", &.{"__0"}, try std.mem.replaceOwned(u8, gpa, reduce, "STEP", "1"));
+        t.funcs.items[fi].param_level[0] = .thread;
+        try analyse(gpa, t.funcs.items);
+        const f = t.funcs.items[fi];
+        try expectEqual(.threadgroup, levelAt(f, "%more = icmp"));
+        try expectEqual(.thread, levelAt(f, "store i32 1, ptr addrspace(3)"));
+        try expectEqual(.threadgroup, levelAt(f, "call void @air.wg.barrier"));
+        try expectEqual(Scope.threadgroup, f.convergent);
+    }
+    {
+        // The step is per-thread (`s >>= lid`): the loop's exit is too.
+        var t = TestModule{};
+        const fi = try t.add(gpa, "k", &.{"__0"}, try std.mem.replaceOwned(u8, gpa, reduce, "lshr i32 %s2, STEP", "lshr i32 %s2, %l"));
+        t.funcs.items[fi].param_level[0] = .thread;
+        try analyse(gpa, t.funcs.items);
+        try expectEqual(.thread, levelAt(t.funcs.items[fi], "call void @air.wg.barrier"));
+    }
+    {
+        // A store only some threads execute makes the variable per-thread.
+        var t = TestModule{};
+        const fi = try t.add(gpa, "k", &.{"__0"}, try std.mem.replaceOwned(u8, gpa, reduce, "store i32 1, ptr addrspace(3) @tile, align 4", "store i32 0, ptr %s, align 4"));
+        t.funcs.items[fi].param_level[0] = .thread;
+        try analyse(gpa, t.funcs.items);
+        try expectEqual(.thread, levelAt(t.funcs.items[fi], "call void @air.wg.barrier"));
+    }
+    {
+        // An escaping alloca (its address passed to an external call or an
+        // intrinsic, compared, used as an index, or stored) keeps the
+        // per-thread level of its address. (A getelementptr from it is a
+        // derived pointer, not an escape: "private variables: ..." below.)
+        for ([_][]const u8{ "call void @f(ptr %s)", "%g = icmp eq ptr %s, null", "%g = getelementptr i32, ptr addrspace(3) @tile, i64 0, ptr %s", "store ptr %s, ptr %lid, align 8", "call void @llvm.memcpy.p0.p0.i64(ptr %s, ptr %lid, i64 4, i1 false)" }) |esc| {
+            var t = TestModule{};
+            const body = try std.mem.replaceOwned(u8, gpa, reduce, "  br label %head\nhead:", try std.fmt.allocPrint(gpa, "  {s}\n  br label %head\nhead:", .{esc}));
+            const fi = try t.add(gpa, "k", &.{"__0"}, try std.mem.replaceOwned(u8, gpa, body, "STEP", "1"));
+            t.funcs.items[fi].param_level[0] = .thread;
+            try analyse(gpa, t.funcs.items);
+            try expectEqual(.thread, levelAt(t.funcs.items[fi], "call void @air.wg.barrier"));
+        }
+    }
+    {
+        // `load atomic` is per-thread whatever its address.
+        var t = TestModule{};
+        const fi = try t.add(gpa, "k", &.{"__0"},
+            \\  %v = load atomic i32, ptr addrspace(3) @c monotonic, align 4
+            \\  %z = icmp eq i32 %v, 0
+            \\  br i1 %z, label %a, label %b
+            \\a:
+            \\  br label %b
+            \\b:
+            \\  ret void
+        );
+        try analyse(gpa, t.funcs.items);
+        try expectEqual(.thread, t.funcs.items[fi].line_level[lineOf(t.funcs.items[fi], "a:") + 1]);
+    }
 }
 
 test "control: a loop some threads leave early is divergent everywhere inside; the block after it is not" {
@@ -1273,4 +1939,249 @@ test "control: a block that traps (`unreachable`) does not cut post-dominance; t
     try expectEqual(.threadgroup, levelAt(g, "@air.wg.barrier"));
     try expectEqual(.threadgroup, levelAt(g, "%next = add"));
     try expectEqual(.thread, levelAt(g, "@llvm.trap"));
+}
+
+test "private variables: glslang passes helper arguments by pointer; the helper reads the caller's variable" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const gpa = arena.allocator();
+    // review round 2 (find-real-world-1/t8.spvasm), as tools/spirv/lower.zig
+    // prints glslang -V's `uint tiles = ceilDiv(pc.n, 64u); for (t = 0; t <
+    // tiles; t++) { ...; barrier(); }`: every argument is copied into a
+    // Function variable and passed by pointer.
+    const kernel =
+        \\  %tiles = alloca i32, align 4
+        \\  %param = alloca i32, align 4
+        \\  %param_0 = alloca i32, align 4
+        \\  %t = alloca i32, align 4
+        \\  %lid = extractelement <3 x i32> %__0, i32 0
+        \\  %n = load i32, ptr addrspace(2) %__1, align 4
+        \\  store i32 SRC, ptr %param, align 4
+        \\  store i32 64, ptr %param_0, align 4
+        \\  CALL
+        \\  store i32 0, ptr %t, align 4
+        \\  br label %head
+        \\head:
+        \\  %tv = load i32, ptr %t, align 4
+        \\  %tn = load i32, ptr %tiles, align 4
+        \\  %more = icmp ult i32 %tv, %tn
+        \\  br i1 %more, label %body, label %exit
+        \\body:
+        \\  call void @air.wg.barrier(i32 2, i32 1)
+        \\  %t2 = add i32 %tv, 1
+        \\  store i32 %t2, ptr %t, align 4
+        \\  br label %head
+        \\exit:
+        \\  ret void
+    ;
+    const ceil_div =
+        \\  %x = load i32, ptr %a, align 4
+        \\  %y = load i32, ptr %b, align 4
+        \\  %s = add i32 %x, %y
+        \\  %s1 = sub i32 %s, 1
+        \\  %d = udiv i32 %s1, %y
+        \\  ESCAPE
+        \\  ret i32 %d
+    ;
+    const call_ceil = "%r = call i32 @ceilDiv(ptr %param, ptr %param_0)\n  store i32 %r, ptr %tiles, align 4";
+    const Case = struct { src: []const u8, call: []const u8, escape: []const u8 = "", want: Level };
+    const cases = [_]Case{
+        // A uniform push constant through the helper: accepted.
+        .{ .src = "%n", .call = call_ceil, .want = .threadgroup },
+        // The thread id through the helper: refused.
+        .{ .src = "%lid", .call = call_ceil, .want = .thread },
+        // The helper lets the pointer escape (an external call): the
+        // variable is no longer followed.
+        .{ .src = "%n", .call = call_ceil, .escape = "call void @ext(ptr %a)", .want = .thread },
+        // `out` parameters: what the helper stores through the pointer
+        // lands in the caller's variable.
+        .{ .src = "%n", .call = "call void @put(ptr %tiles, i32 %n)", .want = .threadgroup },
+        .{ .src = "%n", .call = "call void @put(ptr %tiles, i32 %lid)", .want = .thread },
+        // ... also for the threads that make the call: a uniform value
+        // stored by a helper only thread 0 calls.
+        .{ .src = "%n", .call = "store i32 4, ptr %tiles, align 4\n  %z = icmp eq i32 %lid, 0\n  br i1 %z, label %one, label %rest\none:\n  call void @put(ptr %tiles, i32 %n)\n  br label %rest\nrest:", .want = .thread },
+        // A helper that stores what it read back through another pointer.
+        .{ .src = "%lid", .call = "call void @copy(ptr %tiles, ptr %param)", .want = .thread },
+        .{ .src = "%n", .call = "call void @copy(ptr %tiles, ptr %param)", .want = .threadgroup },
+    };
+    for (cases) |cs| {
+        var t = TestModule{};
+        var body = try std.mem.replaceOwned(u8, gpa, kernel, "SRC", cs.src);
+        body = try std.mem.replaceOwned(u8, gpa, body, "CALL", cs.call);
+        const k = try t.add(gpa, "main", &.{ "__0", "__1" }, body);
+        _ = try t.add(gpa, "ceilDiv", &.{ "a", "b" }, try std.mem.replaceOwned(u8, gpa, ceil_div, "ESCAPE", cs.escape));
+        _ = try t.add(gpa, "put", &.{ "o", "v" },
+            \\  store i32 %v, ptr %o, align 4
+            \\  ret void
+        );
+        _ = try t.add(gpa, "copy", &.{ "dst", "src" },
+            \\  %v = load i32, ptr %src, align 4
+            \\  store i32 %v, ptr %dst, align 4
+            \\  ret void
+        );
+        t.funcs.items[k].param_level[0] = .thread;
+        try analyse(gpa, t.funcs.items);
+        expectEqual(cs.want, levelAt(t.funcs.items[k], "@air.wg.barrier")) catch |err| {
+            std.debug.print("case src={s} call={s} escape={s}\n", .{ cs.src, cs.call, cs.escape });
+            return err;
+        };
+    }
+}
+
+test "private variables: struct members and vector lanes read through getelementptr" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const gpa = arena.allocator();
+    // find-real-world-1/t8_struct and t8_vec: `P p = P(pc.n); ... p.n` and
+    // `uvec2 r = uvec2(pc.n, 64u); ... r.x`, read through OpAccessChain.
+    const kernel =
+        \\  %p = alloca { i32, i32 }, align 4
+        \\  %arr = alloca [64 x i32], align 4
+        \\  %t = alloca i32, align 4
+        \\  %lid = extractelement <3 x i32> %__0, i32 0
+        \\  %n = load i32, ptr addrspace(2) %__1, align 4
+        \\  %v0 = insertvalue { i32, i32 } undef, i32 SRC, 0
+        \\  %v1 = insertvalue { i32, i32 } %v0, i32 64, 1
+        \\  store { i32, i32 } %v1, ptr %p, align 4
+        \\  EXTRA
+        \\  store i32 0, ptr %t, align 4
+        \\  br label %head
+        \\head:
+        \\  %pn = getelementptr { i32, i32 }, ptr %p, i64 0, i32 0
+        \\  %nn = load i32, ptr %pn, align 4
+        \\  %tv = load i32, ptr %t, align 4
+        \\  %more = icmp ult i32 %tv, %nn
+        \\  br i1 %more, label %body, label %exit
+        \\body:
+        \\  call void @air.wg.barrier(i32 2, i32 1)
+        \\  %t2 = add i32 %tv, 1
+        \\  store i32 %t2, ptr %t, align 4
+        \\  br label %head
+        \\exit:
+        \\  ret void
+    ;
+    const Case = struct { src: []const u8, extra: []const u8 = "", want: Level };
+    const cases = [_]Case{
+        .{ .src = "%n", .want = .threadgroup },
+        .{ .src = "%lid", .want = .thread },
+        // A per-thread member stored through its own getelementptr.
+        .{ .src = "%n", .extra = "%q = getelementptr { i32, i32 }, ptr %p, i64 0, i32 0\n  store i32 %lid, ptr %q, align 4", .want = .thread },
+        // A uniform value stored at a per-thread index: the copies differ.
+        .{ .src = "%n", .extra = "%e = getelementptr [64 x i32], ptr %arr, i64 0, i32 %lid\n  store i32 1, ptr %e, align 4\n  %e0 = getelementptr [64 x i32], ptr %arr, i64 0, i32 0\n  %a0 = load i32, ptr %e0, align 4\n  store i32 %a0, ptr %t, align 4", .want = .thread },
+        // A uniform store to a uniform element stays uniform.
+        .{ .src = "%n", .extra = "%e = getelementptr [64 x i32], ptr %arr, i64 0, i32 3\n  store i32 1, ptr %e, align 4\n  %e0 = getelementptr [64 x i32], ptr %arr, i64 0, i32 3\n  %a0 = load i32, ptr %e0, align 4\n  store i32 %a0, ptr %t, align 4", .want = .threadgroup },
+        // A derived pointer that escapes takes its variable with it.
+        .{ .src = "%n", .extra = "%q = getelementptr { i32, i32 }, ptr %p, i64 0, i32 0\n  call void @ext(ptr %q)", .want = .thread },
+    };
+    for (cases) |cs| {
+        var t = TestModule{};
+        var body = try std.mem.replaceOwned(u8, gpa, kernel, "SRC", cs.src);
+        body = try std.mem.replaceOwned(u8, gpa, body, "EXTRA", cs.extra);
+        const k = try t.add(gpa, "main", &.{ "__0", "__1" }, body);
+        t.funcs.items[k].param_level[0] = .thread;
+        try analyse(gpa, t.funcs.items);
+        expectEqual(cs.want, levelAt(t.funcs.items[k], "@air.wg.barrier")) catch |err| {
+            std.debug.print("case src={s} extra={s}\n", .{ cs.src, cs.extra });
+            return err;
+        };
+    }
+}
+
+test "scaling: thousands of blocks behind divergent branches, thousands of helpers, deep call chains" {
+    // Review round 2: the n x n post-dominator fixpoint took 17 s for a
+    // 1000-block chain behind one divergent branch and 111 s for 1600
+    // sequential divergent ifs; a call chain needed one round over the
+    // whole module per level. These sizes would not finish with those
+    // algorithms; here they take milliseconds.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const gpa = arena.allocator();
+    const n = 20000;
+    {
+        // One divergent branch, then a chain of n blocks back to a join.
+        var text: std.Io.Writer.Allocating = .init(gpa);
+        const w = &text.writer;
+        try w.writeAll("  %c = icmp eq i32 %__0, 0\n  br i1 %c, label %b0, label %end\n");
+        for (0..n) |i| try w.print("b{d}:\n  br label %{s}{d}\n", .{ i, if (i + 1 < n) "b" else "end", if (i + 1 < n) i + 1 else 0 });
+        try w.writeAll("end0:\n  br label %end\nend:\n  call void @air.wg.barrier(i32 2, i32 1)\n  ret void");
+        var t = TestModule{};
+        const k = try t.add(gpa, "k", &.{"__0"}, text.written());
+        t.funcs.items[k].param_level[0] = .thread;
+        try analyse(gpa, t.funcs.items);
+        const f = t.funcs.items[k];
+        try expectEqual(.thread, f.line_level[lineOf(f, "b0:") + 1]);
+        try expectEqual(.thread, f.line_level[lineOf(f, "end0:") + 1]);
+        try expectEqual(.threadgroup, levelAt(f, "@air.wg.barrier"));
+    }
+    {
+        // n sequential `if (x == i) {}` on a per-thread x, with a
+        // barrier in every join.
+        var text: std.Io.Writer.Allocating = .init(gpa);
+        const w = &text.writer;
+        try w.writeAll("  br label %j0\n");
+        for (0..n) |i| try w.print("j{d}:\n  call void @air.wg.barrier(i32 2, i32 1)\n  %c{d} = icmp eq i32 %__0, {d}\n  br i1 %c{d}, label %a{d}, label %j{d}\na{d}:\n  store i32 1, ptr addrspace(3) @x, align 4\n  br label %j{d}\n", .{ i, i, i, i, i, i + 1, i, i + 1 });
+        try w.print("j{d}:\n  ret void", .{n});
+        var t = TestModule{};
+        const k = try t.add(gpa, "k", &.{"__0"}, text.written());
+        t.funcs.items[k].param_level[0] = .thread;
+        try analyse(gpa, t.funcs.items);
+        const f = t.funcs.items[k];
+        for (f.body.?, f.line_level) |l, lv| {
+            if (std.mem.find(u8, l, "@air.wg.barrier") != null) try expectEqual(.threadgroup, lv);
+            if (std.mem.find(u8, l, "store i32 1") != null) try expectEqual(.thread, lv);
+        }
+    }
+    {
+        // n uniform loops in sequence, each with a per-thread branch and a
+        // barrier inside.
+        var text: std.Io.Writer.Allocating = .init(gpa);
+        const w = &text.writer;
+        const loops = 2000;
+        try w.writeAll("  br label %h0\n");
+        for (0..loops) |i| try w.print(
+            \\h{d}:
+            \\  %i{d} = phi i32 [ 0, %{s}{d} ], [ %n{d}, %l{d} ]
+            \\  %c{d} = icmp eq i32 %__0, %i{d}
+            \\  br i1 %c{d}, label %a{d}, label %l{d}
+            \\a{d}:
+            \\  store i32 1, ptr addrspace(3) @x, align 4
+            \\  br label %l{d}
+            \\l{d}:
+            \\  call void @air.wg.barrier(i32 2, i32 1)
+            \\  %n{d} = add i32 %i{d}, 1
+            \\  %d{d} = icmp eq i32 %n{d}, 8
+            \\  br i1 %d{d}, label %h{d}, label %h{d}
+            \\
+        , .{ i, i, if (i == 0) "__1" else "l", if (i == 0) 0 else i - 1, i, i, i, i, i, i, i, i, i, i, i, i, i, i, i, i + 1, i });
+        try w.print("h{d}:\n  ret void", .{loops});
+        var t = TestModule{};
+        const k = try t.add(gpa, "k", &.{"__0"}, text.written());
+        t.funcs.items[k].param_level[0] = .thread;
+        try analyse(gpa, t.funcs.items);
+        const f = t.funcs.items[k];
+        for (f.body.?, f.line_level) |l, lv| {
+            if (std.mem.find(u8, l, "@air.wg.barrier") != null) try expectEqual(.threadgroup, lv);
+            if (std.mem.find(u8, l, "store i32 1") != null) try expectEqual(.thread, lv);
+        }
+    }
+    {
+        // A flat module of n helpers and a call chain n deep, the chain's
+        // last helper making a barrier; every helper defined after its
+        // caller, so the convergence scope flows against the order.
+        var t = TestModule{};
+        var calls: std.Io.Writer.Allocating = .init(gpa);
+        for (0..n) |i| try calls.writer.print("  %r{d} = call i32 @h{d}(i32 %__0)\n", .{ i, i });
+        try calls.writer.writeAll("  call void @c0()\n  ret void");
+        const k = try t.add(gpa, "k", &.{"__0"}, calls.written());
+        for (0..n) |i| _ = try t.add(gpa, try std.fmt.allocPrint(gpa, "h{d}", .{i}), &.{"x"}, "  %y = add i32 %x, 1\n  ret i32 %y");
+        for (0..n) |i| _ = try t.add(gpa, try std.fmt.allocPrint(gpa, "c{d}", .{i}), &.{}, if (i + 1 < n)
+            try std.fmt.allocPrint(gpa, "  call void @c{d}()\n  ret void", .{i + 1})
+        else
+            "  call void @air.wg.barrier(i32 2, i32 1)\n  ret void");
+        t.funcs.items[k].param_level[0] = .thread;
+        try analyse(gpa, t.funcs.items);
+        try expectEqual(Scope.threadgroup, t.funcs.items[k].convergent);
+        try expectEqual(Scope.threadgroup, t.funcs.items[1 + n].convergent);
+        try expectEqual(Level.thread, t.funcs.items[n].ret_level);
+    }
 }

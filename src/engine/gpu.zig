@@ -68,6 +68,12 @@ extern fn @"air.simdgroup.barrier"(flags: i32, scope: i32) void;
 /// and to the SIMD-group functions below (a duplicated `simdSum` adds up
 /// only the lanes of its arm, review-b/r4/helper/check.log).
 ///
+/// Metal's own optimizer would do the same to the bitcode, after the
+/// assembler: the assembler therefore marks these declarations, their calls
+/// and the helpers that reach them `convergent`, as Apple's front end does
+/// (barrierJoinKernel in a Debug shader build computes wrong totals
+/// without it). Zig's LLVM threads before that, though, so:
+///
 /// The assembler catches this at build time with a uniformity analysis
 /// (tools/air/divergence.zig, lattice `air.Uniformity`): a barrier, or a
 /// helper that makes one, is refused ("convergent call in divergent

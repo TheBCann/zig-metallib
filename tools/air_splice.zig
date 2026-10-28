@@ -40,8 +40,11 @@
 //! Packer (air/metallib.zig): bitcode modules -> MTLB container.
 //!
 //! Usage: air-splice [--target=<profile>] [--allow-unverified] [--fast-math=<bool>] <in.ll> <out.metallib> [out.ll]
-//! The optional third output is the rewritten IR plus metadata as text, which
-//! `xcrun metal -Xclang -opaque-pointers` also accepts; handy for diffing.
+//! The optional third output is the rewritten IR plus metadata as text, with
+//! the assembler's intrinsic renames and `convergent` attributes spelled out
+//! (intrinsics.printForApple), which `xcrun metal -Xclang -opaque-pointers`
+//! also accepts and builds into the same library; handy for diffing and
+//! for attributing a GPU result to our assembler or to Metal.
 
 const std = @import("std");
 const shader = @import("shader");
@@ -162,7 +165,9 @@ pub fn main(init: std.process.Init) !void {
 
     if (cli.text_output) |path| {
         var text: List = .empty;
-        try text.appendSlice(arena, rewritten);
+        // Spelled for Apple's front end: the assembler's intrinsic renames
+        // and convergent attributes (intrinsics.printForApple).
+        try text.appendSlice(arena, try intrinsics.printForApple(arena, rewritten, cli.fast_math));
         try metadata.printModule(arena, &text, try samplerGlobals(arena, rewritten), profile, .{ .fast_math = cli.fast_math });
         try cwd.writeFile(io, .{ .sub_path = path, .data = text.items });
     }

@@ -14,13 +14,19 @@
 //! still invalid simply lands in another bucket and is not kept.
 //!
 //! Output: <out>/<seed>/original.zig and reduced.zig, plus a line per kept
-//! change. The candidates are built in <out>/<seed>/cache, which is deleted
-//! afterwards (hundreds of builds would otherwise fill the project's cache and
+//! change. The candidates are built in <out>/<seed>/cache, which is cleared
+//! every ten candidates and deleted afterwards (hundreds of builds would otherwise fill the project's cache and
 //! the disk). Exit 0 when a reduced program was written, 3 when the seed does
 //! not fail at all, 2 on bad usage.
 //!
 //! Usage: crosscheck-reduce --seed=<u64> --repo=<dir> --zig=<zig exe> --out=<dir>
-//!        [--include-known-findings] [--floats] [--max-candidates=<n>]
+//!        [--include-known-findings] [--floats] [--spirv [--no-zig-workarounds]]
+//!        [--max-candidates=<n>]
+//!
+//! `--spirv` reduces a failure of the SPIR-V path (`-Dcrosscheck-spirv=true`,
+//! docs/spirv.md): the program is generated without the operators Zig's
+//! SPIR-V backend cannot compile, and every candidate is judged through that
+//! path; `--no-zig-workarounds` judges with `-Dspirv-zig-workarounds=false`.
 
 const std = @import("std");
 const program = @import("program.zig");
@@ -76,6 +82,13 @@ pub fn classify(gpa: Allocator, out: []const u8) !Signature {
         if (metal == null) for ([_][]const u8{ "FAIL newLibraryWithData", "FAIL newFunctionWithName", "FAIL newComputePipelineState", "FAIL command buffer" }) |prefix| {
             if (std.mem.startsWith(u8, line, prefix)) metal = line;
         };
+        // spirv-splice's refusals (the SPIR-V path): "spirv-splice: <input>:
+        // <message>". The input is a cache path that differs per candidate,
+        // so the key is the message after it.
+        if (refused == null and std.mem.startsWith(u8, line, "spirv-splice: ") and !std.mem.startsWith(u8, line, "spirv-splice: warning:")) {
+            const rest = line["spirv-splice: ".len..];
+            refused = if (std.mem.indexOf(u8, rest, ": ")) |colon| rest[colon + 2 ..] else rest;
+        }
         if (refused == null and std.mem.startsWith(u8, line, "air-splice: ")) {
             const rest = line["air-splice: ".len..];
             if (std.mem.startsWith(u8, rest, "line ")) {
@@ -141,6 +154,10 @@ const PipelineJudge = struct {
             .cwd = .{ .path = j.repo },
         });
         j.runs += 1;
+        // Every candidate leaves about 50 MB of build products behind; on a
+        // small disk a reduction would fill it, so the cache is cleared every
+        // few candidates (the next one rebuilds the tools, about a minute).
+        if (j.runs % 10 == 0) Io.Dir.cwd().deleteTree(j.io, j.cache_dir) catch {};
         const combined = try std.mem.concat(j.gpa, u8, &.{ result.stderr, "\n", result.stdout });
         return classify(j.gpa, combined);
     }
@@ -810,6 +827,8 @@ pub fn main(init: std.process.Init) !void {
     var out_dir: ?[]const u8 = null;
     var include_known = false;
     var floats = false;
+    var spirv = false;
+    var zig_workarounds = true;
     var max_candidates: u32 = 3000;
     for (args[1..]) |arg| {
         if (std.mem.startsWith(u8, arg, "--seed=")) {
@@ -826,13 +845,17 @@ pub fn main(init: std.process.Init) !void {
             include_known = true;
         } else if (std.mem.eql(u8, arg, "--floats")) {
             floats = true;
+        } else if (std.mem.eql(u8, arg, "--spirv")) {
+            spirv = true;
+        } else if (std.mem.eql(u8, arg, "--no-zig-workarounds")) {
+            zig_workarounds = false;
         } else {
             std.debug.print("crosscheck-reduce: unknown argument '{s}'\n", .{arg});
             std.process.exit(2);
         }
     }
     const sd = seed orelse {
-        std.debug.print("usage: crosscheck-reduce --seed=<u64> --repo=<dir> --zig=<zig> --out=<dir> [--include-known-findings] [--max-candidates=<n>]\n", .{});
+        std.debug.print("usage: crosscheck-reduce --seed=<u64> --repo=<dir> --zig=<zig> --out=<dir> [--include-known-findings] [--floats] [--spirv [--no-zig-workarounds]] [--max-candidates=<n>]\n", .{});
         std.process.exit(2);
     };
     const repo_path = repo orelse ".";
@@ -842,13 +865,22 @@ pub fn main(init: std.process.Init) !void {
     const dir = try std.fmt.allocPrint(arena, "{s}/{d}", .{ out_root, sd });
     try Io.Dir.cwd().createDirPath(io, dir);
 
-    var prog = try program.generate(arena, sd, .{ .include_known = include_known, .floats = floats });
-    const known_note: []const u8 = if (include_known and floats) " -Dcrosscheck-known=true -Dcrosscheck-floats=true" else if (include_known) " -Dcrosscheck-known=true" else if (floats) " -Dcrosscheck-floats=true" else "";
-    // The judge runs every candidate under the failing seed's input stream
-    // and mode; the reduced file's hint repeats both.
-    const mode_note: []const u8 = if (floats) " -Dcrosscheck-floats=true" else "";
+    var prog = try program.generate(arena, sd, .{ .include_known = include_known, .floats = floats, .spirv = spirv });
+    const spirv_note: []const u8 = if (!spirv) "" else if (zig_workarounds) " -Dcrosscheck-spirv=true" else " -Dcrosscheck-spirv=true -Dspirv-zig-workarounds=false";
+    const known_note: []const u8 = try std.mem.concat(arena, u8, &.{
+        if (include_known and floats) " -Dcrosscheck-known=true -Dcrosscheck-floats=true" else if (include_known) " -Dcrosscheck-known=true" else if (floats) " -Dcrosscheck-floats=true" else "",
+        spirv_note,
+    });
+    // The judge runs every candidate under the failing seed's input stream,
+    // mode and front end; the reduced file's hint repeats them.
+    const mode_note: []const u8 = try std.mem.concat(arena, u8, &.{ if (floats) " -Dcrosscheck-floats=true" else "", spirv_note });
     const seed_arg = try std.fmt.allocPrint(arena, "-Dseed={d}", .{sd});
-    const build_args: []const []const u8 = if (floats) &.{ seed_arg, "-Dcrosscheck-floats=true" } else &.{seed_arg};
+    var build_args_list: std.ArrayList([]const u8) = .empty;
+    try build_args_list.append(arena, seed_arg);
+    if (floats) try build_args_list.append(arena, "-Dcrosscheck-floats=true");
+    if (spirv) try build_args_list.append(arena, "-Dcrosscheck-spirv=true");
+    if (spirv and !zig_workarounds) try build_args_list.append(arena, "-Dspirv-zig-workarounds=false");
+    const build_args: []const []const u8 = build_args_list.items;
     const original_header = try std.fmt.allocPrint(arena,
         \\// The program of `zig build crosscheck -Dseed={d}{s}`, as crosscheck-reduce
         \\// started from it.
@@ -935,6 +967,15 @@ test "classify follows sweep.sh's buckets and blanks numbers in the key" {
     // Same failure, different line number: equal signatures.
     const r2 = try classify(gpa, "air-splice: line 9: use of undefined value\n");
     try std.testing.expect(refused.eql(r2));
+    // spirv-splice names its input, a cache path that differs per candidate:
+    // the key is the message after it, numbers blanked.
+    const s1 = try classify(gpa, "spirv-splice: .zig-cache/o/0a1b2c/crosscheck_shader.spv: entry point 'crosscheckKernel': `%12 = OpArrayLength %3 %4 0`: Metal gives a kernel no buffer length\n");
+    const s2 = try classify(gpa, "spirv-splice: .zig-cache/o/ffee99/crosscheck_shader.spv: entry point 'crosscheckKernel': `%40 = OpArrayLength %3 %4 0`: Metal gives a kernel no buffer length\n");
+    try std.testing.expectEqual(Bucket.refused, s1.bucket);
+    try std.testing.expectEqualStrings("entry point 'crosscheckKernel': `%# = OpArrayLength %# %# #`: Metal gives a kernel no buffer length", s1.key);
+    try std.testing.expect(s1.eql(s2));
+    // A warning is not a refusal.
+    try std.testing.expectEqual(Bucket.err, (try classify(gpa, "spirv-splice: warning: building an UNVERIFIED macos15 library: x\n")).bucket);
 }
 
 const TextProperty = struct {

@@ -2,6 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const zon = @import("build.zig.zon");
 const air_target = @import("tools/air/target.zig");
+const crosscheck_reproduce = @import("tools/crosscheck/reproduce.zig");
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
@@ -147,6 +148,122 @@ pub fn build(b: *std.Build) void {
     run_check.addPassthruArgs();
     b.step("check", "Load a .metallib into Metal and build a pipeline from it").dependOn(&run_check.step);
 
+    // `zig build spirv-dis -- file.spv` prints a SPIR-V module as text
+    // (tools/spirv/dis.zig); a .spvasm input is assembled first
+    // (tools/spirv/asm.zig). The SPIR-V front end (docs/spirv-plan.md) is
+    // built on these: tools/spirv/reader.zig decodes the binary, the corpus in
+    // tools/spirv/corpus/ is text that asm.zig turns back into modules.
+    const spirv_dis_mod = b.createModule(.{
+        .root_source_file = b.path("tools/spirv_dis.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const spirv_dis = b.addExecutable(.{ .name = "spirv-dis", .root_module = spirv_dis_mod });
+    const run_spirv_dis = b.addRunArtifact(spirv_dis);
+    run_spirv_dis.addPassthruArgs();
+    b.step("spirv-dis", "Disassemble a SPIR-V module (.spv, or .spvasm via the assembler) to text").dependOn(&run_spirv_dis.step);
+
+    // `zig build spirv-splice` installs spirv-splice (tools/spirv_splice.zig):
+    // a SPIR-V compute module -> .metallib through tools/spirv/lower.zig and
+    // the same assembler and packer as air-splice. Its entry points arrive at
+    // runtime, so its `shader` module lists none (src/engine/no_shaders.zig);
+    // each kernel's metadata comes from the module's interface
+    // (tools/spirv/manifest.zig).
+    const no_shaders = b.createModule(.{
+        .root_source_file = b.path("src/engine/no_shaders.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const spirv_splice_mod = b.createModule(.{
+        .root_source_file = b.path("tools/spirv_splice.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "shader", .module = no_shaders }},
+    });
+    const spirv_splice = b.addExecutable(.{ .name = "spirv-splice", .root_module = spirv_splice_mod });
+    const spirv_splice_step = b.step("spirv-splice", "Install zig-out/bin/spirv-splice (SPIR-V compute module -> .metallib), spirv-probe, spirv-probe-run and metallib-check");
+    spirv_splice_step.dependOn(&b.addInstallArtifact(spirv_splice, .{}).step);
+    // spirv-probe (tools/spirv_probe.zig): one library per probe kernel or per
+    // corpus entry point, for tools/spirv/run_probes.sh.
+    const spirv_probe = b.addExecutable(.{ .name = "spirv-probe", .root_module = b.createModule(.{
+        .root_source_file = b.path("tools/spirv_probe.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "shader", .module = no_shaders }},
+    }) });
+    spirv_splice_step.dependOn(&b.addInstallArtifact(spirv_probe, .{}).step);
+    // spirv-probe-run (tools/spirv_probe_run.zig): runs the probe kernels on
+    // the GPU and compares them with tools/spirv/reference.zig.
+    const spirv_probe_run = b.addExecutable(.{ .name = "spirv-probe-run", .root_module = b.createModule(.{
+        .root_source_file = b.path("tools/spirv_probe_run.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "shader", .module = no_shaders },
+            .{ .name = "objc", .module = objc_mod },
+        },
+    }) });
+    spirv_probe_run.root_module.linkSystemLibrary("c", .{});
+    spirv_probe_run.root_module.linkSystemLibrary("objc", .{});
+    spirv_probe_run.root_module.linkFramework("Foundation", .{});
+    spirv_probe_run.root_module.linkFramework("Metal", .{});
+    spirv_splice_step.dependOn(&b.addInstallArtifact(spirv_probe_run, .{}).step);
+    // metallib-check too: its `--kernels=a,b` mode checks libraries whose
+    // interface is only known at runtime.
+    spirv_splice_step.dependOn(&b.addInstallArtifact(check, .{}).step);
+
+    // `zig build spirv-corpus [-Dmetal-fast-math=true]` (tools/spirv/corpus_driver.zig):
+    // every entry point of tools/spirv/corpus/*.spvasm lowered, loaded and
+    // built into a compute pipeline, the outcomes compared with
+    // tools/spirv/corpus/EXPECTED.txt, and the kernels with known answers
+    // executed on the GPU, among them tools/spirv/zig_kernels.zig compiled
+    // here by Zig's self-hosted SPIR-V backend (stage 4: a threadgroup
+    // reverse with a barrier, an atomic counter, the control-flow kernel
+    // against its CPU twin). The driver reaches the lowering through the
+    // spirv-splice module (its root imports reader, asm, lower, manifest).
+    const spirv_kernels_target = b.resolveTargetQuery(.{
+        .cpu_arch = .spirv64,
+        .os_tag = .vulkan,
+        .cpu_model = .{ .explicit = &std.Target.spirv.cpu.generic },
+        .cpu_features_add = std.Target.spirv.featureSet(&.{ .float16, .int64, .int8, .int16 }),
+    });
+    const zig_kernels_obj = b.addObject(.{
+        .name = "zig_kernels",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/spirv/zig_kernels.zig"),
+            .target = spirv_kernels_target,
+            .optimize = .ReleaseFast,
+        }),
+        .use_llvm = false,
+    });
+    const spirv_corpus_mod = b.createModule(.{
+        .root_source_file = b.path("tools/spirv/corpus_driver.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "objc", .module = objc_mod },
+            .{ .name = "spirv_splice", .module = spirv_splice_mod },
+        },
+    });
+    spirv_corpus_mod.linkSystemLibrary("c", .{});
+    spirv_corpus_mod.linkSystemLibrary("objc", .{});
+    spirv_corpus_mod.linkFramework("Foundation", .{});
+    spirv_corpus_mod.linkFramework("Metal", .{});
+    const spirv_corpus = b.addExecutable(.{ .name = "spirv-corpus", .root_module = spirv_corpus_mod });
+    const run_spirv_corpus = b.addRunArtifact(spirv_corpus);
+    run_spirv_corpus.addArg(fast_math_arg);
+    run_spirv_corpus.addDirectoryArg(b.path("tools/spirv/corpus"));
+    run_spirv_corpus.addFileArg(b.path("tools/spirv/corpus/EXPECTED.txt"));
+    run_spirv_corpus.addFileArg(zig_kernels_obj.getEmittedBin());
+    // A GPU run: never cached.
+    run_spirv_corpus.has_side_effects = true;
+    // `zig build spirv-splice` also installs the driver and the Zig kernels'
+    // SPIR-V (zig-out/bin/spirv-corpus, zig_kernels.spv), so the driver can be
+    // run on another directory (docs/spirv.md, "Reproducing every claim").
+    spirv_splice_step.dependOn(&b.addInstallArtifact(spirv_corpus, .{}).step);
+    spirv_splice_step.dependOn(&b.addInstallBinFile(zig_kernels_obj.getEmittedBin(), "zig_kernels.spv").step);
+    b.step("spirv-corpus", "Build every SPIR-V corpus kernel on Metal, compare with EXPECTED.txt, run the known-answer kernels").dependOn(&run_spirv_corpus.step);
+
     // ── 6. Tests ───────────────────────────────────────────────────────────
     const splice_tests = b.addTest(.{ .root_module = splice_mod });
     const test_step = b.step("test", "Run tests");
@@ -154,6 +271,21 @@ pub fn build(b: *std.Build) void {
     // Compile (not run) metallib-check too: nothing else builds it without a
     // GPU, so a compile error in it would otherwise pass `zig build test`.
     test_step.dependOn(&check.step);
+    // The SPIR-V tools: reader, disassembler and assembler, with the corpus
+    // round trips (tools/spirv_dis.zig is the module root).
+    const spirv_tests = b.addTest(.{ .root_module = spirv_dis_mod });
+    test_step.dependOn(&b.addRunArtifact(spirv_tests).step);
+    // The SPIR-V lowering, the runtime manifest and spirv-splice's CLI
+    // (tools/spirv_splice.zig is the module root).
+    const spirv_splice_tests = b.addTest(.{ .root_module = spirv_splice_mod });
+    test_step.dependOn(&b.addRunArtifact(spirv_splice_tests).step);
+    // Compile (not run) the GPU-side SPIR-V tools too, as for metallib-check.
+    test_step.dependOn(&spirv_probe_run.step);
+    test_step.dependOn(&spirv_probe.step);
+    // The corpus driver's CPU-side tests (its references; no GPU), and the
+    // Zig stage-4 kernels through Zig's SPIR-V backend.
+    test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = spirv_corpus_mod })).step);
+    test_step.dependOn(&zig_kernels_obj.step);
 
     // ── 7. Differential test bench: `zig build crosscheck -Dseed=N` ─────────────
     // tools/crosscheck/gen.zig writes a random total i32 `body(a, b)` for the seed.
@@ -175,6 +307,15 @@ pub fn build(b: *std.Build) void {
     // Apple's front end: a Metal Shading Language twin of the body for the
     // `crosscheck-msl` step below (tools/crosscheck/known/*.metal).
     const crosscheck_metal_file = b.option([]const u8, "crosscheck-metal", "Metal Shading Language twin of -Dcrosscheck-body, compiled by xcrun metal for `zig build crosscheck-msl`");
+    // The SPIR-V front end (docs/spirv.md): the body is compiled by Zig's
+    // self-hosted SPIR-V backend inside src/engine/crosscheck_harness_spirv.zig
+    // and the library is built by spirv-splice instead of air-splice. The
+    // driver, its inputs and its verdicts are the same.
+    const crosscheck_spirv = b.option(bool, "crosscheck-spirv", "Compile the crosscheck kernel to SPIR-V (Zig's -fno-llvm backend) and build the library with spirv-splice") orelse false;
+    // spirv-splice undoes known bugs of Zig's SPIR-V backend in the modules
+    // it generated (tools/spirv/lower.zig, "producer workarounds"); false
+    // measures them, as crosscheck-apple measures the Metal findings.
+    const spirv_zig_workarounds = b.option(bool, "spirv-zig-workarounds", "With -Dcrosscheck-spirv: let spirv-splice undo known Zig SPIR-V backend bugs (default true)") orelse true;
 
     const crosscheck_gen = b.addExecutable(.{
         .name = "crosscheck-gen",
@@ -189,48 +330,88 @@ pub fn build(b: *std.Build) void {
         run_crosscheck_gen.addArg(b.fmt("--seed={d}", .{crosscheck_seed}));
         if (crosscheck_known) run_crosscheck_gen.addArg("--include-known-findings");
         if (crosscheck_floats) run_crosscheck_gen.addArg("--floats");
+        // Leave out the operators Zig's SPIR-V backend cannot compile yet.
+        if (crosscheck_spirv) run_crosscheck_gen.addArg("--spirv");
         break :blk run_crosscheck_gen.addOutputFileArg2("crosscheck_body.zig", .{});
     };
 
-    // GPU side: harness + generated body for nvptx, exactly like the shader.
-    const crosscheck_body_gpu = b.createModule(.{ .root_source_file = crosscheck_body_src, .target = gpu_target, .optimize = shader_optimize });
-    const crosscheck_shader_obj = b.addObject(.{
-        .name = "crosscheck_shader",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/engine/crosscheck_harness.zig"),
-            .target = gpu_target,
-            .optimize = shader_optimize,
-            .imports = &.{.{ .name = "crosscheck_body", .module = crosscheck_body_gpu }},
-        }),
-        .use_llvm = true,
-    });
-    crosscheck_shader_obj.bundle_ubsan_rt = false;
-
-    // A second air-splice whose manifest is the harness.
     // The CPU side is pinned to Debug whatever -Doptimize says: its safety
     // checks are the bench's undefined-behaviour detector (docs/crosscheck.md).
     const crosscheck_body_host = b.createModule(.{ .root_source_file = crosscheck_body_src, .target = target, .optimize = .debug });
-    const crosscheck_manifest = b.createModule(.{
-        .root_source_file = b.path("src/engine/crosscheck_harness.zig"),
-        .target = target,
-        .optimize = optimize,
-        .imports = &.{.{ .name = "crosscheck_body", .module = crosscheck_body_host }},
-    });
-    const crosscheck_splice = b.addExecutable(.{
-        .name = "crosscheck-air-splice",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("tools/air_splice.zig"),
+
+    // GPU side: harness + generated body, built into crosscheck.metallib plus
+    // its IR text (crosscheck.air.ll, for the Apple-assembler cross-check
+    // below) by one of two front ends.
+    const crosscheck_metallib: std.Build.LazyPath, const crosscheck_air_ll: std.Build.LazyPath = if (crosscheck_spirv) blk: {
+        // SPIR-V: the harness in the standard Vulkan compute shape, compiled
+        // by Zig's self-hosted SPIR-V backend (`-fno-llvm`). float16 for the
+        // half-precision nodes, int8/int16/int64 for the narrow and wide
+        // integer helpers (without a feature the backend refuses the type).
+        const spirv_target = b.resolveTargetQuery(.{
+            .cpu_arch = .spirv64,
+            .os_tag = .vulkan,
+            .cpu_model = .{ .explicit = &std.Target.spirv.cpu.generic },
+            .cpu_features_add = std.Target.spirv.featureSet(&.{ .float16, .int64, .int8, .int16 }),
+        });
+        const crosscheck_body_spirv = b.createModule(.{ .root_source_file = crosscheck_body_src, .target = spirv_target, .optimize = shader_optimize });
+        const crosscheck_spirv_obj = b.addObject(.{
+            .name = "crosscheck_shader",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("src/engine/crosscheck_harness_spirv.zig"),
+                .target = spirv_target,
+                .optimize = shader_optimize,
+                .imports = &.{.{ .name = "crosscheck_body", .module = crosscheck_body_spirv }},
+            }),
+            .use_llvm = false,
+        });
+        // spirv-splice: the module's interface is its own manifest.
+        const run_crosscheck_spirv_splice = b.addRunArtifact(spirv_splice);
+        run_crosscheck_spirv_splice.addArg(fast_math_arg);
+        if (!spirv_zig_workarounds) run_crosscheck_spirv_splice.addArg("--zig-workarounds=false");
+        run_crosscheck_spirv_splice.addFileArg(crosscheck_spirv_obj.getEmittedBin());
+        break :blk .{
+            run_crosscheck_spirv_splice.addOutputFileArg2("crosscheck.metallib", .{}),
+            run_crosscheck_spirv_splice.addOutputFileArg2("crosscheck.air.ll", .{}),
+        };
+    } else blk: {
+        // nvptx: harness + generated body, exactly like the shader.
+        const crosscheck_body_gpu = b.createModule(.{ .root_source_file = crosscheck_body_src, .target = gpu_target, .optimize = shader_optimize });
+        const crosscheck_shader_obj = b.addObject(.{
+            .name = "crosscheck_shader",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("src/engine/crosscheck_harness.zig"),
+                .target = gpu_target,
+                .optimize = shader_optimize,
+                .imports = &.{.{ .name = "crosscheck_body", .module = crosscheck_body_gpu }},
+            }),
+            .use_llvm = true,
+        });
+        crosscheck_shader_obj.bundle_ubsan_rt = false;
+
+        // A second air-splice whose manifest is the harness.
+        const crosscheck_manifest = b.createModule(.{
+            .root_source_file = b.path("src/engine/crosscheck_harness.zig"),
             .target = target,
             .optimize = optimize,
-            .imports = &.{.{ .name = "shader", .module = crosscheck_manifest }},
-        }),
-    });
-    const run_crosscheck_splice = b.addRunArtifact(crosscheck_splice);
-    run_crosscheck_splice.addArg(fast_math_arg);
-    run_crosscheck_splice.addFileArg(crosscheck_shader_obj.getEmittedLlvmIr());
-    const crosscheck_metallib = run_crosscheck_splice.addOutputFileArg2("crosscheck.metallib", .{});
-    // The rewritten IR as text, for the Apple-assembler cross-check below.
-    const crosscheck_air_ll = run_crosscheck_splice.addOutputFileArg2("crosscheck.air.ll", .{});
+            .imports = &.{.{ .name = "crosscheck_body", .module = crosscheck_body_host }},
+        });
+        const crosscheck_splice = b.addExecutable(.{
+            .name = "crosscheck-air-splice",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("tools/air_splice.zig"),
+                .target = target,
+                .optimize = optimize,
+                .imports = &.{.{ .name = "shader", .module = crosscheck_manifest }},
+            }),
+        });
+        const run_crosscheck_splice = b.addRunArtifact(crosscheck_splice);
+        run_crosscheck_splice.addArg(fast_math_arg);
+        run_crosscheck_splice.addFileArg(crosscheck_shader_obj.getEmittedLlvmIr());
+        break :blk .{
+            run_crosscheck_splice.addOutputFileArg2("crosscheck.metallib", .{}),
+            run_crosscheck_splice.addOutputFileArg2("crosscheck.air.ll", .{}),
+        };
+    };
 
     // Host side: the driver runs `body` on the CPU and the kernel on the GPU.
     const crosscheck_driver = b.addExecutable(.{
@@ -254,13 +435,18 @@ pub fn build(b: *std.Build) void {
     // The driver names the body file in its result lines and prints the exact
     // command that reproduces a failure: the inputs come from -Dseed even when
     // the body is hand-written, and the Apple step below must name itself.
-    const crosscheck_body_opt: []const u8 = if (crosscheck_body_file) |path| b.fmt(" -Dcrosscheck-body={s}", .{path}) else "";
-    const crosscheck_known_opt: []const u8 = if (crosscheck_known) " -Dcrosscheck-known=true" else "";
-    const crosscheck_floats_opt: []const u8 = if (crosscheck_floats) " -Dcrosscheck-floats=true" else "";
-    const crosscheck_fast_math_opt: []const u8 = if (metal_fast_math) " -Dmetal-fast-math=true" else "";
+    // (tools/crosscheck/reproduce.zig composes it; `zig build test` checks it.)
+    const reproduce_opts: crosscheck_reproduce.Options = .{
+        .known = crosscheck_known,
+        .floats = crosscheck_floats,
+        .spirv = crosscheck_spirv,
+        .spirv_zig_workarounds = spirv_zig_workarounds,
+        .fast_math = metal_fast_math,
+        .body = crosscheck_body_file,
+    };
     if (crosscheck_floats) run_crosscheck.addArg("--floats");
     if (crosscheck_body_file) |path| run_crosscheck.addArg(b.fmt("--body={s}", .{path}));
-    run_crosscheck.addArg(b.fmt("--reproduce=zig build crosscheck -Dseed={d}{s}{s}{s}{s}", .{ crosscheck_seed, crosscheck_known_opt, crosscheck_floats_opt, crosscheck_fast_math_opt, crosscheck_body_opt }));
+    run_crosscheck.addArg(reproduceArg(b, "crosscheck", crosscheck_seed, reproduce_opts));
     run_crosscheck.addFileArg(crosscheck_metallib);
     b.step("crosscheck", "Differential test: one generated kernel on the GPU vs the CPU (-Dseed=N)").dependOn(&run_crosscheck.step);
 
@@ -281,7 +467,7 @@ pub fn build(b: *std.Build) void {
     run_crosscheck_apple.addArg(b.fmt("--seed={d}", .{crosscheck_seed}));
     if (crosscheck_body_file) |path| run_crosscheck_apple.addArg(b.fmt("--body={s}", .{path}));
     if (crosscheck_floats) run_crosscheck_apple.addArg("--floats");
-    run_crosscheck_apple.addArg(b.fmt("--reproduce=zig build crosscheck-apple -Dseed={d}{s}{s}{s}{s}", .{ crosscheck_seed, crosscheck_known_opt, crosscheck_floats_opt, crosscheck_fast_math_opt, crosscheck_body_opt }));
+    run_crosscheck_apple.addArg(reproduceArg(b, "crosscheck-apple", crosscheck_seed, reproduce_opts));
     run_crosscheck_apple.addFileArg(crosscheck_apple_metallib);
     b.step("crosscheck-apple", "The crosscheck kernel with the library built by Apple's assembler from our IR (attribution)").dependOn(&run_crosscheck_apple.step);
 
@@ -301,7 +487,12 @@ pub fn build(b: *std.Build) void {
         run_crosscheck_msl.addArg(b.fmt("--seed={d}", .{crosscheck_seed}));
         if (crosscheck_body_file) |path| run_crosscheck_msl.addArg(b.fmt("--body={s}", .{path}));
         if (crosscheck_floats) run_crosscheck_msl.addArg("--floats");
-        run_crosscheck_msl.addArg(b.fmt("--reproduce=zig build crosscheck-msl -Dseed={d}{s}{s}{s}{s} -Dcrosscheck-metal={s}", .{ crosscheck_seed, crosscheck_known_opt, crosscheck_floats_opt, crosscheck_fast_math_opt, crosscheck_body_opt, metal_path }));
+        // The MSL kernel comes from Apple's front end, so -Dcrosscheck-spirv
+        // changes nothing there and is not repeated.
+        var msl_opts = reproduce_opts;
+        msl_opts.spirv = false;
+        msl_opts.metal = metal_path;
+        run_crosscheck_msl.addArg(reproduceArg(b, "crosscheck-msl", crosscheck_seed, msl_opts));
         run_crosscheck_msl.addFileArg(crosscheck_msl_metallib);
         msl_step.dependOn(&run_crosscheck_msl.step);
     } else {
@@ -323,18 +514,29 @@ pub fn build(b: *std.Build) void {
     run_reduce.addArg(b.fmt("--seed={d}", .{crosscheck_seed}));
     if (crosscheck_known) run_reduce.addArg("--include-known-findings");
     if (crosscheck_floats) run_reduce.addArg("--floats");
+    if (crosscheck_spirv) run_reduce.addArg("--spirv");
+    if (crosscheck_spirv and !spirv_zig_workarounds) run_reduce.addArg("--no-zig-workarounds");
     run_reduce.addPrefixedDirectoryArg("--repo=", b.path("."));
     run_reduce.addArg(b.fmt("--zig={s}", .{b.graph.zig_exe}));
     run_reduce.addArg("--out=zig-out/crosscheck/reduce");
     run_reduce.has_side_effects = true;
     b.step("reduce", "Shrink the failing crosscheck seed -Dseed=N to a minimal program (zig-out/crosscheck/reduce/<seed>/)").dependOn(&run_reduce.step);
-    // The reducer's own tests (classification, the engine) run with `zig build test`.
+    // The reducer's own tests (classification, the engine) and the
+    // generator's (program.zig, imported by it: the --spirv exclusions) run
+    // with `zig build test`.
     const reduce_tests = b.addTest(.{ .root_module = b.createModule(.{
         .root_source_file = b.path("tools/crosscheck/reduce.zig"),
         .target = target,
         .optimize = optimize,
     }) });
     test_step.dependOn(&b.addRunArtifact(reduce_tests).step);
+    // The driver's reproduce command (every crosscheck option, -Dcrosscheck-spirv included).
+    const reproduce_tests = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("tools/crosscheck/reproduce.zig"),
+        .target = target,
+        .optimize = optimize,
+    }) });
+    test_step.dependOn(&b.addRunArtifact(reproduce_tests).step);
 
     // ── 8. Precision survey: `zig build survey` ─────────────────────────────────
     // src/engine/survey_harness.zig holds one kernel per transcendental function
@@ -393,4 +595,11 @@ pub fn build(b: *std.Build) void {
     run_survey.addFileArg(survey_metallib);
     run_survey.has_side_effects = true;
     b.step("survey", "Precision survey: ulp error of exp, log, sin, cos, tan and sqrt on the GPU against an f64 reference (docs/crosscheck-float-policy.md)").dependOn(&run_survey.step);
+}
+
+/// The driver's `--reproduce=` argument: the command that reruns this
+/// crosscheck configuration (tools/crosscheck/reproduce.zig).
+fn reproduceArg(b: *std.Build, step: []const u8, seed: u64, opts: crosscheck_reproduce.Options) []const u8 {
+    const cmd = crosscheck_reproduce.command(b.allocator, step, seed, opts) catch @panic("OOM");
+    return b.fmt("--reproduce={s}", .{cmd});
 }
