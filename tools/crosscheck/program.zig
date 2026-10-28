@@ -348,6 +348,130 @@ pub const half_helpers =
     \\
 ;
 
+/// Appended when the program has integer vector nodes.
+pub const vector_helpers =
+    \\// Vectors (docs/crosscheck.md): two 4-lane vectors built from the scalar
+    \\// operands, the operation lane-wise, the lanes folded back with wrapping
+    \\// arithmetic (a reduction plus one lane), so splats, lane-wise ops,
+    \\// compares, selects and reductions run on the same inputs.
+    \\const V4 = @Vector(4, i32);
+    \\inline fn vmk(x: i32, y: i32) V4 {
+    \\    return .{ x, y, x ^ y, x +% y };
+    \\}
+    \\inline fn vred(v: V4) i32 {
+    \\    return @reduce(.Xor, v) +% v[1];
+    \\}
+    \\inline fn vadd(x: i32, y: i32) i32 {
+    \\    return vred(vmk(x, y) +% vmk(y, x));
+    \\}
+    \\inline fn vsub(x: i32, y: i32) i32 {
+    \\    return vred(vmk(x, y) -% vmk(y, x));
+    \\}
+    \\inline fn vmul(x: i32, y: i32) i32 {
+    \\    return vred(vmk(x, y) *% vmk(y, x));
+    \\}
+    \\inline fn vband(x: i32, y: i32) i32 {
+    \\    return vred(vmk(x, y) & vmk(y, x));
+    \\}
+    \\inline fn vbor(x: i32, y: i32) i32 {
+    \\    return vred(vmk(x, y) | vmk(y, x));
+    \\}
+    \\inline fn vbxor(x: i32, y: i32) i32 {
+    \\    return vred(vmk(x, y) ^ vmk(y, x));
+    \\}
+    \\inline fn vadd_sat(x: i32, y: i32) i32 {
+    \\    return vred(vmk(x, y) +| vmk(y, x));
+    \\}
+    \\inline fn vsub_sat(x: i32, y: i32) i32 {
+    \\    return vred(vmk(x, y) -| vmk(y, x));
+    \\}
+    \\inline fn vmul_sat(x: i32, y: i32) i32 {
+    \\    return vred(vmk(x, y) *| vmk(y, x));
+    \\}
+    \\inline fn vmin(x: i32, y: i32) i32 {
+    \\    return vred(@min(vmk(x, y), vmk(y, x)));
+    \\}
+    \\inline fn vmax(x: i32, y: i32) i32 {
+    \\    return vred(@max(vmk(x, y), vmk(y, x)));
+    \\}
+    \\inline fn vabs(x: i32, y: i32) i32 {
+    \\    return vred(@as(V4, @bitCast(@abs(vmk(x, y)))) +% vmk(y, x));
+    \\}
+    \\inline fn vpopcount(x: i32, y: i32) i32 {
+    \\    return vred(@as(V4, @intCast(@popCount(vmk(x, y)))) +% vmk(y, x));
+    \\}
+    \\inline fn vselect(x: i32, y: i32) i32 {
+    \\    const v = vmk(x, y);
+    \\    const w = vmk(y, x);
+    \\    return vred(@select(i32, v > w, v, w));
+    \\}
+    \\
+;
+
+/// Appended when the program has float vector nodes (after the float helpers).
+pub const fvector_helpers =
+    \\// Float vectors: as the integer ones, with every lane flushed as a scalar
+    \\// would be, before and after the lane-wise operation.
+    \\const VF = @Vector(4, f32);
+    \\inline fn vfmk(x: f32, y: f32) VF {
+    \\    return .{ x, y, ftz(x - y), ftz(x + y) };
+    \\}
+    \\inline fn vfred(v: VF) f32 {
+    \\    return ftz(ftz(ftz(v[0]) + ftz(v[1])) + ftz(ftz(v[2]) - ftz(v[3])));
+    \\}
+    \\inline fn vfadd(x: f32, y: f32) f32 {
+    \\    return vfred(vfmk(x, y) + vfmk(y, x));
+    \\}
+    \\inline fn vfsub(x: f32, y: f32) f32 {
+    \\    return vfred(vfmk(x, y) - vfmk(y, x));
+    \\}
+    \\inline fn vfmul(x: f32, y: f32) f32 {
+    \\    return vfred(vfmk(x, y) * vfmk(y, x));
+    \\}
+    \\inline fn vfdiv(x: f32, y: f32) f32 {
+    \\    return vfred(vfmk(x, y) / vfmk(y, x));
+    \\}
+    \\inline fn vfmin(x: f32, y: f32) f32 {
+    \\    return vfred(@min(vfmk(x, y), vfmk(y, x)) + @as(VF, @splat(0.0)));
+    \\}
+    \\inline fn vfmax(x: f32, y: f32) f32 {
+    \\    return vfred(@max(vfmk(x, y), vfmk(y, x)) + @as(VF, @splat(0.0)));
+    \\}
+    \\inline fn vffma(x: f32, y: f32) f32 {
+    \\    return vfred(@mulAdd(VF, vfmk(x, y), vfmk(y, x), vfmk(x, x)));
+    \\}
+    \\inline fn vfsqrt(x: f32, y: f32) f32 {
+    \\    return vfred(@sqrt(vfmk(x, y)) + vfmk(y, x));
+    \\}
+    \\inline fn vfabs(x: f32, y: f32) f32 {
+    \\    return vfred(@abs(vfmk(x, y)) + vfmk(y, x));
+    \\}
+    \\inline fn vfneg(x: f32, y: f32) f32 {
+    \\    return vfred(-vfmk(x, y) + vfmk(y, x));
+    \\}
+    \\inline fn vffloor(x: f32, y: f32) f32 {
+    \\    return vfred(@floor(vfmk(x, y)) + vfmk(y, x));
+    \\}
+    \\inline fn vfceil(x: f32, y: f32) f32 {
+    \\    return vfred(@ceil(vfmk(x, y)) + vfmk(y, x));
+    \\}
+    \\inline fn vftrunc(x: f32, y: f32) f32 {
+    \\    return vfred(@trunc(vfmk(x, y)) + vfmk(y, x));
+    \\}
+    \\inline fn vfround(x: f32, y: f32) f32 {
+    \\    return vfred(@round(vfmk(x, y)) + vfmk(y, x));
+    \\}
+    \\inline fn vfrem(x: f32, y: f32) f32 {
+    \\    return vfred(@rem(vfmk(x, y), vfmk(y, x)));
+    \\}
+    \\inline fn vfselect(x: f32, y: f32) f32 {
+    \\    const v = vfmk(x, y);
+    \\    const w = vfmk(y, x);
+    \\    return vfred(@select(f32, v < w, v, w));
+    \\}
+    \\
+;
+
 // ── Syntax tree ──────────────────────────────────────────────────────────────
 // The generator builds a tree first and prints it afterwards, so the post-passes
 // (every local assigned and read; which inputs were used) can walk it, and so a
@@ -364,6 +488,16 @@ pub const Cmp = enum { eq, ne, lt, le, gt, ge };
 pub const FOp = enum { neg, abs, sqrt, floor, ceil, trunc, round, add, sub, mul, div, rem, min, max };
 const funary = [_]FOp{ .neg, .abs, .sqrt, .floor, .ceil, .trunc, .round };
 const fbinary = [_]FOp{ .add, .sub, .mul, .div, .rem, .min, .max };
+
+/// Vector operators (docs/crosscheck.md): each builds two 4-lane vectors from
+/// its two scalar operands, applies the operation lane-wise and folds the
+/// lanes back, so vector codegen (splats, lane-wise ops, compares and
+/// selects, reductions) runs on the same inputs. The helper is `v<op>`.
+pub const VOp = enum { add, sub, mul, band, bor, bxor, add_sat, sub_sat, mul_sat, min, max, abs, popcount, select };
+pub const vops = [_]VOp{ .add, .sub, .mul, .band, .bor, .bxor, .add_sat, .sub_sat, .mul_sat, .min, .max, .abs, .popcount, .select };
+/// The same on f32 vectors (`vf<op>`); the lanes are flushed as scalars are.
+pub const VFOp = enum { add, sub, mul, div, min, max, fma, sqrt, abs, neg, floor, ceil, trunc, round, rem, select };
+pub const vfops = [_]VFOp{ .add, .sub, .mul, .div, .min, .max, .fma, .sqrt, .abs, .neg, .floor, .ceil, .trunc, .round, .rem, .select };
 
 /// The static type of an expression node.
 pub const Ty = enum { int, float };
@@ -402,6 +536,9 @@ pub const Expr = union(enum) {
     hun: struct { op: FOp, x: *Expr },
     hbin: struct { op: FOp, x: *Expr, y: *Expr },
     hfma: struct { x: *Expr, y: *Expr, z: *Expr },
+    // Vectors: two scalar operands in, one scalar out (see VOp / VFOp).
+    vbin: struct { op: VOp, x: *Expr, y: *Expr },
+    vfbin: struct { op: VFOp, x: *Expr, y: *Expr },
     fsel: struct { c: *Cond, x: *Expr, y: *Expr },
     fromint: *Expr,
     fbits: *Expr,
@@ -422,6 +559,8 @@ pub fn inputDependent(e: *const Expr) bool {
         .hun => |n| inputDependent(n.x),
         .hbin => |n| inputDependent(n.x) or inputDependent(n.y),
         .hfma => |n| inputDependent(n.x) or inputDependent(n.y) or inputDependent(n.z),
+        .vbin => |n| inputDependent(n.x) or inputDependent(n.y),
+        .vfbin => |n| inputDependent(n.x) or inputDependent(n.y),
         .select => |n| condInputDependent(n.c) or inputDependent(n.x) or inputDependent(n.y),
         .fsel => |n| condInputDependent(n.c) or inputDependent(n.x) or inputDependent(n.y),
         .fin, .fromint, .fbits, .ftoi => |x| inputDependent(x),
@@ -434,8 +573,8 @@ fn condInputDependent(c: *const Cond) bool {
 
 pub fn exprType(e: *const Expr) Ty {
     return switch (e.*) {
-        .a, .b, .v, .constant, .un, .bin, .select, .fbits, .ftoi => .int,
-        .fin, .fconst, .fun, .fbin, .ffma, .fsel, .fromint, .hun, .hbin, .hfma => .float,
+        .a, .b, .v, .constant, .un, .bin, .select, .fbits, .ftoi, .vbin => .int,
+        .fin, .fconst, .fun, .fbin, .ffma, .fsel, .fromint, .hun, .hbin, .hfma, .vfbin => .float,
     };
 }
 
@@ -489,6 +628,9 @@ pub const Usage = struct {
     floats: bool = false,
     /// Any half-precision node: the half helpers too.
     halves: bool = false,
+    /// Any integer or float vector node: the vector helpers.
+    vectors: bool = false,
+    fvectors: bool = false,
 
     pub fn expr(u: *Usage, e: *const Expr) void {
         switch (e.*) {
@@ -548,6 +690,17 @@ pub const Usage = struct {
                 u.expr(n.x);
                 u.expr(n.y);
                 u.expr(n.z);
+            },
+            .vbin => |n| {
+                u.vectors = true;
+                u.expr(n.x);
+                u.expr(n.y);
+            },
+            .vfbin => |n| {
+                u.floats = true;
+                u.fvectors = true;
+                u.expr(n.x);
+                u.expr(n.y);
             },
         }
     }
@@ -618,6 +771,11 @@ pub const Gen = struct {
         return set[g.r.uintLessThan(usize, set.len)];
     }
 
+    /// An integer vector operator.
+    pub fn pickV(g: *Gen) VOp {
+        return vops[g.r.uintLessThan(usize, vops.len)];
+    }
+
     const binary_inline_known = binary_inline;
     const binary_helper_known = binary_helper ++ [_]Op{ .ov_add, .ov_sub };
 
@@ -646,7 +804,7 @@ pub const Gen = struct {
         if (depth == 0 or g.expr_budget == 0) return g.fleaf(rt);
         g.expr_budget -= 1;
         const d = depth - 1;
-        switch (g.r.uintLessThan(u8, 24)) {
+        switch (g.r.uintLessThan(u8, 26)) {
             0...3 => return g.fleaf(rt),
             4...7 => {
                 const op = g.pickF(&funary);
@@ -698,13 +856,22 @@ pub const Gen = struct {
                 if (op == .div and !inputDependent(y)) y = try g.new(.{ .fin = try g.new(.b) });
                 return g.new(.{ .hbin = .{ .op = op, .x = x, .y = y } });
             },
-            else => {
+            23 => {
                 var x = try g.fexpr(d, rt);
                 const y = try g.fexpr(d, rt);
                 const z = try g.fexpr(d, rt);
                 // The same constant-fold guard as ffma.
                 if (!inputDependent(x) and !inputDependent(y)) x = try g.new(.{ .fin = try g.new(.a) });
                 return g.new(.{ .hfma = .{ .x = x, .y = y, .z = z } });
+            },
+            else => {
+                const op = vfops[g.r.uintLessThan(usize, vfops.len)];
+                var x = try g.fexpr(d, rt);
+                const y = try g.fexpr(d, rt);
+                // The fma lanes are built from both operands: the constant-fold
+                // guard of ffma, on x.
+                if (op == .fma and !inputDependent(x) and !inputDependent(y)) x = try g.new(.{ .fin = try g.new(.a) });
+                return g.new(.{ .vfbin = .{ .op = op, .x = x, .y = y } });
             },
         }
     }
@@ -740,8 +907,14 @@ pub const Gen = struct {
         }
         // Operands are generated into locals first: the order of the random
         // draws must not depend on how a struct literal is evaluated.
-        switch (g.r.uintLessThan(u8, 20)) {
+        switch (g.r.uintLessThan(u8, 22)) {
             0...4 => return g.leaf(rt),
+            20, 21 => {
+                const op = g.pickV();
+                const x = try g.expr(d, rt);
+                const y = try g.expr(d, rt);
+                return g.new(.{ .vbin = .{ .op = op, .x = x, .y = y } });
+            },
             5...8 => {
                 const x = try g.expr(d, rt);
                 return g.new(.{ .un = .{ .op = g.pick(&unary), .x = x } });
@@ -975,6 +1148,20 @@ pub const Printer = struct {
             },
             .select => |n| try p.selectLike(n.c, n.x, n.y),
             .fsel => |n| try p.selectLike(n.c, n.x, n.y),
+            .vbin => |n| {
+                try w.print("v{s}(", .{@tagName(n.op)});
+                try p.expr(n.x);
+                try w.writeAll(", ");
+                try p.expr(n.y);
+                try w.writeAll(")");
+            },
+            .vfbin => |n| {
+                try w.print("vf{s}(", .{@tagName(n.op)});
+                try p.expr(n.x);
+                try w.writeAll(", ");
+                try p.expr(n.y);
+                try w.writeAll(")");
+            },
             .fin => |x| {
                 try w.writeAll("fin(");
                 try p.expr(x);
@@ -1287,6 +1474,8 @@ pub fn render(gpa: std.mem.Allocator, prog: *const Program, header: []const u8) 
     try w.writer.writeAll(helpers);
     if (usage.floats) try w.writer.writeAll(float_helpers);
     if (usage.halves) try w.writer.writeAll(half_helpers);
+    if (usage.vectors) try w.writer.writeAll(vector_helpers);
+    if (usage.fvectors) try w.writer.writeAll(fvector_helpers);
     try w.writer.writeAll("\n");
     var printer: Printer = .{ .w = &w.writer };
     try printer.program(prog, usage);
@@ -1304,6 +1493,8 @@ fn exprNodes(e: *const Expr) u32 {
         .hun => |n| 1 + exprNodes(n.x),
         .hbin => |n| 1 + exprNodes(n.x) + exprNodes(n.y),
         .hfma => |n| 1 + exprNodes(n.x) + exprNodes(n.y) + exprNodes(n.z),
+        .vbin => |n| 1 + exprNodes(n.x) + exprNodes(n.y),
+        .vfbin => |n| 1 + exprNodes(n.x) + exprNodes(n.y),
         .select => |n| 1 + condNodes(n.c) + exprNodes(n.x) + exprNodes(n.y),
         .fsel => |n| 1 + condNodes(n.c) + exprNodes(n.x) + exprNodes(n.y),
         .fin, .fromint, .fbits, .ftoi => |x| 1 + exprNodes(x),

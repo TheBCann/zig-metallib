@@ -134,6 +134,16 @@ bits of the exact 64-bit signed and unsigned products, a 64-bit average, and the
 of a 64-bit shift. The 64-bit operations cannot overflow: the product of two 32-bit values
 always fits in 64 bits.
 
+Vectors. An integer vector node takes two scalar operands, builds two 4-lane
+`@Vector(4, i32)` from them (`{x, y, x ^ y, x +% y}` and the same with the operands
+swapped), applies one operation lane-wise (`+% -% *% & | ^ +| -| *|`, `@min`, `@max`,
+`@abs`, `@popCount`, or a compare and `@select`) and folds the lanes back with a
+`@reduce(.Xor)` plus one lane, so splats, lane-wise operations, vector compares and
+selects, reductions and lane extraction all run on the same inputs. Float mode has the
+same on `@Vector(4, f32)` (`+ - * /`, `@min`, `@max`, `@mulAdd`, `@sqrt`, `@abs`, negation,
+`@floor`, `@ceil`, `@trunc`, `@round`, `@rem`, compare and `@select`), every lane flushed
+as a scalar would be.
+
 Control flow. A body is a small program rather than one expression: up to four local
 variables, assignments, `if`/`else`, `switch` on a masked value, bounded `for` loops over
 a range of at most 8 iterations, `break` and `continue` under a condition, and a final
@@ -386,6 +396,6 @@ On an Apple M3 (macOS 26.3, Zig 0.18.0-dev.253):
 
 - File the drafted reports in `docs/apple-reports/` with Apple, and record the feedback
   numbers in the findings table.
-- Vectors as a generated type.
+- Wider vectors (2 and 8 lanes, f16 lanes), and vector results carried through locals.
 - Later, the same generated shaders on Asahi Linux's Mesa stack once its M3 GPU driver
   works, so the two compilers can be compared on the same hardware.

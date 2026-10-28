@@ -147,6 +147,14 @@ a run-time divisor is exact), so the generator keeps f16 divisors input-dependen
 keeps one fma multiplicand. LLVM 20's fast-math flags on `fptrunc`/`fpext` also showed up
 here and are dropped by the assembler and the text rewrite.
 
+## Vectors
+
+Since 2026-10-21 float mode also generates `@Vector(4, f32)` nodes (docs/crosscheck.md,
+"Vectors"): the lanes are built from two flushed scalars and `ftz(x - y)`, `ftz(x + y)`,
+the operation runs lane-wise, and the lanes are folded back through the scalar flush, so
+the policy above applies lane by lane; `@mulAdd` on vectors keeps the constant-fold guard
+on its first operand.
+
 ## Precision survey
 
 `zig build survey` (`tools/crosscheck/survey.zig`, kernels in `src/engine/survey_harness.zig`)

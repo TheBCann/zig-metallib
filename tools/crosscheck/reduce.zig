@@ -499,6 +499,14 @@ pub const Engine = struct {
                 e.renumberExpr(n.x, at, delta);
                 e.renumberExpr(n.y, at, delta);
             },
+            .vbin => |n| {
+                e.renumberExpr(n.x, at, delta);
+                e.renumberExpr(n.y, at, delta);
+            },
+            .vfbin => |n| {
+                e.renumberExpr(n.x, at, delta);
+                e.renumberExpr(n.y, at, delta);
+            },
             .select => |n| {
                 e.renumberCond(n.c, at, delta);
                 e.renumberExpr(n.x, at, delta);
@@ -589,6 +597,18 @@ pub const Engine = struct {
                 try e.collectChildren(n.x, rt, out);
             },
             .hbin => |*n| {
+                try out.append(e.gpa, .{ .p = &n.x, .rt = rt });
+                try e.collectChildren(n.x, rt, out);
+                try out.append(e.gpa, .{ .p = &n.y, .rt = rt });
+                try e.collectChildren(n.y, rt, out);
+            },
+            .vbin => |*n| {
+                try out.append(e.gpa, .{ .p = &n.x, .rt = rt });
+                try e.collectChildren(n.x, rt, out);
+                try out.append(e.gpa, .{ .p = &n.y, .rt = rt });
+                try e.collectChildren(n.y, rt, out);
+            },
+            .vfbin => |*n| {
                 try out.append(e.gpa, .{ .p = &n.x, .rt = rt });
                 try e.collectChildren(n.x, rt, out);
                 try out.append(e.gpa, .{ .p = &n.y, .rt = rt });
@@ -727,6 +747,14 @@ pub const Engine = struct {
                 },
                 .hun => |n| candidates[0] = n.x,
                 .hbin => |n| {
+                    candidates[0] = n.x;
+                    candidates[1] = n.y;
+                },
+                .vbin => |n| {
+                    candidates[0] = n.x;
+                    candidates[1] = n.y;
+                },
+                .vfbin => |n| {
                     candidates[0] = n.x;
                     candidates[1] = n.y;
                 },
